@@ -1,6 +1,6 @@
 """
 Validate atlas's per-edge AADT flow estimates (from 03b_traffic_flows.py)
-against Swiss ASTRA traffic counters.
+against Swiss traffic counters (NPVM zaehldaten).
 
 Loads the saved `edges_car_flows.csv` + the car graph from atlas,
 re-tags each edge with a tier bucket (`highway` / `main` / `local`)
@@ -129,7 +129,7 @@ def main():
             f"median {flows.median():,.0f}, P95 {flows.quantile(0.95):,.0f} veh/day")
 
     # ---------- Load + snap counters --------------------------------------
-    with step('load counters (PRIVATE Swiss ASTRA dataset)'):
+    with step('load counters (PRIVATE Swiss traffic counts)'):
         ctr_ctx = context.source(_COUNTERS_NAMESPACE, storage=Storage.PRIVATE)
         counters_path = ctr_ctx.path_for(ctr_ctx.default_storage, _COUNTERS_FILE)
         counters = gpd.read_file(counters_path).to_crs(crs_main)

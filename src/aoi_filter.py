@@ -77,7 +77,7 @@ def filter_points_by_aoi(
     """Return only rows whose `geometry` falls inside `aoi_polygon`.
 
     `gdf` must be in the same CRS as `aoi_polygon`. Logs the count
-    reduction under `label` (e.g. 'ASTRA counters').
+    reduction under `label` (e.g. 'traffic counters').
     """
     before = len(gdf)
     kept = gdf.loc[gdf.geometry.within(aoi_polygon)].copy()

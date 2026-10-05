@@ -26,7 +26,8 @@ restricted-access data:
   utility model
 - **GPS-tracked trips** — MOBIS legs: ground truth for car travel times
   (pre-COVID-19 cohort) and out-of-sample validation
-- **Traffic counters** — Swiss ASTRA counters, for traffic-flow validation
+- **Traffic counters** — Swiss traffic counts pooled from several counting
+  programmes, for traffic-flow validation
 
 This code is **documentation for the datasets it produces**: read it to
 understand how an atlas was made, fork it to reproduce a public

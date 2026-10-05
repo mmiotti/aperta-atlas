@@ -1,8 +1,8 @@
 """
-Prepare Swiss ASTRA / NPVM traffic counter measurements.
+Prepare Swiss traffic counter measurements (NPVM zaehldaten).
 
-> **Private data.** Requires the NPVM zaehldaten gpkg (Swiss ASTRA
-> traffic counters, restricted-access); not redistributable. Published
+> **Private data.** Requires the NPVM zaehldaten gpkg (Swiss traffic
+> counts pooled from several sources, restricted-access); not redistributable. Published
 > as documentation of the method.
 
 Reads the NPVM zaehldaten gpkg (per-direction line geometries with annual

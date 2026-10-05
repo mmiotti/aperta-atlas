@@ -99,7 +99,7 @@ src/
                 npvm/              # NPVM zones + transit ODM
             private/               # STORAGE = Storage.PRIVATE
                 surveys/           # MZMV + MOBIS preprocessing
-                traffic_counters/  # ASTRA counters
+                traffic_counters/  # pooled Swiss traffic counts (NPVM zaehldaten)
         world/
             areas.py               # `Area` dataclass + `AREAS` dict
             pipeline.yml           # public-data prep chain, `--area <name>`
