@@ -1,0 +1,70 @@
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea
+.vscode/*
+!.vscode/extensions.json
+!.vscode/tasks.json
+
+# Claude Code session state (per-machine; never tracked)
+.claude/
+
+# Ruff cache (tooling)
+.ruff_cache/
+
+# YAML backup dir from the 2026-06 config cleanup
+config/_bck/
+
+# Environments / secrets
+.env
+.env.*
+*.env
+.venv
+env/
+venv/
+ENV/
+
+# Personal scratchspace (kept out of git)
+.archive
+.asc
+.misc
+misc
+scratch
+src/aperta_atlas/_shelf.py
+
+# Pipeline outputs (regenerable; large)
+results
+status
+paper
+
+# Data files — both intermediate and final
+*.csv
+*.gpkg
+*.npy
+*.tif
+*.tiff
+*.parquet
+**/cache
+**/prepared
+**/results
+**/data
+**/_archive/
+
+# Python build / cache
+**/__pycache__/**
+**/build/
+**/*.egg-info/
+**/dist/
+*.whl
+*.py[cod]
+*$py.class
+*.so
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter
+.ipynb_checkpoints/

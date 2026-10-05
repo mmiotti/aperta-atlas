@@ -1,0 +1,72 @@
+name: world_preparation
+description: |
+  Public-data preparation chain for one area: OSM PBF clip + per-mode networks
+  + buildings/POIs/obstacles + elevation + GHS-POP population + STATENT-derived
+  employment. Parameterised by --area; the area name must match one defined
+  in `preparation/world/areas.py`.
+
+# Run from src/ so `python -m preparation.world.X` resolves.
+working_dir: ../..
+
+# Order respects inter-script dependencies:
+#   - clip_pbf produces the buffered PBF every osm/* downstream reads
+#   - networks_consolidate reads networks_from_pbf
+#   - networks_decorate reads networks_consolidate + obstacles_from_pbf
+#   - {population,employment}_per_building read buildings_from_pbf
+#   - population_per_building also reads population_ghs
+# elevation_dem is independent (fetches its own Copernicus tiles); kept
+# adjacent to its land-use cousins for readability.
+
+stages:
+  - name: clip_pbf
+    module: preparation.world.osm.clip_pbf
+    variants: ['${area}_buffered']
+
+  - name: networks_from_pbf
+    module: preparation.world.osm.networks_from_pbf
+    variants: ['${area}_walk', '${area}_bike', '${area}_car']
+
+  - name: networks_consolidate
+    module: preparation.world.osm.networks_consolidate
+    variants: ['${area}_walk', '${area}_bike', '${area}_car']
+
+  - name: buildings_from_pbf
+    module: preparation.world.osm.buildings_from_pbf
+    variants: ['${area}_buildings']
+
+  - name: pois_from_pbf
+    module: preparation.world.osm.pois_from_pbf
+    variants: ['${area}_pois']
+
+  - name: obstacles_from_pbf
+    module: preparation.world.osm.obstacles_from_pbf
+    variants: ['${area}_obstacles']
+
+  - name: networks_decorate
+    module: preparation.world.osm.networks_decorate
+    variants: ['${area}_walk', '${area}_bike', '${area}_car']
+
+  - name: elevation_dem
+    module: preparation.world.elevation.elevation_dem
+    variants: ['${area}_dem']
+
+  - name: population_ghs
+    module: preparation.world.land_use.population_ghs
+    variants: ['${area}']
+
+  - name: population_per_building_from_ghs
+    module: preparation.world.land_use.population_per_building_from_ghs
+    variants: ['${area}']
+
+  # {population,employment}_per_building_from_coef read the STATPOP /
+  # STATENT-derived coefs from preparation/switzerland/land_use/ — which
+  # must have been built once (in any area's prior run, since the coefs
+  # are area-agnostic). Re-run order across areas doesn't matter for
+  # these stages.
+  - name: population_per_building_from_coef
+    module: preparation.world.land_use.population_per_building_from_coef
+    variants: ['${area}']
+
+  - name: employment_per_building_from_coef
+    module: preparation.world.land_use.employment_per_building_from_coef
+    variants: ['${area}']

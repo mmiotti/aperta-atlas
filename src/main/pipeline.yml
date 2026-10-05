@@ -1,0 +1,121 @@
+name: main
+description: |
+  Full atlas pipeline for one scenario, in dependency order. Spans both
+  `main/` and `survey/` — the survey scripts are load-bearing prerequisites
+  for `Calibrate()` scenarios (they feed 03a's flow coefs + 04's edge
+  weights + 07a/07b's overhead coefs + 09a's utility model).
+
+  Every coef-producing stage (03a, 04, 07a, 07b, 09a) uses `coefs.resolve`,
+  and each survey stage self-skips via `scenario_needs_survey_prep()` when
+  no Calibrate() coef is declared. So one invocation works for both cases:
+
+      # Calibrate scenario — full run (all 22 stages)
+      python -m aperta_atlas.pipeline run main/pipeline.yml \
+          --scenario switzerland-h10
+
+      # ImportFrom scenario — same command; survey stages self-skip
+      python -m aperta_atlas.pipeline run main/pipeline.yml \
+          --scenario res-h10
+
+  Mode variants are hard-coded to walk/bike/car — scripts read the
+  scenario's own `mode_configs[mode].profiles` inside each per-mode run,
+  so a scenario with only rwalk still works under `variants: [walk]`.
+  Scenarios that drop a mode entirely will error at that mode's stage
+  (drop the corresponding variant in a copy of this file if needed).
+
+# Run from src/ so `python -m main.X` and `python -m survey.X` resolve.
+working_dir: ..
+
+stages:
+  # ---- Cell/zone geometry + snap ----------------------------------------
+  - name: cells_zones
+    module: main.01_cells_zones
+
+  - name: networks_snap
+    module: main.02a_networks_snap
+    variants: [walk, bike, car]
+
+  - name: networks_features
+    module: main.02b_networks_features
+    variants: [walk, bike, car]
+
+  - name: active_flags
+    module: main.02c_active_flags
+
+  # ---- Survey prep: legs (needs graphs from 02a + cells/zones from 01) --
+  # Calibrate-only stage in practice — for ImportFrom scenarios the
+  # calibration scripts short-circuit and never read survey_legs.csv, so
+  # this stage can be safely --skip'd.
+  - name: prepare_survey_legs
+    module: survey.02d_prepare_survey_legs
+
+  # ---- Flow calibration (needs survey_legs) + traffic-flow bake --------
+  - name: flow_coefs
+    module: main.03a_flow_coefs
+
+  - name: traffic_flows
+    module: main.03b_traffic_flows
+
+  # ---- Per-mode edge weights (needs survey_legs on Calibrate) ----------
+  - name: edge_weights
+    module: main.04_edge_weights
+    variants: [walk, bike, car]
+
+  # ---- OD travel-time skims: road (per mode) + transit (NPVM lookup) ---
+  - name: road_od_times
+    module: main.05_road_od_times
+    variants: [walk, bike, car]
+
+  - name: transit_od_times
+    module: main.05_transit_od_times
+
+  # ---- Survey routing (needs 04's edge weights + 05_transit's NPVM z2z)-
+  - name: survey_leg_times
+    module: survey.05_leg_times
+
+  # ---- Public-transit per-cell access (uses 05 walk + bike + transit) --
+  - name: public_transit_access
+    module: main.06_public_transit_access
+
+  # ---- Overhead coefs: road (needs survey_leg_times on Calibrate) and
+  #      transit (needs survey_legs + 06's cells_transit_access) ----------
+  - name: road_overhead_coefs
+    module: main.07a_road_overhead_coefs
+
+  - name: transit_overhead_coefs
+    module: main.07b_transit_overhead_coefs
+
+  # ---- Survey overheads (needs 07a + 07b), trip-level transit times
+  #      (needs 07b), summary (needs 08a; read by 09a) --------------------
+  - name: survey_leg_overheads
+    module: survey.08a_add_leg_overheads
+
+  - name: survey_trip_transit
+    module: survey.08b_trip_transit_times
+
+  - name: survey_stats
+    module: survey.08c_survey_stats
+
+  # ---- Gross-time ODM bake + straight-line distance ODM ----------------
+  - name: gross_od_times
+    module: main.08a_gross_od_times
+
+  - name: dist_line_od
+    module: main.08b_dist_line_od
+
+  # ---- Utility model (needs survey/{02d,05,08a,08b} on Calibrate) ------
+  # Only `default` is declared in shipped scenarios' coefs dicts as
+  # `utility_default`. Add more here if you register additional
+  # `utility_<name>` variants in scenarios.py.
+  - name: utility_estimation
+    module: main.09a_utility_estimation
+    variants: [default]
+
+  - name: od_utilities
+    module: main.09b_od_utilities
+
+  # ---- Final accessibilities per grid-variant --------------------------
+  # 10 reads scenario.accessibility_grids and iterates internally — one
+  # subprocess is enough.
+  - name: accessibilities
+    module: main.10_accessibilities

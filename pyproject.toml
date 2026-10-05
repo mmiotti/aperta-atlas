@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aperta-atlas"
+version = "0.2.0a0"
+description = "Opinionated project scaffolding on top of the aperta accessibility-analysis library, plus the projects built on it."
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [
+    {name = "Marco Miotti", email = "marco@miotti.me"},
+]
+keywords = [
+    "accessibility",
+    "transport",
+    "mobility",
+    "urban",
+    "pipeline",
+    "research",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+
+# Lightweight default install: the `aperta_atlas` framework + the algorithm
+# library it sits on top of. No heavy data-handling deps — those are
+# behind the `projects` extra below.
+dependencies = [
+    "aperta>=0.4.0a0",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+]
+
+# Optional features.
+#   - `projects`: deps needed to actually RUN the atlas pipeline scripts
+#     under src/main, src/validation, src/visualization, src/analysis and
+#     the preparation scripts under src/preparation. A user who installs
+#     `aperta-atlas` alone (the published package) gets just the
+#     `aperta_atlas` scaffolding framework — they can build their own
+#     project on top, but won't be able to execute the Accessibility
+#     Atlas pipeline shipped in this repo without this extra. The
+#     private `aperta-lumos` sibling repo also depends on this extra
+#     (via its own pyproject) since it reuses the same scaffolding.
+[project.optional-dependencies]
+projects = [
+    "aperta[osm,topo,h3]",
+    "pyaxis>=0.4",          # parse BFS PC-Axis (.px) files (Swiss data)
+    "contextily>=1.4",      # basemap tiles
+]
+# Dev tooling. Mirrors aperta's `[dev]` extra so the pre-commit hooks (ruff
+# lint/format, mypy typecheck, jupytext sync, unittest on push) work the
+# same way here. Install with `pip install -e '.[dev]'`.
+dev = [
+    "pre-commit>=4.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "jupytext>=1.16",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["aperta_atlas*"]

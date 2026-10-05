@@ -1,0 +1,27 @@
+name: switzerland_general
+description: Switzerland-wide reference layers (political boundaries, water bodies, traffic zones, per-municipality stats).
+
+# Run from src/ so that `python -m preparation.switzerland.public.general.X` resolves correctly.
+working_dir: ../../..
+
+# topography_25m is not yet ported to the new aperta API — kept out of the pipeline
+# until it's migrated.
+
+# Order matters: taxable_income / vehicle_ownership consume political_boundaries
+# outputs; traffic_zones consumes tlm_regio outputs.
+
+stages:
+  - name: political_boundaries
+    module: preparation.switzerland.public.general.political_boundaries
+
+  - name: tlm_regio
+    module: preparation.switzerland.public.general.tlm_regio
+
+  - name: taxable_income
+    module: preparation.switzerland.public.general.taxable_income
+
+  - name: vehicle_ownership
+    module: preparation.switzerland.public.general.vehicle_ownership
+
+  - name: traffic_zones
+    module: preparation.switzerland.public.general.traffic_zones
