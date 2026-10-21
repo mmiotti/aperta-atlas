@@ -163,4 +163,7 @@ Aperta-atlas was developed by Marco Miotti at the [Chair of Ecological Systems D
 
 ## License
 
+© 2026 ETH Zurich\
+Created by: Marco Miotti
+
 MIT. See [LICENSE](LICENSE).
