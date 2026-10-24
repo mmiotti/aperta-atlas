@@ -3,9 +3,9 @@ AOI-scoped filters for training and validation data.
 
 Purpose: restrict survey legs and traffic counters used for calibration
 (04, 07, 09a, 03a) and counter-based validation (flows_vs_counters) to
-the scenario's AOI. Region-agnostic — the AOI polygon is derived from
-the scenario's own cells layer (`is_aoi=True`), so any scenario works
-without a scenario-name check.
+the scenario's AOI. Region-agnostic — the AOI polygon is the scenario
+area's place polygon buffered by `aoi_buffer_m`, the geometry 01 uses to
+set `is_aoi`, so any scenario works without a scenario-name check.
 
 For switzerland-h10 (AOI = Switzerland), the filter is effectively
 a pass-through: nearly all Swiss survey legs and counters fall inside
@@ -20,26 +20,31 @@ would leak out-of-region behaviour into training.
 """
 
 import logging
+from functools import lru_cache
 
 import geopandas as gpd
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import unary_union
+
+from preparation.world.areas import AREAS
+from preparation.world.common import buffered_place_polygon
+from scenarios import get_scenario
 
 
 def load_aoi_polygon(context) -> BaseGeometry:
-    """Return the scenario's AOI polygon in `scenario.crs_main`.
-
-    Derived as the union of cells with `is_aoi=True` from the scenario's
-    own `shapes/cells.gpkg`. This is the same polygon 01 used to classify
-    cells (subject to cell-boundary discretization, sub-cell resolution).
+    """Return the scenario's AOI polygon in `scenario.crs_main`: the area's
+    place polygon buffered by `aoi_buffer_m`, as in 01. Not the union of the
+    `is_aoi` cells: 01 drops cells without residents, jobs or POIs, which
+    would leave holes where survey legs start or end (car parks, parks).
     """
-    cells = context.get_shapes('cells')
-    aoi_cells = cells.loc[cells['is_aoi'].astype(bool)]
-    if aoi_cells.empty:
-        raise ValueError(
-            "AOI is empty (no cells with is_aoi=True). Run 01_cells_zones "
-            "first, or check that scenario.area_name is set correctly.")
-    return unary_union(aoi_cells.geometry.tolist())
+    scenario = get_scenario(context.scenario)
+    return _aoi_polygon(scenario.area_name, scenario.crs_main)
+
+
+@lru_cache(maxsize=None)
+def _aoi_polygon(area_name: str, crs: str) -> BaseGeometry:
+    area = AREAS[area_name]
+    return (buffered_place_polygon(area.place, area.aoi_buffer_m)
+            .to_crs(crs).geometry.union_all())
 
 
 def filter_legs_by_aoi(

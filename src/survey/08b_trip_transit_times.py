@@ -3,28 +3,27 @@ Trip-level transit-time predictions for validation.
 
 For every survey TRIP that contains at least one transit leg, aggregate
 the trip's constituent legs, then produce a door-to-door transit
-prediction as `NPVM z2z(trip_orig_zone, trip_dest_zone) +
+prediction as `α × NPVM z2z(trip_orig_zone, trip_dest_zone) +
 overheads_transit(trip_orig_cell) + overheads_transit(trip_dest_cell)`.
 
-Why trip-level (not leg-level) for transit: NPVM z2z is inherently
-door-to-door (includes walk-to-stop and walk-from-stop). MTMC's per-leg
-`time_measured` for a transit leg covers only the ride segment
-(stop-to-stop). Comparing them at leg level is apples-to-oranges (see
-the ~+47 % z2z-vs-measured bias explored 2026-09). At trip level,
-`Σ leg time_measured` IS door-to-door — the natural comparator.
+Why trip-level (not leg-level) for transit: NPVM z2z is door-to-door
+(includes walk-to-stop and walk-from-stop), while MTMC's per-leg
+`time_measured` for a transit leg covers only the ride (stop-to-stop),
+so a leg-level comparison is biased (z2z ≈ +47 % vs measured). The
+trip's measured time (first departure → last arrival) is door-to-door.
 
 Access-mode context columns are added so downstream validation can
 stratify by walk-only / park-and-ride / bike-and-ride patterns.
 
-Trip ordering rule: legs within a trip are ordered by `leg_id` (the
-pandas index of `survey_legs.csv`). The leg-id namespacing scheme in
-02d encodes participant × trip × sequence-in-trip, so `groupby.head(1)`
-after sort gives the first leg, `tail(1)` the last.
+Legs within a trip are ordered by `leg_id` (the index of
+`survey_legs.csv`, `<year>_<HHNR>_<ETNR>` from survey prep); the first
+leg's origin and the last leg's destination are the trip endpoints
+(`main.common.aggregate_transit_trips`).
 
 Inputs (PRIVATE, under `<scenario>/`):
     generic/survey_legs.csv                      # from survey/02d (needs trip_id)
 
-Inputs (PUBLIC, under `<scenario>/`):
+Inputs (scenario storage, under `<scenario>/`):
     properties/cells_{population,employment,snap,pois,transit_access}.csv
     shapes/cells.gpkg
     coefs/<kind>/overheads_transit.csv           # from main/07b (calibrated in switzerland-h10)
@@ -36,15 +35,19 @@ Output (PRIVATE, under `<scenario>/`):
 
 Output columns:
     trip_id (index)
-    trip_time_measured, trip_dist_measured       # sum across legs (seconds, metres)
+    trip_time_measured                           # last arrival − first departure (s;
+                                                 # door to door incl. waiting)
+    trip_time_legs, trip_dist_measured           # sum across legs (seconds, metres)
+    is_within_gap_envelope                       # survey prep (standardize.py)
     trip_dist_line                               # straight-line trip_orig → trip_dest (metres)
     trip_orig_{x,y}, trip_dest_{x,y}             # first-leg orig, last-leg dest
     trip_orig_cell, trip_dest_cell               # cell ids for overhead lookup
     trip_orig_zone, trip_dest_zone               # zone ids for NPVM z2z lookup
     weight_person                                # first-leg weight (constant within trip)
     peak_str                                     # first-leg peak label
+    datetime_departure                           # first-leg departure (MZMV legs only)
     n_legs_in_trip, n_transit_legs
-    has_walk_access, has_car_access, has_bike_access   # bool
+    has_walk_access, has_car_access, has_bike_access   # 0/1
     access_pattern                               # walk_only / park_and_ride / bike_and_ride / mixed
     is_within_speed_envelope, is_within_detour_envelope
                                                  # min across legs (0 if ANY leg fails)
@@ -104,11 +107,8 @@ def _predict_transit(trips: pd.DataFrame, context) -> pd.DataFrame:
             f"mean orig+dest overhead = "
             f"{(trips['pred_overhead_orig'] + trips['pred_overhead_dest']).mean():.1f} s")
 
-    # α scaling of z2z (from the `t_routed` row in overheads_transit).
-    # `pred_time = α × pred_z2z + orig_ov + dest_ov` at trip level;
-    # parallels `main.common.per_cell_transit_overhead` semantics but
-    # applies α inline here (no per-leg `t_routed_bias_transit` column
-    # at trip level — this is trip-aggregated, not per-leg).
+    # α (the `t_routed` row of overheads_transit) scales z2z directly: the
+    # trip-level counterpart of survey/08a's per-leg `t_routed_bias_transit`.
     alpha_transit = route_time_alpha(transit_coefs['transit'])
     logging.info(
         f"  → α (t_routed slope) = {alpha_transit:.4f} applied to pred_z2z")
@@ -122,6 +122,10 @@ def _predict_transit(trips: pd.DataFrame, context) -> pd.DataFrame:
 def main():
     context = init_context()
     scenario = get_scenario(context.scenario)
+    if scenario.transit_source is None:
+        logging.info(f"Scenario {scenario.name!r} has no transit; skipping.")
+        context.close()
+        return
     if not scenario_needs_survey_prep(scenario):
         logging.info(
             f"Scenario {scenario.name!r} has no survey-driven calibrators — "

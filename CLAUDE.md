@@ -35,22 +35,21 @@ into one of these phases.
 
 1. **Load and prepare data** — networks (per mode); land use; topography.
 2. **Map data to units** — `cells → zones` aggregation hierarchy
-   via `geo_mapping` + `network_processing.snap_to_network_nodes` /
-   `assign_to_eligible_centroid`.
+   via `geo_mapping` + `network_snap.snap_to_network_nodes`.
 3. **Build sparse OD pairs** — `od_pairs.get_pairs` returns a
    `TieredODNodePairs` (three distance tiers: cells_to_cells,
    cells_to_zones, zones_to_zones — node-keyed). Lift to
    `TieredODGeoPairs` (cell/zone-keyed) via
    `od_pairs.reindex_by_geo_unit` for cross-modal alignment.
 4. **Estimate traffic flows** — `traffic_flows.nested_node_sample` +
-   betweenness via `network_processing.get_*_betweenness*`.
+   betweenness via `network_processing.get_nested_edge_betweenness`.
 5. **Estimate travel costs** — `routing.tiered_path_costs` /
-   `routing.tiered_path_aggregate` (Dijkstra on any networkx graph) +
+   `routing.tiered_path_aggregate` (Dijkstra via `scipy.sparse.csgraph`) +
    `overhead.add_geo_overheads` (per-geo-unit origin / destination
    first-mile and last-mile costs added onto a geo-keyed cost ODM).
    Plus `utility.route_utility` / `add_endpoint_utility` for
    utility-based costs.
-6. **Calculate accessibilities** — `accessibility.count_in_bins`,
+6. **Calculate accessibilities** — `accessibility.cumulative_opportunities`,
    `accessibility.gravity`, `accessibility.nearest_k`. Cross-modal:
    `od_pairs.aggregate_across_modes` on per-mode `TieredODGeoPairs`,
    then any accessibility primitive on the combined ODM.
@@ -97,6 +96,7 @@ src/
                 general/           # political boundaries, traffic zones, TLM, income, vehicles
                 land_use/          # STATPOP / STATENT dasymetric mapping + intensity coefs
                 npvm/              # NPVM zones + transit ODM
+                tlmregio/          # swissTLMRegio car network (network-tlmregio scenario)
             private/               # STORAGE = Storage.PRIVATE
                 surveys/           # MZMV + MOBIS preprocessing
                 traffic_counters/  # pooled Swiss traffic counts (NPVM zaehldaten)
@@ -107,14 +107,16 @@ src/
 
     # The atlas project — flat at src/ root (one repo = one project):
     scenarios.py                   # PROJECT_NAME + `Scenario` + SCENARIOS + DEFAULT_SCENARIO + per-scenario `coefs` declarations
-    scenarios_technical_validation.py  # res-* / radii-* / cv-* / data-* scenarios (merged into SCENARIOS)
+    scenarios_technical_validation.py  # res-* / radii-* / cv-* / data-* / network-* scenarios (merged into SCENARIOS)
     mode_configs.py                # `ModeConfig` per road mode + `TRANSIT_MODE_CONFIG`
     aoi_filter.py                  # restrict calibration / validation data to the scenario AOI
     main/                          # accessibility pipeline (build outputs); main/pipeline.yml runs all stages
     survey/                        # survey legs → routed times → overheads → stats (02d, 05, 08a, 08b, 08c);
                                    #   variants per leg set: mtmc (default), mobis_precovid, mobis_covid
-    validation/                    # ground-truth comparison (times vs survey, transit trips, flows vs counters, …)
-    visualization/                 # figures (story.py, story_condensed.py, fastest_mode.py)
+    technical_validation/          # checks of a scenario: vs surveys, transit trips, counters; exact vs tiered OD;
+                                   #   scenario vs reference (plan: scenarios_technical_validation.py)
+    data_paper/                    # figures + LaTeX table bodies of the Scientific Data descriptor
+    research/                      # gitignored: private experimental scripts (`python -m research.<script>`)
 tests/                             # scaffolding unit tests
 status/status.json                 # dependency tracker output (when tracking enabled)
 results/<project>/<scenario>/      # figure outputs
@@ -131,7 +133,7 @@ passed), and `SCENARIOS[<active>].storage` (for the project context's
 constant in their `__init__.py` (e.g. `preparation/switzerland/private/surveys`
 sets `STORAGE = Storage.PRIVATE` because the survey data is proprietary).
 
-The lone remaining YAML is `pipeline.yml` files (per-pipeline
+The only YAML files are the `pipeline.yml` files (per-pipeline
 definitions; consumed by the optional pipeline runner).
 
 The `aperta` library itself is **not** in this repo — it lives in the
@@ -152,10 +154,10 @@ project-agnostic (any project repo can read them). Project code is
 *scenario-bound* — typed I/O writes under
 `<DATA_DIR_*>/<PROJECT_NAME>/<scenario>/<rel>`.
 
-**Project subfolders are organisational.** `main/`, `validation/`,
-`visualization/`, `analysis/` etc. don't become scenarios and don't
+**Project subfolders are organisational.** `main/`, `technical_validation/`,
+`data_paper/` etc. don't become scenarios and don't
 appear in the output path. They DO appear in `status.json` keys (e.g.
-`atlas/main/04_edge_weights.py` vs `atlas/validation/flows_vs_counters.py`)
+`atlas/main/04_edge_weights.py` vs `atlas/technical_validation/flows_vs_counters.py`)
 so dependency tracking distinguishes scripts by role.
 
 **Scenario vs variant.** *Scenario* = project-wide runtime axis with a
@@ -169,18 +171,15 @@ files.
 **Canonical geo_units.** `cells`, `zones`, `nodes`, `edges` for the
 **aperta library** (routing primitives — anything else maps to one of
 these during preparation). Plus `buildings` as a **scaffolding-only
-addition** in `aperta_atlas.context.CANONICAL_UNITS` (added 2026-06-07)
-— recognised by the typed-I/O methods (`create_shapes` /
+addition** in `aperta_atlas.context.CANONICAL_UNITS` — recognised
+by the typed-I/O methods (`create_shapes` /
 `create_properties` / `get_shapes` / `get_properties`) so multiple
 per-building property files can layer onto one geometry file without
 duplication. Buildings are NOT routed on by aperta; the algorithm
 library's contract remains 4 units. Municipalities / cantons /
 locations etc. still map down to a canonical unit in preparation.
 Keep the contract tight — no further additions without explicit
-discussion. (The historical `regions` tier was removed when aperta
-moved to its two-geo-layer / three-distance-tier OD structure; some
-aperta-atlas code may still carry `region` naming for backward
-compatibility.)
+discussion.
 
 **ODM convention.** An ODM is a `dict` keyed by origin id, with values that
 are either `list[str]` (destination ids; `data_name='idx'`) or `np.ndarray`
@@ -192,7 +191,7 @@ readable. Do not silently convert to sparse / 2D arrays.
 `cells_to_zones` (medium — cell-resolution origin, zone-resolution dest),
 `zones_to_zones` (far). Each tier is a dict-of-arrays at its own resolution.
 Built by `od_pairs.get_pairs`; consumed by `routing.tiered_path_costs`,
-`accessibility.count_in_bins`, `traffic_flows.nested_node_sample`.
+`accessibility.cumulative_opportunities`, `traffic_flows.nested_node_sample`.
 
 **Coordinate systems (Switzerland).** `EPSG:2056` (LV95, meters) is the
 canonical CRS for internal processing. `EPSG:4326` only at lat/lon
@@ -268,7 +267,7 @@ hand (mixed-storage preparation namespace) or unreachable cross-repo:
 
 - Python **3.12** (3.13 not yet supported — `pyosmium` and a few other
   geo / scientific deps don't have 3.13 wheels on conda-forge yet).
-  `pyproject.toml` declares ≥ 3.12 and `aperta>=0.4.0a0`.
+  `pyproject.toml` declares ≥ 3.12 and `aperta>=0.4.3a0,<0.5`.
 - Dependencies declared in [pyproject.toml](pyproject.toml) (this repo, for
   `aperta_atlas` + project deps) and in the sibling [../aperta/pyproject.toml](../aperta/pyproject.toml)
   (for the `aperta` library).
@@ -292,10 +291,8 @@ hand (mixed-storage preparation namespace) or unreachable cross-repo:
   `cd src && python -m preparation.world.osm.<script>` from a shell
   with the env active.
 - `.env` (gitignored) at the repo root: `WORKING_DIR`, `DATA_DIR_PUBLIC`,
-  `DATA_DIR_PRIVATE`, `LOGGING_LEVEL`, `APERTA_TRACK_DEPENDENCIES`, and
-  optionally `CARTO_API_KEY` (basemap tiles for the story figures — never in
-  source code). Optional per-machine overrides via `*_MACHINE2` +
-  `OS_NAME_MACHINE2`.
+  `DATA_DIR_PRIVATE`, `LOGGING_LEVEL`, `APERTA_TRACK_DEPENDENCIES`.
+  Optional per-machine overrides via `*_MACHINE2` + `OS_NAME_MACHINE2`.
 
 ## Running scripts
 
@@ -312,7 +309,7 @@ reject `--scenario` (they're scenario-free).
 
 Tests live with each package.
 
-- **aperta** (in sibling repo): ~455 tests under `aperta/tests/`. Run from
+- **aperta** (in sibling repo): ~450 tests under `aperta/tests/`. Run from
   the aperta clone: `python -m unittest discover -s tests -t .`. Also runs
   in GitHub Actions on every push to `mmiotti/aperta`, alongside Ruff
   lint/format and mypy type-checking jobs.
@@ -321,14 +318,14 @@ Tests live with each package.
   ```bash
   python -m unittest discover -s tests -t .
   ```
-  Covers `Context.create_/get_odm` round-trips, `coefs` resolution, the
+  Covers `Context.create_/get_tiered_odm` round-trips, `coefs` resolution, the
   pipeline runner, dasymetric mapping, and OSM helpers. Other `Context`
   methods and `variant` remain untested (exercised indirectly by project
   scripts).
 
-## Docstring convention for `preparation/` and `projects/` scripts
+## Docstring convention for scripts
 
-Every refactored script in `src/preparation/` and `src/` has a
+Every script in `src/preparation/` and `src/` has a
 top-of-file docstring with this shape:
 
 ```python

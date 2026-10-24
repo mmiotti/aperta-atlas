@@ -6,16 +6,16 @@ to legs whose chosen mode matches, then reports person-weighted mean +
 percentiles (p50, p90, p95, p99) of:
   - dist_line_m: straight-line OD distance
   - t_net_min:   net routed travel time
-  - t_gross_min: gross (net + orig + dest overheads)
+  - t_gross_min: gross (α-scaled net + orig + dest overheads, as in 09a and main/08a)
 
 Weighted percentiles use `weight_person` via cumulative-weight
 interpolation (inverse weighted empirical CDF).
 
-Provides `t_gross_min_p95` per mode → consumed by 09a as the
-LINEAR-EXTRAPOLATION SWITCHOVER point for the utility-vs-time fit.
-Beyond `t_cut`, `V(t) = V(t_cut) + s_cut · (t − t_cut)` with
-`s_cut = β_t + β_ln/t_cut` — prevents the log-shaped tail from
-mis-behaving in the survey's data-thin long-time region.
+Provides `t_gross_min` p95 per mode as `t_cut`: 09a stores it in the
+`utility_<variant>_stats` sidecar and 09b switches the utility's log-time
+term to linear extrapolation beyond it, `V(t) = V(t_cut) + s_cut · (t − t_cut)`
+with `s_cut = β_t + β_ln/t_cut` — keeps the log-shaped tail in check in
+the survey's data-thin long-time region.
 
 Inputs (PRIVATE, under `<scenario>/`):
     generic/survey_legs.csv                          # from survey/02d
@@ -37,7 +37,7 @@ import pandas as pd
 from aperta_atlas.context import Storage, init_context
 from aperta_atlas.utils import step
 
-from main.common import car_overhead_by_peak
+from main.common import car_overhead_by_peak, car_routed_bias_by_peak
 from scenarios import get_scenario, scenario_needs_survey_prep
 
 
@@ -94,16 +94,17 @@ def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
 def _mode_times_seconds(
     df: pd.DataFrame, mode: str,
 ) -> tuple[pd.Series, pd.Series]:
-    """Return `(t_net_s, t_gross_s)` for `mode` — seconds. Car needs
-    special handling because its overhead is peak-str-aware (per leg's
-    `peak_str` picks one of three columns); all other modes read net
-    from `t_routed_<profile>` + overheads uniformly."""
+    """Return `(t_net_s, t_gross_s)` for `mode` — seconds. Gross subtracts
+    the α correction `t_routed_bias_<profile>` (survey/08a). Car needs special
+    handling because its overhead and bias are peak-str-aware (per leg's
+    `peak_str` picks one of three columns)."""
     zero = pd.Series(0.0, index=df.index)
     if mode == 'car':
         net_s = df['t_routed_car']
         gross_s = (net_s
                    + car_overhead_by_peak(df, 'orig').fillna(0)
-                   + car_overhead_by_peak(df, 'dest').fillna(0))
+                   + car_overhead_by_peak(df, 'dest').fillna(0)
+                   - car_routed_bias_by_peak(df).fillna(0))
     else:
         profile = _MODE_TO_PROFILE[mode]
         net_s = df[f't_routed_{profile}']
@@ -113,7 +114,8 @@ def _mode_times_seconds(
         ov_profile = 'transit' if mode == 'transit' else profile
         ov_orig = df.get(f't_overhead_orig_{ov_profile}', zero).fillna(0)
         ov_dest = df.get(f't_overhead_dest_{ov_profile}', zero).fillna(0)
-        gross_s = net_s + ov_orig + ov_dest
+        bias = df.get(f't_routed_bias_{ov_profile}', zero).fillna(0)
+        gross_s = net_s + ov_orig + ov_dest - bias
     return net_s, gross_s
 
 
@@ -162,6 +164,10 @@ def main():
         n_chosen = int(chosen_mask.sum())
         if n_chosen == 0:
             logging.warning(f"  ⚠ mode_simplified={mode!r}: 0 legs in survey — skipped.")
+            continue
+        routed_col = 't_routed_car' if mode == 'car' else f't_routed_{_MODE_TO_PROFILE[mode]}'
+        if routed_col not in df.columns:
+            logging.info(f"  → mode={mode!r}: not routed in this scenario — skipped.")
             continue
         with step(f'summarise mode={mode} (n={n_chosen:,})'):
             net_s, gross_s = _mode_times_seconds(df, mode)

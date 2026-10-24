@@ -3,10 +3,12 @@ Materialize the z2z transit pair-index + z2z travel-time ODM from NPVM.
 
 Two sections:
   A. **Pair index** — z2z-only `TieredODGeoPairs`, keyed by zone_id
-     strings (matches NPVM's key format). Filters to zones with a
-     car-graph snap (proxy for spatial position) within `r_zones`.
+     strings (matches NPVM's key format): all pairs of zones with a
+     car-graph snap whose centroids lie within `r_zones`.
   B. **NPVM z2z fill** — look up travel times in NPVM's country-wide
-     matrix for every pair in the scenario set; missing pairs → NaN.
+     matrix for every pair in the scenario set; missing pairs and pairs
+     beyond `TRANSIT_MODE_CONFIG.time_cutoff_s` → NaN (as road pairs beyond
+     their routing cutoff).
 
 Sibling to `05_road_od_times.py` — same pipeline stage but a
 fundamentally different mechanism (matrix lookup, no routing). A
@@ -17,13 +19,13 @@ Downstream 08a lifts the z2z ODM to cell tiers (via `cell_to_zone`)
 and bakes the per-cell overhead — the cell-tier equivalent of what
 road's Dijkstra provides directly.
 
-Inputs (PUBLIC, under <scenario>/):
+Inputs (scenario storage, under <scenario>/):
     properties/zones_snap.csv + shapes/zones.gpkg
 
-Inputs (cross-repo, PUBLIC):
+Inputs (PUBLIC, preparation):
     preparation/switzerland/npvm/odm/npvm_2023_transit_{idx,travel_time}.npz
 
-Outputs (PUBLIC, under <scenario>/):
+Outputs (scenario storage, under <scenario>/):
     odm/transit_z2z_pairs.npz       # zone-id-keyed z2z pair index
     odm/transit_time_net_npvm.npz   # z2z travel times (seconds); `npvm`
                                     # names the source (GTFS variant → `_gtfs`)
@@ -43,6 +45,7 @@ from aperta_atlas.utils import step
 
 from main.common import npvm_transit_z2z_lookup
 from mode_configs import TRANSIT_MODE_CONFIG
+from scenarios import get_scenario
 
 
 # ---------------------------------------------------------------------------
@@ -54,12 +57,9 @@ def _build_transit_pairs(zones) -> TieredODGeoPairs:
     """z2z-only pair index — for each zone, every zone within
     `r_zones` Euclidean distance on centroid, keyed by zone_id.
 
-    Direct scipy KDTree rather than `od_pairs.get_pairs` — that helper
-    is cells-first and forcing a zone-only output out of it requires
-    setting `r_cells = r_medium = 0` + a reindex dance. Zone-level
-    input, zone-keyed output → direct query is cleaner.
-
-    TODO: update `get_pairs` to support zone-only cleanly.
+    A direct KDTree query: `od_pairs.get_pairs` is cells-first, and a
+    zone-only output from it needs `r_cells = r_medium = 0` plus a reindex.
+    TODO: support zone-only pairs in `get_pairs`.
 
     Zones without a car snap are excluded — matches the origin /
     destination set NPVM's atlas subset was built against.
@@ -95,17 +95,18 @@ def _fill_transit_z2z_from_npvm(
 ) -> None:
     """Fill z2z travel times from NPVM's country-wide matrix.
     `transit_pairs` must be geo-keyed (zone_id strings) so the NPVM
-    lookup matches. Missing scenario pairs → NaN (downstream treats
-    as unreachable)."""
+    lookup matches. Missing scenario pairs and pairs beyond the cutoff
+    → NaN (downstream treats as unreachable)."""
     z2z_idx = transit_pairs.zones_to_zones or {}
 
     with step('mode=transit: load NPVM 2023 z2z travel times'):
         lookup = npvm_transit_z2z_lookup(context)
         logging.info(f"  → NPVM covers {len(lookup):,} z2z pairs")
 
-    with step('mode=transit: filter NPVM to scenario pair set + save'):
+    cutoff_s = TRANSIT_MODE_CONFIG.time_cutoff_s
+    with step(f'mode=transit: filter NPVM to scenario pair set (cutoff {cutoff_s:.0f} s) + save'):
         z2z_out: dict = {}
-        n_missing = 0
+        n_missing = n_beyond = 0
         for orig, dests in z2z_idx.items():
             cost = np.empty(len(dests), dtype=np.float32)
             for i, dest in enumerate(dests):
@@ -113,9 +114,14 @@ def _fill_transit_z2z_from_npvm(
                 if v is None:
                     n_missing += 1
                     cost[i] = np.nan
+                elif v > cutoff_s:
+                    n_beyond += 1
+                    cost[i] = np.nan
                 else:
                     cost[i] = v
             z2z_out[orig] = cost
+        logging.info(
+            f"  → {n_beyond:,} z2z pairs beyond the {cutoff_s / 60:.0f}-min cutoff → NaN")
         if n_missing:
             n_total = sum(len(a) for a in z2z_idx.values())
             pct = 100 * n_missing / max(n_total, 1)
@@ -143,6 +149,11 @@ def _fill_transit_z2z_from_npvm(
 
 def main():
     context = init_context()
+    scenario = get_scenario(context.scenario)
+    if scenario.transit_source is None:
+        logging.info(f"Scenario {scenario.name!r} has no transit; skipping.")
+        context.close()
+        return
 
     with step('load zones (snap + shapes)'):
         zones = context.get_properties(

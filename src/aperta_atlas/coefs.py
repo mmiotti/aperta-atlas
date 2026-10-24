@@ -3,10 +3,10 @@
 Each `Scenario` declares where every coef comes from via a
 `Scenario.coefs: dict[str, CoefSource]` mapping. The three source kinds are:
 
-- **`Calibrate()`** — this scenario calibrates the coef from its own data
-  via the appropriate calibration script (04 for `edge_weights_<mode>`,
-  08a for `overheads_road`, etc.). Output lands at
-  `<scenario>/coefs/calibrated/<name>.csv`.
+- **`Calibrate()`** — this scenario fits the coef from its own data in the
+  calibration script (03a for the flow coefs, 04 for `edge_weights_<mode>`,
+  07a / 07b for `overheads_road` / `overheads_transit`, 09a for
+  `utility_*`). Output lands at `<scenario>/coefs/calibrated/<name>.csv`.
 
 - **`ImportFrom('<other_scenario>')`** — this scenario uses the coef
   fitted by another scenario in the same project. The calibration script
@@ -23,11 +23,11 @@ The on-disk `<kind>/` subfolder (`calibrated` / `transferred` /
 
 `Context.get_coefs(name)` is the read API: it consults the scenario's
 declaration to figure out which subfolder to read from. Consumers
-(survey/08a / 09a / story.py / …) don't need to know which kind a coef is.
+(03b / 08a / 09b / …) don't need to know which kind a coef is.
 
 `coefs.resolve(context, name, calibrate_fn)` is the write/dispatch API:
 calibration scripts call it once per coef, passing a `calibrate_fn`
-callable that runs the OLS (used only when the source is `Calibrate`).
+callable that runs the fit (called only when the source is `Calibrate`).
 For `ImportFrom` it performs the cross-scenario copy; for `HandWritten`
 it verifies the file exists.
 """
@@ -142,7 +142,7 @@ def resolve(
 ) -> pd.DataFrame:
     """Resolve and persist this scenario's coef `name`.
 
-    Calibration scripts (04 / 08a / 08b / utility / …) call this once per
+    Calibration scripts (03a / 04 / 07a / 07b / 09a) call this once per
     coef. Looks up `scenario.coefs[name]` and:
 
       - `Calibrate()`         → runs `calibrate_fn()`, writes the result to
@@ -155,8 +155,8 @@ def resolve(
                                  missing), returns it. `calibrate_fn` is
                                  NOT called.
 
-    `calibrate_fn` is a zero-arg callable returning a `param × profile`
-    DataFrame (param index, one column per profile).
+    `calibrate_fn` is a zero-arg callable returning the coef DataFrame
+    (typically `param` index, one column per profile).
     """
     source = _get_source(context, name)
     if isinstance(source, Calibrate):

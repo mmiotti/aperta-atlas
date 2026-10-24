@@ -3,7 +3,9 @@ Estimate mode-choice utility coefficients on the survey legs via biogeme.
 
 Per-mode utility functions with:
   - mode-specific ASC (walk is the base, ASC_walk fixed at 0)
-  - travel time as `β_t · t + β_ln · log(t)` (t in MINUTES)
+  - travel time as `β_t · (t − T) + β_ln · log(t / T)` (t in MINUTES), centered
+    at T = `UTILITY_T_REF_MIN` (main.common), so each ASC is the utility of a
+    T-minute trip; T is stored in the coef file as `t_ref_min`
   - location features driven by the `location_features` variant axis
     (endpoints_combined / endpoints_separate / route — see below)
   - sociodemographic covariates (weather, sex, age bins, income bins),
@@ -38,28 +40,31 @@ Inputs (PRIVATE):
     generic/survey_leg_overheads.csv                 # survey/08a
     generic/survey_summary.csv                       # survey/08c — for t_cut_min bake-in
 
-Inputs (PUBLIC):
+Inputs (scenario storage, under <scenario>/):
     properties/nodes_{walk,bike,car}_extended.csv    # 02b
     properties/nodes_car_flows_avg.csv               # 03b
-    preparation/switzerland/npvm/odm/npvm_2023_transit_{idx,travel_time}.npz
+    shapes/cells.gpkg                                # AOI (`is_aoi` cells)
 
-Outputs (PUBLIC):
-    coefs/<kind>/utility_<variant>.csv               # β table (rows: b_*, asc_*;
-                                                      # cols: value, rob_std_err,
-                                                      # rob_t_test, rob_p_value).
+Outputs (scenario storage, under <scenario>/):
+    coefs/<kind>/utility_<variant>.csv               # β table (rows: b_*, asc_*,
+                                                      # t_ref_min; cols: value,
+                                                      # rob_std_err, rob_t_test,
+                                                      # rob_p_value)
     coefs/<kind>/utility_<variant>_stats.csv         # companion sidecar (rows:
                                                       # sd_avg_<sd_col> +
                                                       # t_cut_min_<mode>; two-col
-                                                      # `key, value`). Source
-                                                      # mirrors the parent's coef
-                                                      # declaration (validated in
-                                                      # Scenario.__post_init__).
+                                                      # `key, value`); same coef
+                                                      # source as the parent
+    biogeme/<variant>/                               # SCRATCH — biogeme logs + reports
 
-Run:
+Run (default variant `default`; variants not in `scenario.coefs` are skipped):
     python -m main.09a_utility_estimation --scenario <name>
+Single variant, or all:
+    python -m main.09a_utility_estimation --scenario <name> --variant <name|all>
 """
 
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -69,7 +74,7 @@ import pandas as pd
 
 import biogeme.database as db
 from biogeme import biogeme, models
-from biogeme.expressions import Beta, Variable
+from biogeme.expressions import Beta, Numeric, Variable
 from biogeme.nests import NestsForNestedLogit, OneNestForNestedLogit
 
 from aperta_atlas import coefs
@@ -78,13 +83,14 @@ from aperta_atlas.utils import step
 from aperta_atlas.variant import Variants
 
 from aoi_filter import filter_legs_by_aoi, load_aoi_polygon
-from main.common import car_overhead_by_peak, car_routed_bias_by_peak
+from main.common import UTILITY_T_REF_MIN, car_overhead_by_peak, car_routed_bias_by_peak
 from mode_configs import MODE_CONFIGS, TRANSIT_MODE_CONFIG
 from scenarios import get_scenario
 
 
 # Per-mode physical floor on per-leg time (seconds); protects the fit from
-# below-floor values (e.g. NPVM same-zone transit = 0 s + negative overheads).
+# below-floor values (e.g. short routed times + negative overheads). NPVM has no
+# same-zone transit times; such legs have no transit time and transit is unavailable.
 _MIN_ROUTE_TIME_S_PER_MODE: dict[str, float] = {
     'walk':    MODE_CONFIGS['walk'].min_route_time_s,
     'rbike':   MODE_CONFIGS['bike'].min_route_time_s,
@@ -129,7 +135,7 @@ _ENDPOINT_FEATURES: dict[str, tuple[str, ...]] = {
 }
 
 # Per-feature source graph (single source of truth in main.utility_config,
-# shared with 09b / 10 via `common.join_util_node_features`).
+# shared with 09b via `common.join_util_node_features`).
 from main.utility_config import POINT_FEATURE_SOURCES as _POINT_FEATURE_SOURCES
 
 # ROUTE variant: features from survey/05's per-profile route aggregates in
@@ -173,6 +179,7 @@ _SD_COL_MODES: dict[str, tuple[str, ...]] = {
     'sd_cat_age_19to25':            ('rbike', 'transit', 'car'),
     'sd_cat_age_51to65':            ('rbike', 'transit', 'car'),
     'sd_cat_age_66to75':            ('rbike', 'transit', 'car'),
+    'sd_cat_age_76+':               ('rbike', 'transit', 'car'),
     'sd_cat_income_leq4000':        ('rbike', 'transit', 'car'),
     'sd_cat_income_4001to8000':     ('rbike', 'transit', 'car'),
     'sd_cat_income_12001to16000':   ('rbike', 'transit', 'car'),
@@ -468,13 +475,14 @@ def _utility_expression(
         if mode == 'car' and has_asc:
             exprs.append(betas['asc_car_peak'] * vars_['hour_peak'])
             exprs.append(betas['asc_car_night'] * vars_['hour_night'])
-    exprs.append(betas[f'b_time_{mode}'] * vars_[f't_{mode}_min'])
-    exprs.append(betas[f'b_time_log_{mode}'] * vars_[f't_{mode}_min_log'])
+    # Time terms centered at UTILITY_T_REF_MIN (see the module docstring).
+    t_c = vars_[f't_{mode}_min'] - UTILITY_T_REF_MIN
+    exprs.append(betas[f'b_time_{mode}'] * t_c)
+    exprs.append(betas[f'b_time_log_{mode}']
+                 * (vars_[f't_{mode}_min_log'] - math.log(UTILITY_T_REF_MIN)))
     if mode == 'car' and has_time:
-        exprs.append(betas['b_time_car_peak']
-                     * vars_['hour_peak'] * vars_['t_car_min'])
-        exprs.append(betas['b_time_car_night']
-                     * vars_['hour_night'] * vars_['t_car_min'])
+        exprs.append(betas['b_time_car_peak'] * vars_['hour_peak'] * t_c)
+        exprs.append(betas['b_time_car_night'] * vars_['hour_night'] * t_c)
     if mode == 'car' and feat_names:
         missing = [f for f in feat_names if f not in vars_]
         if missing:
@@ -556,9 +564,11 @@ def _fit_and_extract(
     df: pd.DataFrame, variant,
     features: dict[str, tuple[str, ...]],
     run_dir: Path,
-) -> tuple[pd.DataFrame, float]:
+) -> tuple[pd.DataFrame, float, float]:
     """Set up + estimate the biogeme MNL / nested-logit model. Returns the
-    coefficient table and rho² (bar, vs null)."""
+    coefficient table and rho² (bar) vs the null model and vs a constants-only
+    MNL (ASCs only, same legs, weights and availability), which reproduces the
+    mode shares and so shows what times, features and SD terms add."""
     modes = ['walk', 'rbike', 'transit', 'car']
     if variant.ebikes != 'exclude':
         modes.append('ebike25')
@@ -616,11 +626,22 @@ def _fit_and_extract(
         bg.modelName = f'utility_{variant_name(variant)}'
         bg.calculate_null_loglikelihood(availability)
         results = bg.estimate()
+
+        asc = {mode: Beta(f'asc_{mode}', 0, None, None, 0) for mode in modes if mode != 'walk'}
+        utilities_c = {_MODE_IDS[mode]: asc.get(mode, Numeric(0)) for mode in modes}
+        bg_c = biogeme.BIOGEME(db.Database('trips_constants', df_bg), {
+            'loglike': models.loglogit(utilities_c, availability, v['choice']),
+            'weight': v['weight_person'],
+        })
+        bg_c.modelName = f'utility_{variant_name(variant)}_constants'
+        results_c = bg_c.estimate()
     finally:
         os.chdir(cwd)
 
     params = results.get_estimated_parameters()
     rho2 = float(results.data.rhoBarSquareNull)
+    rho2_const = 1.0 - ((results.data.logLike - results.data.nparam)
+                        / (results_c.data.logLike - results_c.data.nparam))
     # Rename biogeme's default columns to snake_case so the on-disk CSV
     # follows this codebase's convention.
     params = params.rename(columns={
@@ -629,9 +650,7 @@ def _fit_and_extract(
         'Rob. t-test':  'rob_t_test',
         'Rob. p-value': 'rob_p_value',
     })
-    return params, rho2
-
-
+    return params, rho2, rho2_const
 
 
 def variant_name(variant) -> str:
@@ -645,14 +664,19 @@ def variant_name(variant) -> str:
 def main(variant):
     context = init_context()
     v = variant_name(variant)
+    scenario = get_scenario(context.scenario)
+    if f'utility_{v}' not in scenario.coefs:
+        logging.info(f"utility_{v} not declared in scenario {scenario.name!r} "
+                     f"(no utility grid); skipping")
+        context.close()
+        return
     coefs.resolve(
         context,
         name=f'utility_{v}',
         calibrate_fn=lambda: _fit_utility(context, variant),
     )
-    # Companion sidecar — SD averages + t_cut_min. Mirrors the parent's
-    # source declaration (validated in Scenario.__post_init__); the
-    # calibrate_fn only fires on `Calibrate()`.
+    # Companion sidecar — SD averages + t_cut_min. Same source declaration
+    # as the parent (validated in Scenario.__post_init__).
     coefs.resolve(
         context,
         name=f'utility_{v}_stats',
@@ -663,9 +687,8 @@ def main(variant):
 
 def _compute_utility_stats(context) -> pd.DataFrame:
     """SD averages + t_cut_min per mode, as a two-column `key, value`
-    DataFrame. Written to the `utility_<variant>_stats` companion CSV
-    (see `main` above). Only called on `Calibrate()` scenarios;
-    `ImportFrom` copies the file from the source scenario."""
+    DataFrame for the `utility_<variant>_stats` sidecar. Only called on
+    `Calibrate()` scenarios."""
     from main.common import compute_sd_averages, load_util_cutoffs_from_summary
     raw_legs = context.get_generic('survey_legs.csv', storage=Storage.PRIVATE)
     # Scope SD averages to the AOI so utility-stats align with the
@@ -683,7 +706,7 @@ def _compute_utility_stats(context) -> pd.DataFrame:
         logging.warning(
             "  ⚠ survey_summary.csv missing — t_cut_min NOT baked into "
             "stats. 09b's log-time extrapolation will fall back to pure "
-            "log. Re-run survey/08b to enable.")
+            "log. Re-run survey/08c to enable.")
     stats = pd.DataFrame(
         {'value': list(sd_averages.values()) + list(t_cut_min_per_mode.values())},
         index=(
@@ -698,9 +721,9 @@ def _compute_utility_stats(context) -> pd.DataFrame:
 
 
 def _fit_utility(context, variant) -> pd.DataFrame:
-    """Fit the biogeme MDCL model and return the coef DataFrame for
-    `coefs.resolve` to persist. Only called on `Calibrate()` scenarios;
-    `ImportFrom`/`HandWritten` short-circuit before reaching this."""
+    """Fit the biogeme MNL / nested-logit model and return the coef
+    DataFrame for `coefs.resolve` to persist. Only called on
+    `Calibrate()` scenarios."""
     logging.info(f"variant: time={variant.time}, ownership={variant.ownership}, "
                  f"ebikes={variant.ebikes}, single_leg_only={variant.single_leg_only}, "
                  f"subset_fraction={variant.subset_fraction}, "
@@ -744,11 +767,8 @@ def _fit_utility(context, variant) -> pd.DataFrame:
             logging.info(f"  → {len(df):,}/{n_before:,} kept ({100*len(df)/max(n_before,1):.1f} %)")
 
     with step('speed + detour envelope filter (from survey standardization)'):
-        # `is_within_speed_envelope` / `is_within_detour_envelope` are
-        # per-mode plausibility gates from the survey preparation. Same
-        # subset that 04's edge-weight calibration and 07's overhead
-        # calibration train on — so the utility model fits on
-        # data-quality-consistent legs.
+        # Per-mode plausibility gates from the survey preparation; the
+        # same ones 04 and 07a train on.
         n_before = len(df)
         for flag in ('is_within_speed_envelope', 'is_within_detour_envelope'):
             if flag in df.columns:
@@ -762,7 +782,6 @@ def _fit_utility(context, variant) -> pd.DataFrame:
             (df['dist_line'] >= _MIN_LEG_DIST_LINE_M)
             & (df['dist_line'] <= _MAX_LEG_DIST_LINE_M)
         ]
-        df = df[df['_chosen_mode'].isin(list(_MODE_IDS))]
         active_modes = set(modes_for_avail)
         df = df[df['_chosen_mode'].isin(active_modes)]
         df = df[df['availability_mismatch'] == 0]
@@ -805,13 +824,16 @@ def _fit_utility(context, variant) -> pd.DataFrame:
 
     with step('fit biogeme model'):
         scratch_root = Path(context.path_for(Storage.SCRATCH, 'biogeme'))
-        params, rho2 = _fit_and_extract(
+        params, rho2, rho2_const = _fit_and_extract(
             df, variant, features, run_dir=scratch_root / variant_name(variant))
-        logging.info(f"  → rho² (bar, vs null) = {rho2:.4f}")
+        logging.info(f"  → {len(df):,} legs; rho² (bar) vs null = {rho2:.4f}, "
+                     f"vs constants only = {rho2_const:.4f}")
         with pd.option_context('display.max_rows', None):
             logging.info('\n' + params[['value', 'rob_p_value']].round(4).to_string())
 
-    return params[['value', 'rob_std_err', 'rob_t_test', 'rob_p_value']].copy()
+    out = params[['value', 'rob_std_err', 'rob_t_test', 'rob_p_value']].copy()
+    out.loc['t_ref_min', 'value'] = UTILITY_T_REF_MIN
+    return out
 
 
 # ---------------------------------------------------------------------------

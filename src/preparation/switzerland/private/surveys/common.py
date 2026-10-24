@@ -1,15 +1,15 @@
 """
 Switzerland-specific helpers shared across the survey-prep scripts in this folder.
 
-Four groups:
+Main groups:
 
-  1. **Time-of-day / plausibility checks** (`is_peak`, `is_night`,
-     `is_realistic_speed`, `is_not_too_long`) plus their Swiss-tuned defaults
-     (`PEAK_HOURS_WEEKDAY`, `SPEED_ENVELOPES_KMH`, ...). The defaults assume
-     Swiss commuting patterns and the MZMV/MOBIS mode taxonomy.
+  1. **Time-of-day / plausibility** (`is_peak`, `is_night`, `report_intervals`)
+     plus their Swiss-tuned defaults (`PEAK_HOURS_WEEKDAY`, `SPEED_ENVELOPES_KMH`,
+     `MAX_DETOUR_RATIO`, `MAX_TRIP_GAP_S`, ...). The defaults assume Swiss
+     commuting patterns and the MZMV/MOBIS mode taxonomy.
 
-  2. **MZMV code → string mappings** (`wmittel2_to_str`, `f51300_to_str`,
-     `f52900a_to_str`, `f51700w_to_str`). These translate the integer column
+  2. **MZMV code → string mappings** (`WMITTEL2_TO_STR`, `F51300_TO_STR`,
+     `F52900A_TO_STR`, `F51700W_TO_STR`). These translate the integer column
      codes of the Swiss Mikrozensus Mobilität und Verkehr survey into
      human-readable mode / purpose strings.
 
@@ -23,17 +23,10 @@ These live here (not in `aperta/`) because they depend on Swiss-specific data: M
 column codes, Swiss electricity mix, Swiss external-cost calibrations, and Swiss
 commuting / mode-name conventions.
 
-Generic helpers that *used* to live in `aperta.surveys` (now removed) —
-bin labels, group-ID assignment, lat/lon transforms, straight-line
-distance, geometry simplification, time-zone attachment — landed in
-`aperta_atlas.utils` (timing + small numeric helpers),
-`aperta.data_processing` (`add_straight_line_dist` — still library-tier
-since aperta.calibration uses it), and here (`add_lat_lon`,
-`add_group_id`, `attach_time_zone` — atlas-local since surveys are
-their only caller).
-
-For Switzerland-wide constants used across multiple prep scripts (cities, coverage
-fractions), see `SWISS_CITIES_100K_POP` and `FRACTION_COVERED`.
+Also here: small generic helpers whose only callers are the survey scripts
+(`add_lat_lon`, `add_group_id`, `attach_time_zone`, `bin_labels`), the
+survey column allowlist (`ALLOWED_SURVEY_PREFIXES`), population coverage
+(`FRACTION_COVERED`) and the top-6 city subsets (`SWISS_CITIES_100K_POP`).
 """
 
 import logging
@@ -60,10 +53,8 @@ def add_lat_lon(
 
 
 def add_group_id(df: pd.DataFrame, id_col: str, out_col: str = "group_id") -> pd.DataFrame:
-    """Add `out_col` with sequential integer IDs based on unique values of `id_col`.
-
-    Uses `pd.factorize` — O(n) and avoids a materialised replacement dict.
-    """
+    """Add `out_col` with sequential integer IDs based on unique values of `id_col`
+    (in order of first appearance; NaN → -1)."""
     codes, _ = pd.factorize(df[id_col], sort=False)
     df[out_col] = codes
     return df
@@ -78,11 +69,6 @@ def attach_time_zone(dt: pd.Series, timezone_name: str) -> pd.Series:
     `'2021-04-15T14:30:00+02:00'`). Returns strings rather than
     tz-aware Timestamps so the column round-trips losslessly through
     CSV without pandas inferring a different dtype on reload.
-
-    Was previously in the deleted `aperta.surveys` (as
-    `attach_time_zone_to_pd_datetime`); lifted from
-    `_archive/uma_surveys/common/survey_processing.py` and parked here
-    because the only caller is `b_mzmv_process.py`.
     """
     tz = zoneinfo.ZoneInfo(timezone_name)
     return dt.apply(
@@ -100,12 +86,7 @@ def bin_labels(bins: Sequence[int | float]) -> list[str]:
     - First bin: `'leq{bins[1]}'` (or literal `'0'` if `bins[1] == 0`).
     - Last bin:  `'{bins[-2]+1}+'` (open-ended, "and above").
     - Single-value bins (where `bins[i]+1 == bins[i+1]`) collapse to
-      just the value, so `(0, 1, 5)` becomes `['leq1', '2to5']` and
-      `(-1, 0, 1)` becomes `['0', '1+']`.
-
-    Was previously in the deleted `aperta.surveys`; lifted from
-    `_archive/uma_surveys/common/survey_processing.py` and parked here
-    because the only callers live under `preparation/switzerland/surveys/`.
+      just the value, so `(-1, 0, 1, 2, 99)` becomes `['0', '1', '2', '3+']`.
     """
     out: list[str] = []
     for i in range(len(bins) - 1):
@@ -123,7 +104,7 @@ def bin_labels(bins: Sequence[int | float]) -> list[str]:
 # ---------------------------------------------------------------------------
 # Time-of-day / plausibility constants (Swiss commuting + mode taxonomy).
 # Used by the survey-prep scripts (`b_mzmv_process.py`, `b_mobis_process.py`)
-# to flag rows by peak/night/weekday and to drop implausible speeds.
+# to flag rows by peak/night/weekday and implausible speeds / detours / gaps.
 
 # The slowest part of peak hours in the morning is quite short; higher impact
 # in the afternoon.
@@ -141,8 +122,8 @@ NIGHT_HOURS_WEEKEND: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7, 8, 20, 21, 22, 2
 #   'anyebike' — ebike, assist limit unknown (MOBIS Mode::Ebicycle)
 # Deliberately STRICT — false positives (dropping legitimate trips) are
 # cheaper than false negatives (mode-misclassified trips silently
-# poisoning per-mode edge-weight calibration). Loosen only if a WARNING
-# on drop rate suggests real trips are being lost.
+# poisoning per-mode edge-weight calibration). Loosen only if the logged
+# out-of-envelope rate suggests real trips are being lost.
 SPEED_ENVELOPES_KMH: dict[str, tuple[float, float]] = {
     'walk':     (2.0,   8.0),  # 3-5 km/h typical; upper generous to admit GPS/rounding noise on brisk walks
     'rbike':    (5.0,  30.0),  # Mechanical bike; lower relaxed for Alpine climbs / urban stops
@@ -174,6 +155,46 @@ MAX_DETOUR_RATIO: dict[str, float] = {
 }
 
 
+# Trip-level time-gap envelope: gap = (last leg's arrival − first leg's
+# departure) − Σ leg `time_measured`, i.e. time between legs (waiting at
+# stops, transfers, parking). Gaps beyond MAX_TRIP_GAP_S, or beyond both
+# MAX_TRIP_GAP_RATIO × Σ legs and TRIP_GAP_RATIO_FLOOR_S, flag "did something
+# else along the way" (short stops / activities inside one reported trip);
+# gaps below MIN_TRIP_GAP_S flag inconsistent reports. The ratio term catches
+# stops inside short trips; its floor keeps ordinary waits at stops and
+# transfers in.
+MAX_TRIP_GAP_S: float = 30 * 60
+MAX_TRIP_GAP_RATIO: float = 1 / 2
+TRIP_GAP_RATIO_FLOOR_S: float = 5 * 60
+MIN_TRIP_GAP_S: float = -5 * 60
+
+
+def in_trip_order(legs: pd.DataFrame) -> pd.DataFrame:
+    """`legs` sorted by `trip_id`, then by the number that ends each leg id: ETNR for MTMC ids
+    (`<year>_<HHNR>_<ETNR>`, numbered over the survey day), the row number for MOBIS legs in
+    survey prep. Sorting the ids as text would put leg 10 before leg 9."""
+    seq = legs.index.astype(str).str.extract(r'(\d+)$', expand=False).astype(int)
+    return (legs.assign(_leg_seq=seq.to_numpy())
+            .sort_values(['trip_id', '_leg_seq']).drop(columns='_leg_seq'))
+
+
+def report_intervals(time_s: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Bounds (s) of the true times a report can stand for. Exact reading:
+    report ± 0.5 min. Rounded reading (reports on 5-min steps only):
+    report ± 2.5 min, except "5 min" → 0–7.5 min, since short trips are
+    hardly ever reported as 0. Returns `(exact_lo, exact_hi, rounded_lo,
+    rounded_hi, on_step)`; rounded bounds are NaN off the 5-min steps."""
+    m = np.round(time_s / 60.0)
+    on_step = (m % 5 == 0)
+    exact_lo = np.maximum(m - 0.5, 0.0) * 60.0
+    exact_hi = (m + 0.5) * 60.0
+    rounded_lo = np.where(m == 5, 0.0, np.maximum(m - 2.5, 0.0)) * 60.0
+    rounded_hi = (m + 2.5) * 60.0
+    rounded_lo = np.where(on_step, rounded_lo, np.nan)
+    rounded_hi = np.where(on_step, rounded_hi, np.nan)
+    return exact_lo, exact_hi, rounded_lo, rounded_hi, on_step
+
+
 def is_peak(df: pd.DataFrame,
             peak_hours: Sequence[int] = PEAK_HOURS_WEEKDAY) -> pd.Series:
     """1 if `hour_of_day` is in `peak_hours` AND `sd_bool_weekday == 1`, else 0."""
@@ -188,23 +209,6 @@ def is_night(df: pd.DataFrame,
     in_weekday_window = df['hour_of_day'].isin(weekday_hours)
     in_weekend_window = df['hour_of_day'].isin(weekend_hours)
     return ((weekday & in_weekday_window) | (~weekday & in_weekend_window)).astype(int)
-
-
-def is_realistic_speed(mode: str,
-                       speed_kmh: float,
-                       envelopes: dict[str, tuple[float, float]] = SPEED_ENVELOPES_KMH) -> int:
-    """1 if `speed_kmh` is in the realistic envelope for `mode`, else 0."""
-    if mode not in envelopes:
-        raise ValueError(
-            f"Unknown mode {mode!r}; known: {sorted(envelopes)}. "
-            f"Pass a custom `envelopes` dict to add modes.")
-    lo, hi = envelopes[mode]
-    return 1 if lo <= speed_kmh <= hi else 0
-
-
-def is_not_too_long(duration_s: float, max_seconds: int = 7200) -> int:
-    """1 if `duration_s` is at or below `max_seconds` (default 2 h), else 0."""
-    return 1 if duration_s <= max_seconds else 0
 
 
 # ---------------------------------------------------------------------------
@@ -298,19 +302,9 @@ MODE_TO_SIMPLIFIED: dict[str, str] = {
 # Plane-distance binning
 # ---------------------------------------------------------------------------
 
-def get_detailed_plane_mode(distance_m: float) -> str:
-    """Map a single distance to a short/medium/long plane category."""
-    if distance_m < 800_000:
-        return 'plane_short'
-    if distance_m < 3_000_000:
-        return 'plane_medium'
-    if distance_m < 99_000_000:
-        return 'plane_long'
-    return 'plane_na'
-
-
 def vectorized_plane_mode(dist_m: np.ndarray) -> np.ndarray:
-    """Vectorized counterpart to `get_detailed_plane_mode` for whole columns."""
+    """Map distances (m) to 'plane_short' (< 800 km), 'plane_medium' (< 3,000 km),
+    'plane_long' (< 99,000 km) or 'plane_na' (otherwise, incl. NaN)."""
     out = np.full(len(dist_m), 'plane_na', dtype=object)
     out[dist_m < 99_000_000] = 'plane_long'
     out[dist_m < 3_000_000] = 'plane_medium'
@@ -446,21 +440,17 @@ ALLOWED_SURVEY_PREFIXES: tuple[str, ...] = (
     'orig_', 'dest_', 'n_', 'weight_', 'route_', 'include_', 'group_', 'subset_',
     'elev_',  # endpoint elevation (`elev_orig`, `elev_dest` from DEM sample)
     'municipality_id', 'canton_id', 'zone_id', 'longest_leg_id', 'hh_',
-    # Cross-survey leg / trip / person identifiers (replace MOBIS's
-    # former `'_id' in c` substring catch-all — see `standardize.py`
-    # docstring for the intentional unification).
+    # Cross-survey leg / trip / person identifiers.
     'trip_id', 'leg_id', 'participant_id',
 )
 
 # Bike family: rbike / ebike25 / ebike45 = confirmed sub-types.
 # anybike = mixed/unknown (MOBIS pre-split, Bikesharing).
 # anyebike = ebike with unknown assist limit (MOBIS Ebicycle).
-# See `mode_simplified` docstring in `standardize.py` and the mapping
-# notes at the top of `b_mobis_process.py`.
+# See the `SPEED_ENVELOPES_KMH` notes above and the `_MOBIS_MODE_MAP`
+# notes in `b_mobis_process.py`.
 MODES_MODE_CHOICE_MODEL = (
     'walk', 'rbike', 'ebike25', 'ebike45', 'anybike', 'anyebike', 'car', 'transit')
-MODES_TRAVEL_TIME_MODEL = (
-    'walk', 'rbike', 'ebike25', 'ebike45', 'anybike', 'anyebike', 'car')
 
 # If max geometry size is 500 and min precision is 250 m, trajectories longer than
 # ~125 km will be excluded due to too many points after simplification.

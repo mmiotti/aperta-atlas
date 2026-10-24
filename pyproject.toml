@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aperta-atlas"
-version = "0.2.0a0"
+version = "0.3.0rc1"
 description = "Opinionated project scaffolding on top of the aperta accessibility-analysis library, plus the projects built on it."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -32,7 +32,7 @@ classifiers = [
 # library it sits on top of. No heavy data-handling deps — those are
 # behind the `projects` extra below.
 dependencies = [
-    "aperta>=0.4.0a0",
+    "aperta>=0.4.3a0,<0.5",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
 ]
@@ -51,7 +51,6 @@ dependencies = [
 projects = [
     "aperta[osm,topo,h3]",
     "pyaxis>=0.4",          # parse BFS PC-Axis (.px) files (Swiss data)
-    "contextily>=1.4",      # basemap tiles
 ]
 # Dev tooling. Mirrors aperta's `[dev]` extra so the pre-commit hooks (ruff
 # lint/format, mypy typecheck, jupytext sync, unittest on push) work the

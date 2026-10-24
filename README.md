@@ -42,6 +42,11 @@ Declared in [`src/scenarios.py`](src/scenarios.py):
   resolution-10 cells, with STATPOP / STATENT population and employment
   per building. The calibration scenario: it fits every coefficient set
   the other scenarios reuse.
+- **`switzerland-h10-public`** — `switzerland-h10` reproduced from public
+  inputs only. Every survey-derived coefficient set is read from
+  `<DATA_DIR_PUBLIC>/atlas/switzerland-h10-public/coefs/manual/`: unpack
+  `coefficients.zip` from the accessibility Zenodo record there. The
+  survey stages self-skip and no private data is read.
 - **`cambridgeuk-public`** — Cambridge (UK) on public data only (OSM,
   GHS-POP), walk / bike / car, with all coefficients transferred from
   `switzerland-h10`. Shows how to run a new region without local
@@ -50,17 +55,18 @@ Declared in [`src/scenarios.py`](src/scenarios.py):
   ([`src/scenarios_technical_validation.py`](src/scenarios_technical_validation.py)):
   `res-*` (cell resolution), `radii-*` (OD-tier radii),
   `cv-{de,fr}-{train,test}` (spatial cross-validation between language
-  regions), and `data-{coef,ghs}` (public-data population / employment
-  sources).
+  regions), `data-{coef,ghs}` (public-data population / employment
+  sources), and `network-tlmregio` (cars on the swissTLMRegio main roads).
 
 ## Repository layout
 
 ```
 src/
-    main/            # the pipeline: 01_cells_zones → … → 10_accessibilities (+ pipeline.yml)
+    main/            # the pipeline: 01_cells_zones → … → 10_accessibilities → 11_access_reach (+ pipeline.yml)
     survey/          # survey legs → routed times → overheads (needed for calibration + validation)
-    validation/      # predicted vs observed: travel times, transit trips, flows vs counters
-    visualization/   # figures
+    technical_validation/  # checks of a scenario: travel times vs surveys, transit trips, flows vs counters,
+                           #   exact vs tiered OD, scenario vs reference (plan in scenarios_technical_validation.py)
+    data_paper/      # figures and LaTeX table bodies of the Scientific Data descriptor
     preparation/     # scenario-free input preparation: world/ (public data, any region)
                      #   and switzerland/ (Swiss sources, partly restricted-access)
     aperta_atlas/    # project scaffolding: context + typed I/O, coefficients, variants, pipeline runner
@@ -94,7 +100,6 @@ DATA_DIR_PUBLIC=/absolute/path/to/your/data/root
 DATA_DIR_PRIVATE=/absolute/path/to/your/protected/data/root
 LOGGING_LEVEL=INFO
 APERTA_TRACK_DEPENDENCIES=1      # optional: dependency tracking in status/status.json
-CARTO_API_KEY=...                # optional: basemap tiles for visualization/story*.py
 ```
 
 ## Running
@@ -134,7 +139,7 @@ at all, by transferring everything from Switzerland — see
 |---|---|---|
 | `edge_weights_{walk,bike,car}` — per-edge travel times per profile | `main/04` | MTMC legs (walk, bike), MOBIS GPS legs (car) |
 | `node_trip_weights_car`, `flow_cost_bins_car` — trip generation + trip-time distribution | `main/03a` | MTMC car trips, cell population / employment |
-| `overheads_road` — per-cell origin / destination overheads | `main/07a` | MTMC legs |
+| `overheads_road` — door-to-door trip overheads per road profile | `main/07a` | MTMC trips |
 | `overheads_transit` — per-cell transit access overheads | `main/07b` | MTMC trips with a transit leg |
 | `utility_*` — mode-choice utility model | `main/09a` | MTMC legs + sociodemographics |
 | Population / employment intensities per OSM building tag | `preparation/switzerland/public/land_use/` | BFS STATPOP / STATENT |

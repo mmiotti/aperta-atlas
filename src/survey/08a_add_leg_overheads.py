@@ -10,15 +10,13 @@ Sidecar to survey/05's `survey_leg_times.csv` — writes per-leg columns:
 Downstream 09a reconstructs gross per-leg time as `t_routed_<p> +
 t_overhead_orig_<p> + t_overhead_dest_<p> − t_routed_bias_<p>` — matches
 what main/08a bakes into the gross ODM at c2c/c2z tiers. Uses the same
-helpers (`main.common.per_cell_{road,transit}_overheads` +
+helpers (`main.common.per_cell_road_overheads`, `per_cell_transit_overhead`,
 `route_time_alpha`) so numbers align.
 
 `t_routed_bias_<p> = (1 − α) × t_routed_<p>` where α comes from the
 `t_routed` row in `overheads_<road,transit>` for that profile.
 Positive bias means the raw routed time overestimates (subtract to
-correct); α = 1 → zero bias (no correction). For transit, α ≈ 0.86
-in the unconstrained fit corrects long z2z trips that would otherwise
-over-predict.
+correct); α = 1 → zero bias (no correction).
 
 Legs with NaN `orig_cell_id` / `dest_cell_id` (foreign endpoints) get
 NaN overhead on that side. NaN `t_routed_<p>` → NaN bias.
@@ -30,7 +28,7 @@ Inputs (PRIVATE, under `<scenario>/`):
     generic/survey_legs[_<leg_set>].csv          # from survey/02d_prepare_survey_legs
     generic/survey_leg_times[_<leg_set>].csv     # from survey/05 (per-leg t_routed_<p>)
 
-Inputs (PUBLIC, under `<scenario>/`):
+Inputs (scenario storage, under `<scenario>/`):
     properties/cells_{population,employment,snap,pois,transit_access}.csv
     properties/nodes_<mode>_extended.csv         # per-mode density join
     shapes/cells.gpkg
@@ -55,6 +53,7 @@ from aperta_atlas.utils import step
 from aperta_atlas.variant import Variants
 
 from main.common import (
+    ROAD_OVERHEAD_DENSITY_COL,
     SURVEY_LEG_SETS,
     per_cell_road_overheads,
     per_cell_transit_overhead,
@@ -64,10 +63,6 @@ from main.common import (
 )
 from mode_configs import TRANSIT_MODE_CONFIG
 from scenarios import get_scenario, scenario_needs_survey_prep
-
-
-# Per-node density column — kept in sync with 09a's `_DENSITY_COL`.
-_DENSITY_COL = 'density_r1000_norm'
 
 
 def _road_overhead_columns_for_leg(
@@ -81,8 +76,8 @@ def _road_overhead_columns_for_leg(
 ) -> tuple[pd.Series, pd.Series]:
     """Compute per-cell (orig, dest) overhead for one road profile and
     map onto legs via `orig_cell_id` / `dest_cell_id`. NaN cell → NaN
-    overhead. Mirrors what 08a bakes into the gross ODM so 09a fits the
-    same decomposition 10 reads back. `same_mode_profile_labels` lets
+    overhead. Mirrors what main/08a bakes into the gross ODM so 09a fits
+    the same decomposition 10 reads back. `same_mode_profile_labels` lets
     derived profiles (e.g. walk_prm) inherit the parent profile's
     overhead — see `resolve_road_overhead_column`.
     """
@@ -121,7 +116,9 @@ def main(variant):
         logging.info(f"  → {len(leg_times):,} rows joined")
 
     with step('load cells (population, employment, snap, pois, transit_access)'):
-        prop_cols = ['population', 'employment', 'snap', 'pois', 'transit_access']
+        prop_cols = ['population', 'employment', 'snap', 'pois']
+        if scenario.transit_source is not None:
+            prop_cols.append('transit_access')
         cells = context.get_properties('cells', prop_cols, add_shapes=True)
         logging.info(f"  → {len(cells):,} cells loaded")
 
@@ -129,11 +126,12 @@ def main(variant):
         road_coefs = context.get_coefs('overheads_road')
         logging.info(f"  → profiles in overheads_road: {list(road_coefs.columns)}")
 
-    with step('load overheads_transit coefs'):
-        transit_coefs = context.get_coefs('overheads_transit')
-        logging.info(f"  → transit coef rows: {list(transit_coefs.index)}")
+    if scenario.transit_source is not None:
+        with step('load overheads_transit coefs'):
+            transit_coefs = context.get_coefs('overheads_transit')
+            logging.info(f"  → transit coef rows: {list(transit_coefs.index)}")
 
-    # Output frame: NaN-initialised, one column pair per profile filled in below.
+    # Output frame: orig + dest overhead + routed bias per profile, filled in below.
     out = pd.DataFrame(index=legs.index)
 
     # ---- Road modes -------------------------------------------------------
@@ -146,8 +144,8 @@ def main(variant):
             cells_m = cells.copy()
             density_col_local = f'_density_{mode}'
             cells_m = cells_m.join(
-                node_props[[_DENSITY_COL]].rename(
-                    columns={_DENSITY_COL: density_col_local}),
+                node_props[[ROAD_OVERHEAD_DENSITY_COL]].rename(
+                    columns={ROAD_OVERHEAD_DENSITY_COL: density_col_local}),
                 on=node_col)
             cells_m[density_col_local] = cells_m[density_col_local].fillna(0.0)
 
@@ -190,33 +188,36 @@ def main(variant):
                     f"median bias = {out[f't_routed_bias_{label}'].median():.1f} s")
 
     # ---- Transit ----------------------------------------------------------
-    with step(f'profile={TRANSIT_MODE_CONFIG.mode}: per-cell + per-leg overhead + routed bias'):
-        per_cell_ov = per_cell_transit_overhead(cells, transit_coefs)
-        # Symmetric: same per-cell value at origin and destination sides.
-        orig_ov = legs['orig_cell_id'].map(per_cell_ov)
-        dest_ov = legs['dest_cell_id'].map(per_cell_ov)
-        out[f't_overhead_orig_{TRANSIT_MODE_CONFIG.mode}'] = orig_ov
-        out[f't_overhead_dest_{TRANSIT_MODE_CONFIG.mode}'] = dest_ov
-        # α scaling: (1 − α) × t_routed_transit_z2z. α comes from the
-        # `transit` column's `t_routed` row (unconstrained fit) — 1.0 if
-        # only a constrained-α fit is available.
-        alpha_transit = route_time_alpha(transit_coefs['transit'])
-        routed_col_transit = 't_routed_transit_z2z'
-        if routed_col_transit in leg_times.columns:
-            out[f't_routed_bias_{TRANSIT_MODE_CONFIG.mode}'] = (
-                (1.0 - alpha_transit) * leg_times[routed_col_transit])
-        else:
-            logging.warning(
-                f"  ⚠ {routed_col_transit!r} missing from survey_leg_times.csv; "
-                f"t_routed_bias_{TRANSIT_MODE_CONFIG.mode} will be NaN.")
-            out[f't_routed_bias_{TRANSIT_MODE_CONFIG.mode}'] = float('nan')
-        n_finite = int((orig_ov.notna() & dest_ov.notna()).sum())
-        logging.info(
-            f"  → α = {alpha_transit:.4f} (bias = (1−α) × t_routed_transit_z2z); "
-            f"{n_finite:,}/{len(legs):,} legs with finite orig+dest transit "
-            f"overhead; per-cell median = {per_cell_ov.median():.1f} s, "
-            f"median bias = "
-            f"{out[f't_routed_bias_{TRANSIT_MODE_CONFIG.mode}'].median():.1f} s")
+    if scenario.transit_source is None:
+        logging.info('no transit in this scenario; skipping transit overheads')
+    else:
+        with step(f'profile={TRANSIT_MODE_CONFIG.mode}: per-cell + per-leg overhead + routed bias'):
+            per_cell_ov = per_cell_transit_overhead(cells, transit_coefs)
+            # Symmetric: same per-cell value at origin and destination sides.
+            orig_ov = legs['orig_cell_id'].map(per_cell_ov)
+            dest_ov = legs['dest_cell_id'].map(per_cell_ov)
+            out[f't_overhead_orig_{TRANSIT_MODE_CONFIG.mode}'] = orig_ov
+            out[f't_overhead_dest_{TRANSIT_MODE_CONFIG.mode}'] = dest_ov
+            # α scaling: (1 − α) × t_routed_transit_z2z. α comes from the
+            # `transit` column's `t_routed` row (unconstrained fit) — 1.0 if
+            # only a constrained-α fit is available.
+            alpha_transit = route_time_alpha(transit_coefs['transit'])
+            routed_col_transit = 't_routed_transit_z2z'
+            if routed_col_transit in leg_times.columns:
+                out[f't_routed_bias_{TRANSIT_MODE_CONFIG.mode}'] = (
+                    (1.0 - alpha_transit) * leg_times[routed_col_transit])
+            else:
+                logging.warning(
+                    f"  ⚠ {routed_col_transit!r} missing from survey_leg_times.csv; "
+                    f"t_routed_bias_{TRANSIT_MODE_CONFIG.mode} will be NaN.")
+                out[f't_routed_bias_{TRANSIT_MODE_CONFIG.mode}'] = float('nan')
+            n_finite = int((orig_ov.notna() & dest_ov.notna()).sum())
+            logging.info(
+                f"  → α = {alpha_transit:.4f} (bias = (1−α) × t_routed_transit_z2z); "
+                f"{n_finite:,}/{len(legs):,} legs with finite orig+dest transit "
+                f"overhead; per-cell median = {per_cell_ov.median():.1f} s, "
+                f"median bias = "
+                f"{out[f't_routed_bias_{TRANSIT_MODE_CONFIG.mode}'].median():.1f} s")
 
     context.create_generic(
         out, survey_file('survey_leg_overheads.csv', leg_set), storage=Storage.PRIVATE)

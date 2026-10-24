@@ -31,8 +31,8 @@ multiple matching tags (rare — e.g. an `amenity:restaurant` also tagged
 Way features become point features: the polygon centroid for closed
 rings (school buildings, parks), the length-weighted LineString
 centroid for open ways (hiking trails). Relations (multipolygon
-campuses, complex park boundaries) are not yet handled — V1 covers
-node + way only; revisit if specific category coverage looks short.
+campuses, complex park boundaries) are not handled — nodes and ways
+only.
 
 Cases are defined in `preparation/world/areas.py`; this script registers
 one `<area_name>_pois` variant per area.
@@ -55,6 +55,7 @@ Single variant:
 """
 
 import logging
+from collections import Counter
 
 import geopandas as gpd
 import osmium
@@ -125,7 +126,7 @@ POI_CATEGORIES: dict[str, list[tuple[str, float]]] = {
         ('shop:florist',         0.5),
     ],
     # ---- Healthcare ------------------------------------------------
-    # Split out of errands_services so "services" doesn't conflate
+    # Separate from errands_services so "services" doesn't conflate
     # admin/retail with medical. Pharmacy stays in scope for routine
     # access; clinic weighted highest because clinics are
     # multi-physician hubs (fewer features, more visits per feature).
@@ -194,8 +195,9 @@ POI_CATEGORIES: dict[str, list[tuple[str, float]]] = {
         ('leisure:dog_park',         1.0),
     ],
     'poi_leisure_hiking': [
-        # ~50k+ guideposts on Swiss hiking trails; low weight prevents
-        # them from dominating the category by count.
+        # ~50k+ guideposts on Swiss hiking trails; when weights are
+        # applied, the low weight keeps them from dominating the category
+        # (unweighted counts, as in the atlas's 01, are dominated by them).
         ('information:guidepost',   0.2),
         ('highway:trailhead',       1.0),
         ('leisure:park',            0.5),
@@ -217,10 +219,9 @@ POI_CATEGORIES: dict[str, list[tuple[str, float]]] = {
         ('leisure:track',          1.0),
     ],
     # ---- Tourism --------------------------------------------------
-    # Tourism destinations carved out of `poi_leisure_amenity` so the
-    # amenity slot stays focused on local/everyday culture and this
-    # slot captures the kinds of POIs that draw cross-region trips.
-    # Resorts moved here from amenity for the same reason.
+    # POIs that draw cross-region trips (incl. resorts), kept apart from
+    # `poi_leisure_amenity` so that slot stays focused on local /
+    # everyday culture.
     'poi_tourism': [
         ('tourism:museum',       2.0),
         ('tourism:gallery',      0.5),
@@ -388,7 +389,6 @@ def main(variant) -> None:
             handler.apply_file(pbf_path, locations=True)
         # By-category summary so the downstream step has a baseline to
         # compare against after snap-to-network-node.
-        from collections import Counter
         cat_counts = Counter(f[0] for f in handler.features)
         n_features = len(handler.features)
         logging.info(

@@ -1,11 +1,11 @@
 """
 Prepare survey trip legs for the Swiss Urban Mobility Atlas — takes a
 standardized survey source and produces a scenario-scoped legs table for
-the downstream survey scripts (05, 08a, 08b) and the calibration stages.
+the downstream survey scripts (05, 08a–c) and the calibration stages.
 
 One variant per leg set (`main.common.SURVEY_LEG_SETS`):
   - `mtmc` (default): MZMV 2015 + 2021 → `survey_legs.csv`, the canonical
-    set read by 03a, 04, 07a/b, 08b/c and 09a.
+    set read by 03a, 07a/b, 09a, survey/05–08c and the validation scripts.
   - `mobis_precovid` / `mobis_covid`: validation-only MOBIS GPS legs → a
     fixed-seed random sample of 100k legs in `survey_legs_<leg_set>.csv`.
     Keep the cohorts apart: precovid is normal traffic (and car's training
@@ -16,9 +16,10 @@ Concatenates the source vintages (MZMV with a `year` column), filters to
 mode-choice-model rows, then enriches each with:
 
 - Per mode (walk/bike/car): nearest snap-eligible node + snap distance
-  for both origin AND destination → 10 columns.
-- Cell + zone assignment for both endpoints → 4 columns. Foreign
-  endpoints (with a small nearest-neighbour grace radius) get NaN.
+  for both origin AND destination → 4 columns per mode.
+- Cell + zone assignment for both endpoints → 4 columns. Endpoints
+  outside every cell / zone (beyond a small nearest-neighbour grace
+  radius) get NaN.
 
 A final completeness filter drops trips where any endpoint snap failed
 OR any cell/zone id is NaN — makes downstream (survey/05) simpler
@@ -31,7 +32,7 @@ Inputs (PRIVATE, under `preparation/switzerland/surveys/`):
     mobis_precovid/legs.csv                  # mobis_precovid
     mobis_covid/legs.csv                     # mobis_covid
 
-Inputs (PUBLIC, under `<scenario>/`):
+Inputs (scenario storage, under `<scenario>/`):
     nw/<mode>.graphml + properties/edges_<mode>_core.csv
     shapes/cells.gpkg, shapes/zones.gpkg
 
@@ -67,8 +68,9 @@ _MOBIS_SAMPLE_N = 100_000
 _MOBIS_SAMPLE_SEED = 0
 
 # Uniform snap radius across modes. Generous enough to catch most
-# residential origins; endpoints beyond this distance leave NaN
-# node_id + NaN snap_dist for that mode (downstream can filter).
+# residential origins; endpoints beyond it get NaN node_id + snap_dist for
+# that mode (dropped by the completeness filter). Raised to the scenario's
+# cell snap radius where that is larger (sparse networks).
 _MAX_SNAP_RADIUS = 500.0
 
 # Snap-eligibility setup — must match 02a so survey snaps land on the
@@ -77,10 +79,8 @@ _DIRECTEDNESS = 'directed_scc'
 
 # Columns kept from each year's legs.csv. `sd_*` numeric columns are
 # discovered + appended programmatically (varies by survey year).
-# `is_within_speed_envelope` + `is_within_detour_envelope` are kept for
-# downstream calibration/validation filters (04, 07, 09a, and the
-# validation scripts); NOT filtered on here because mode-choice modelling
-# doesn't need them.
+# `is_within_{speed,detour,gap}_envelope` are kept, not filtered on: each
+# consumer (03a, 07a/b, 09a, the validation scripts) applies the ones it needs.
 _KEEP_COLS = [
     'orig_x', 'orig_y', 'dest_x', 'dest_y',
     'dist_measured', 'time_measured',
@@ -93,7 +93,13 @@ _KEEP_COLS = [
     'n_legs_in_trip',
     'is_within_speed_envelope',
     'is_within_detour_envelope',
+    'is_within_gap_envelope',
 ]
+# Kept when present (MZMV only; MOBIS legs carry `started_at` instead):
+# departure / arrival times — trip-level door-to-door time incl. waiting
+# between legs (main.common.aggregate_transit_trips) and timetable-based
+# transit routing (survey/08d).
+_KEEP_COLS_OPTIONAL = ['datetime_departure', 'datetime_arrival']
 
 
 def _load_legs(surveys_ctx, survey_name: str) -> pd.DataFrame:
@@ -145,16 +151,11 @@ def main(variant):
 
     with step('filter to valid legs in mode-choice mode set'):
         before = len(legs)
-        # `is_land_based` is defense-in-depth: the mode filter below
-        # already excludes 'plane'/'boat'/'aerialway' (they're not in
-        # MODES_MODE_CHOICE_MODEL). Keeping the explicit flag check so
-        # future taxonomy changes can't sneak non-land modes through.
-        # `is_within_elevation_band` gates on DEM validity + alpine
-        # exclusion (composite from standardize.py) — same subset that
-        # 04 and 07 use.
-        # Not filtering on `is_within_speed_envelope` — speed measurement
-        # noise doesn't disqualify a trip from mode-choice modeling
-        # (it's a training-set concern for edge-weight calibration).
+        # `is_land_based` is defense-in-depth: the mode filter already
+        # excludes plane / boat / aerialway, but taxonomy changes can't
+        # sneak non-land modes through. `is_within_elevation_band` gates
+        # on DEM validity + alpine exclusion (standardize.py), as in 04
+        # and 07a. Envelope flags are kept, not filtered on (see `_KEEP_COLS`).
         legs = legs.loc[
             (legs['is_valid_domestic_trip'] == 1)
             & (legs['is_land_based'] == 1)
@@ -173,7 +174,9 @@ def main(variant):
             c for c in legs.columns
             if c.startswith('sd_') and pd.api.types.is_numeric_dtype(legs[c])
         ]
-        cols = _KEEP_COLS + sd_cols + (['year'] if 'year' in legs.columns else [])
+        optional = [c for c in _KEEP_COLS_OPTIONAL if c in legs.columns]
+        cols = (_KEEP_COLS + optional + sd_cols
+                + (['year'] if 'year' in legs.columns else []))
         missing = [c for c in cols if c not in legs.columns]
         if missing:
             raise KeyError(f"Expected columns missing from legs: {missing}")
@@ -185,7 +188,9 @@ def main(variant):
     dest_pts = _points_from_xy(legs, 'dest_x', 'dest_y', crs_main)
 
     # -------- Per-mode snap (orig + dest) ---------------------------------
-    for mode in _MODES:
+    max_snap_radius = max(_MAX_SNAP_RADIUS, scenario.snap.max_cell_radius_m)
+    modes = [m for m in _MODES if m in scenario.mode_configs]
+    for mode in modes:
         with step(f'mode={mode}: load graph + compute snap-eligible nodes'):
             # `add_edge_properties='core'` re-attaches the `cost_excluded_<mode>`
             # flag 02a wrote, so we derive the same SCC subset cells used.
@@ -207,7 +212,7 @@ def main(variant):
             with step(f'mode={mode}: snap {endpoint}'):
                 ids, dists = network_snap.snap_to_network_nodes(
                     pts, graph,
-                    max_distance=_MAX_SNAP_RADIUS,
+                    max_distance=max_snap_radius,
                     eligible_node_ids=snap_eligible,
                 )
                 legs[f'{endpoint}_node_id_{mode}']  = ids.values
@@ -232,15 +237,13 @@ def main(variant):
                 f"  → {cell_ids.notna().sum():,}/{len(legs):,} matched to cells, "
                 f"{zone_ids.notna().sum():,}/{len(legs):,} matched to zones")
 
-    # Final completeness filter — makes downstream (survey/05) cleaner.
-    # Drops trips where ANY of the 6 mode-snap columns OR any of the 4
-    # cell/zone ids is NaN. All modes must snap for both endpoints
-    # (otherwise the trip is routable for some modes only, complicating
-    # calibration); foreign trips beyond the nearest-neighbour cap can't
-    # be located in the atlas. Reports drops per cause separately.
+    # Completeness filter: drop trips with ANY NaN mode-snap node id or
+    # cell/zone id, so every remaining leg is routable on every mode and
+    # located in the atlas (survey/05 needs no per-mode snap checks).
+    # Drops are reported per cause.
     with step('drop trips with missing snap / cell-zone (two-batch report)'):
         before = len(legs)
-        node_cols = [f'{e}_node_id_{m}' for e in ('orig', 'dest') for m in _MODES]
+        node_cols = [f'{e}_node_id_{m}' for e in ('orig', 'dest') for m in modes]
         network_missing = legs[node_cols].isna().any(axis=1)
         cell_zone_missing = (
             legs['orig_cell_id'].isna() | legs['dest_cell_id'].isna()

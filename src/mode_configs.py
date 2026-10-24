@@ -81,8 +81,8 @@ class ModeConfig:
 
 
 # Bike: rbike fit against the scenario's bike ground truth (`edge_weights_sources['bike']`);
-# ebike25 / ebike45 derived (05's
-# `_EBIKE_DERIVATIONS`). All three columns share `edges_bike_calibrated.csv`;
+# ebike25 / ebike45 derived (04's `_EBIKE_DERIVATIONS`). All three columns share
+# `edges_bike_calibrated.csv`;
 # each profile gets its own cost ODM.
 _BIKE_SOURCES: dict[str | None, CalibratedSource] = {
     'rbike': CalibratedSource(
@@ -167,8 +167,8 @@ TRANSIT_MODE_CONFIG: ModeConfig = ModeConfig(
     profiles=[None],
     radii=_UNIFIED_RADII,
     time_cutoff_s=5_400.0,
-    # 5 min floor: walk to stop + wait + board + ride + walk. Also
-    # protects against NPVM same-zone = 0 s + negative overhead.
+    # 5 min floor: walk to stop + wait + board + ride + walk. (NPVM has no
+    # same-zone times: same-zone pairs stay NaN, i.e. unreachable by transit.)
     min_route_time_s=300.0,
     min_route_disutility=3.0,
 )

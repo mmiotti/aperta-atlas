@@ -4,27 +4,27 @@ Unified per-cell accessibility computation across all modes.
 Every mode's cell-baked ODM has the same origin + destination shape,
 so the metric loop is symmetric across walk / bike / car / transit.
 Per (grid × mode × profile):
-  1. Load the cell-baked ODM (fully-gross for road, or util variant
-     from 09b) and its geo pair index (from 08a).
+  1. Load the cell-baked cost ODM (gross time from 08a, disutility from
+     09b, or straight-line distance from 08b) and its geo pair index.
   2. Apply per-mode floor (`min_route_time_s` / `min_route_disutility`).
-  3. Run three metric families (cumulative, nearest_k, gravity) per
+  3. Run three metric families (bin counts, nearest_k, gravity) per
      destination column; batches destinations to cap weight memory.
   4. Save `access_<grid>_<metric>_<profile>.csv`. Profile alone is
-     unique across modes.
+     unique across modes; mode-agnostic dist_line grids have no suffix.
 
-Inputs (PUBLIC, under `<scenario>/`):
+Inputs (scenario storage, under `<scenario>/`):
     odm/<mode>_time_gross_<profile>.npz     # 08a — road gross-time
     odm/<mode>_geo_pairs.npz                # 08a — road geo pair index
     odm/transit_time_gross_npvm.npz         # 08a — transit gross-time
     odm/transit_geo_pairs.npz               # 08a — transit geo pair index
-    odm/<mode>_dist_line.npz                # 08b — straight-line distance (dist_line grids only)
+    odm/dist_line_{geo_pairs,dist_line}.npz # 08b — straight-line distance (dist_line grids only)
     odm/<mode>_util_<profile>_<var>.npz     # 09b — road disutility per variant
     odm/transit_util_npvm_<var>.npz         # 09b — transit disutility per variant
     properties/cells_*.csv + shapes/cells.gpkg
     properties/zones_*.csv + shapes/zones.gpkg
 
-Output (PUBLIC, under `<scenario>/`):
-    properties/cells_access_<grid>_<metric>_<profile>.csv
+Output (scenario storage, under `<scenario>/`):
+    properties/cells_access_<grid>_<metric>[_<profile>].csv
 
 Run all grids (default):
     python -m main.10_accessibilities --scenario <name>
@@ -67,12 +67,12 @@ def _iter_plan(scenario) -> list[tuple[str, str, ModeConfig]]:
     for case in scenario.mode_configs.values():
         for profile in case.profiles:
             plan.append((case.mode, case.source_for(profile).name, case))
-    plan.append(('transit', 'transit', TRANSIT_MODE_CONFIG))
+    if scenario.transit_source is not None:
+        plan.append(('transit', 'transit', TRANSIT_MODE_CONFIG))
     return plan
 
 
-def _compute_and_save_metrics(
-    context,
+def _compute_metrics(
     costs_final: TieredODGeoPairs,
     pairs_geo: TieredODGeoPairs,
     cells: pd.DataFrame,
@@ -80,7 +80,6 @@ def _compute_and_save_metrics(
     zones_m: pd.DataFrame,
     cell_to_zone: dict,
     grid_key: str,
-    grid,
     is_util: bool,
     mode: str,
     profile_label: str,
@@ -89,9 +88,10 @@ def _compute_and_save_metrics(
     bins,
     ks,
     decays,
-) -> None:
-    """Run all three metric families for one (grid, mode, profile) triple
-    and save one CSV per family. Batches destinations to cap
+) -> dict[str, pd.DataFrame]:
+    """Run all three metric families for one (grid, mode, profile) triple;
+    returns `{family: cells × columns}` for the families with parameters
+    (`counts`, `nearest_k`, `gravity`). Batches destinations to cap
     simultaneous weight-ODM memory."""
     compute_cum = bool(bins)
     compute_nk = bool(ks)
@@ -135,24 +135,29 @@ def _compute_and_save_metrics(
                 else:
                     parts_grav.append(raw)
 
-    # Concatenate + save per metric family. Empty profile_label
-    # (dist_line, mode-agnostic) drops the trailing suffix.
-    pref = 'access_'
+    metrics: dict[str, pd.DataFrame] = {}
+    if compute_cum:
+        cum = flatten_bin_dest_columns(pd.concat(parts_cum, axis=1))
+        metrics['counts'] = cum.reindex(cells.index, fill_value=np.nan)
+    if compute_nk:
+        nk = flatten_k_dest_columns(pd.concat(parts_nk, axis=1))
+        metrics['nearest_k'] = nk.reindex(cells.index)
+    if compute_grav:
+        gv = flatten_decay_dest_columns(pd.concat(parts_grav, axis=1))
+        metrics['gravity'] = gv.reindex(cells.index, fill_value=np.nan)
+    return metrics
+
+
+def _save_metrics(context, metrics: dict[str, pd.DataFrame], grid_key: str, is_util: bool,
+                  profile_label: str) -> None:
+    """One `cells_access_<grid>_<family>[_<profile>]` CSV per metric family.
+    Empty `profile_label` (dist_line, mode-agnostic) drops the suffix."""
+    formats = {'counts': '%.0f', 'nearest_k': '%.2f' if is_util else '%.1f',
+               'gravity': '%.3g'}
     suffix = f'_{profile_label}' if profile_label else ''
-    with step(f'grid={grid_key} mode={mode} profile={profile_label}: concat + save'):
-        if compute_cum:
-            cum = flatten_bin_dest_columns(pd.concat(parts_cum, axis=1))
-            cum = cum.reindex(cells.index, fill_value=np.nan)
-            context.create_properties(cum, f'{pref}{grid_key}_counts{suffix}', float_format='%.0f')
-        if compute_nk:
-            nk = flatten_k_dest_columns(pd.concat(parts_nk, axis=1))
-            nk = nk.reindex(cells.index)
-            fmt = '%.2f' if is_util else '%.1f'
-            context.create_properties(nk, f'{pref}{grid_key}_nearest_k{suffix}', float_format=fmt)
-        if compute_grav:
-            gv = flatten_decay_dest_columns(pd.concat(parts_grav, axis=1))
-            gv = gv.reindex(cells.index, fill_value=np.nan)
-            context.create_properties(gv, f'{pref}{grid_key}_gravity{suffix}', float_format='%.3g')
+    for family, df in metrics.items():
+        context.create_properties(df, f'access_{grid_key}_{family}{suffix}',
+                                  float_format=formats[family])
 
 
 def main():
@@ -182,9 +187,7 @@ def main():
     with step('load cells + zones (all properties + shapes)'):
         prop_cols = ['population', 'snap', 'pois', 'employment']
         cells_full = context.get_properties('cells', prop_cols, add_shapes=True)
-        zones = context.get_properties(
-            'zones', ['population', 'snap', 'pois', 'employment'],
-            add_shapes=True)
+        zones = context.get_properties('zones', prop_cols, add_shapes=True)
         # `cells_m` covers ALL cells (including cross-border buffer) so
         # `lookup_dest_column_geo` can resolve buffer-cell destinations
         # produced by 08a/08b. `cells` is the is_active subset, used
@@ -279,10 +282,11 @@ def main():
                     routing.floor_intrazonal_costs(costs, min_cost=min_val)
                     if min_val is not None else costs)
 
-            _compute_and_save_metrics(
-                context, costs_floored, pairs_geo, cells, cells_m,
-                zones_m, cell_to_zone, grid_key, grid, is_util,
-                mode, label, dest_cols, scaled_dests, bins, ks, decays)
+            metrics = _compute_metrics(
+                costs_floored, pairs_geo, cells, cells_m, zones_m, cell_to_zone,
+                grid_key, is_util, mode, label, dest_cols, scaled_dests, bins, ks, decays)
+            with step(f'grid={grid_key} mode={mode} profile={label}: save'):
+                _save_metrics(context, metrics, grid_key, is_util, label)
 
     context.close()
 

@@ -2,26 +2,26 @@
 Materialize cell-baked GROSS-TIME ODMs — one per (road mode, profile),
 plus one for transit. 09b / 10 read these as-is (no further overhead).
 
-**Road**: reindex 05's node-keyed NET-TIME ODMs to cell/zone keys and
-bake the full per-cell road overhead (const + density + snap-distance)
-at both endpoints.
+**Road**: reindex 05's node-keyed NET-TIME ODMs to cell/zone keys, scale
+by the fitted α (`route_time_alpha`) and bake the full per-cell road
+overhead (const + density + snap-distance) at both endpoints.
 
 **Transit**: build a cell-tier pair index by spatial proximity, fill
-each pair's base cost from 05's z2z NPVM time via `cell_to_zone`, then
-bake the per-cell transit overhead. All cells in a zone share the
+each pair's base cost from 05's z2z NPVM time via `cell_to_zone`, scale
+by α, then bake the per-cell transit overhead. All cells in a zone share the
 z2z base; per-cell overhead creates within-zone variation — the
 correction that makes transit accessibility genuinely per-cell.
 
-Inputs (PUBLIC, under `<scenario>/`):
+Inputs (scenario storage, under `<scenario>/`):
     odm/<mode>_node_pairs.npz                                  # from 05 (node-keyed tiered pair index)
     odm/<mode>_time_net_<profile>.npz                          # from 05 (per-profile node net-time)
     odm/transit_z2z_pairs.npz + transit_time_net_npvm.npz      # from 05 (z2z-only)
     properties/cells_*.csv + shapes/cells.gpkg + zones_*.csv + shapes/zones.gpkg
-    properties/nodes_<mode>_extended.csv                       # from 02b — density_r1000_norm per snap node
-    coefs/<kind>/overheads_road.csv                            # from 07 — per-profile road coefs
-    coefs/<kind>/overheads_transit.csv                         # from 07/handwritten — transit coefs
+    properties/nodes_<mode>_extended.csv                       # from 02b — ROAD_OVERHEAD_DENSITY_COL per snap node
+    coefs/<kind>/overheads_road.csv                            # from 07a — per-profile road coefs
+    coefs/<kind>/overheads_transit.csv                         # from 07b — transit coefs
 
-Outputs (PUBLIC, under `<scenario>/`):
+Outputs (scenario storage, under `<scenario>/`):
     odm/<mode>_geo_pairs.npz                                   # geo-keyed tiered pair index (road)
     odm/<mode>_time_gross_<profile>.npz                        # cell-baked gross-time ODM per road profile
                                                                # (parallels 05's `<mode>_time_net_<profile>.npz`)
@@ -39,7 +39,7 @@ from typing import cast
 import numpy as np
 import pandas as pd
 
-from aperta import od_pairs, overhead, routing
+from aperta import od_pairs, overhead
 from aperta.od_pairs import TieredODGeoPairs, TieredODNodePairs
 from aperta_atlas.context import init_context
 from aperta_atlas.utils import step
@@ -47,6 +47,7 @@ from aperta_atlas.utils import step
 from aperta.data_processing import weighted_group_mean
 
 from main.common import (
+    ROAD_OVERHEAD_DENSITY_COL,
     per_cell_road_overheads,
     per_cell_transit_overhead,
     resolve_road_overhead_column,
@@ -54,9 +55,6 @@ from main.common import (
 )
 from mode_configs import TRANSIT_MODE_CONFIG
 from scenarios import get_scenario
-
-
-_DENSITY_COL = 'density_r1000_norm'
 
 
 def _scale_tiered_costs_in_place(costs, factor: float) -> None:
@@ -171,23 +169,19 @@ def _build_transit_gross(
         z2z = _z2z_lookup(context)
         base_costs = _fill_transit_base_costs(transit_pairs, z2z, cell_to_zone)
 
-    with step(
-        f'mode=transit: floor at {TRANSIT_MODE_CONFIG.min_route_time_s:.0f}s + '
-        f'scale by α + bake per-cell transit overhead'
-    ):
-        base_floored = routing.floor_intrazonal_costs(
-            base_costs, min_cost=TRANSIT_MODE_CONFIG.min_route_time_s)
-
+    # The minimum trip time applies to the door-to-door cost (10_accessibilities), as in the
+    # overhead calibration (07b) and the utility model (09a), not to the NPVM base time.
+    with step('mode=transit: scale by α + bake per-cell transit overhead'):
         transit_coefs = context.get_coefs('overheads_transit')
         alpha_transit = route_time_alpha(transit_coefs['transit'])
-        _scale_tiered_costs_in_place(base_floored, alpha_transit)
+        _scale_tiered_costs_in_place(base_costs, alpha_transit)
         per_cell_ov = per_cell_transit_overhead(cells_m, transit_coefs)
         cb_weight = cells_m['combined_total']
         zone_ids_series = cells_m['zone_id']
         zone_mean_ov = weighted_group_mean(per_cell_ov, cb_weight, zone_ids_series)
 
         costs_gross = overhead.add_geo_overheads(
-            base_floored, transit_pairs,
+            base_costs, transit_pairs,
             origin_cell=per_cell_ov, dest_cell=per_cell_ov,
             origin_zone=zone_mean_ov, dest_zone=zone_mean_ov,
             cell_to_zone=cell_to_zone,
@@ -215,12 +209,14 @@ def main():
         # `transit_access` needed by `per_cell_transit_overhead` —
         # `overheads_transit` coefs reference its `*_zone_dev` columns.
         prop_cols = ['population', 'snap', 'employment']
-        cells = context.get_properties('cells', prop_cols + ['transit_access'], add_shapes=True)
+        transit_cols = ['transit_access'] if scenario.transit_source else []
+        cells = context.get_properties('cells', prop_cols + transit_cols, add_shapes=True)
         zones = context.get_properties('zones', prop_cols, add_shapes=True)
-        # Keep the full cells frame: origins are restricted to is_active
-        # (Swiss cells snapped to every active mode) post-reindex, but
-        # destinations remain per-mode-snappable including buffer cells,
-        # so cross-border destinations reach the geo_pairs.
+        # Keep the full cells frame: origin nodes are those of is_active
+        # cells (Swiss cells snapped to every active mode; 05's
+        # `orig_cells`), but destinations remain per-mode-snappable
+        # including buffer cells, so cross-border destinations reach the
+        # geo_pairs.
         active_cell_ids = set(cells.loc[cells['is_active'] == 1].index)
         logging.info(f"  → {len(cells):,} cells ({len(active_cell_ids):,} active origins), "
                      f"{len(zones):,} zones")
@@ -242,7 +238,7 @@ def main():
             # Dest-side filter matches 05's: cells with valid snap for THIS
             # mode + valid zone_id + zone present in zones_m. Buffer cells
             # (`is_aoi=False`) that snap successfully stay in as destinations
-            # — origins get restricted to is_active post-reindex.
+            # — origin nodes are those of is_active cells (05's `orig_cells`).
             zones_m = zones[zones[node_col].notna()].copy()
             keep_dest = (
                 cells[node_col].notna()
@@ -255,8 +251,8 @@ def main():
                          f"({n_dest_buffer:,} buffer-only), {len(zones_m):,} zones")
             density_col_local = f'_density_{mode}'
             cells_m = cells_m.join(
-                node_props[[_DENSITY_COL]].rename(
-                    columns={_DENSITY_COL: density_col_local}),
+                node_props[[ROAD_OVERHEAD_DENSITY_COL]].rename(
+                    columns={ROAD_OVERHEAD_DENSITY_COL: density_col_local}),
                 on=node_col)
             cells_m[density_col_local] = cells_m[density_col_local].fillna(0.0)
             logging.info(
@@ -305,24 +301,22 @@ def main():
                 )
                 assert costs_geo is not None
 
-            with step(f'profile={label}: floor at {case.min_route_time_s:.0f}s + '
-                f'scale by α + bake full road overhead'
-            ):
-                costs_floored = routing.floor_intrazonal_costs(
-                    cast(TieredODGeoPairs, costs_geo),
-                    min_cost=case.min_route_time_s,
-                )
+            # The minimum trip time applies to the door-to-door cost (10_accessibilities), as
+            # in the overhead calibration (07a) and the utility model (09a), not to the routed
+            # time.
+            with step(f'profile={label}: scale by α + bake full road overhead'):
+                costs_net = cast(TieredODGeoPairs, costs_geo)
 
                 # Same-mode profile labels are passed so derived profiles
                 # (walk_prm → rwalk, uncalibrated ebikes → rbike) inherit
-                # the parent profile's coefs. Resolver lives in common.
+                # the parent profile's coefs.
                 overhead_label = resolve_road_overhead_column(
                     label, coefs.columns,
                     same_mode_profile_labels=same_mode_labels)
                 if overhead_label != label:
                     logging.info(f"  → falling back to {overhead_label!r} for overhead {label!r}")
                 alpha = route_time_alpha(coefs[overhead_label])
-                _scale_tiered_costs_in_place(costs_floored, alpha)
+                _scale_tiered_costs_in_place(costs_net, alpha)
                 orig_ov, dest_ov = per_cell_road_overheads(
                     cells_m, coefs[overhead_label],
                     density_col=density_col_local,
@@ -334,7 +328,7 @@ def main():
                 dest_zone_ov = weighted_group_mean(dest_ov, cb_weight, zone_ids)
 
                 costs_gross = overhead.add_geo_overheads(
-                    costs_floored, pairs_geo,
+                    costs_net, pairs_geo,
                     origin_cell=orig_ov,
                     dest_cell=dest_ov,
                     origin_zone=orig_zone_ov,
@@ -356,7 +350,8 @@ def main():
                 )
 
     # ---- Transit: cell-tier ODM built from 05's z2z NPVM lookup -----
-    _build_transit_gross(context, cells, zones, cell_to_zone)
+    if scenario.transit_source is not None:
+        _build_transit_gross(context, cells, zones, cell_to_zone)
 
     context.close()
 

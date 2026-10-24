@@ -1,8 +1,8 @@
 """
 Process the preprocessed MZMV survey (legs, trips, daytrips, routes) into final
-per-year tables with mode classifications, peak/night flags, GHG accounting,
-externalities, and zone metadata. Also writes per-mode / per-purpose GHG summary
-CSVs.
+per-year tables with mode classifications, peak/night flags, per-leg validity /
+plausibility flags (see `standardize.py`), GHG accounting and externalities. Also
+writes per-mode / per-purpose GHG summary CSVs.
 
 > **Private data.** Consumes preprocessed MZMV outputs (Switzerland's
 > federal mobility survey, BFS-restricted); not redistributable.
@@ -12,6 +12,8 @@ Inputs (under <DATA_DIR_PRIVATE>/preparation/.../mzmv_<year>/preprocessed/):
     trips.csv, legs.csv, people.csv, households.csv         # from a_mzmv_preprocess
 Inputs (under <DATA_DIR_PRIVATE>/raw/switzerland/mzmv/):
     MZMV<year>_mit_Geo/5_Routen(Geometriefiles)/CH_Routen/Routen_CH.shp
+Inputs (PUBLIC, under preparation/world/elevation/):
+    dem_switzerland.tif                                     # endpoint elevation
 Inputs (cross-namespace; not yet migrated — TODO):
     preparation/switzerland/zones :: properties+shapes for zones, shapes for lfi_regions.
     -> TODO: finalize. Moved zone-based information away from here so that this script doesn't need zones.
@@ -65,8 +67,7 @@ for _y in MZMV_YEARS:
     variants.add(name=str(_y), mzmv_year=_y)
 
 
-# Bin boundaries used in load_people / load_households. Defined at module scope so
-# they're listable for downstream code.
+# Bin boundaries used in load_people / load_households.
 BINS_AGE = (0, 6, 13, 18, 25, 35, 50, 65, 75, 120)
 BINS_N_VEHICLES = (-1, 0, 1, 2, 99)
 BINS_N_EBIKES = (-1, 0, 1, 99)
@@ -212,7 +213,7 @@ def load_households(context: Context, mzmv_year: int) -> pd.DataFrame:
         labels=common.bin_labels(BINS_N_EBIKES),
     )
 
-    # Household composition (vectorized — was a per-row apply previously).
+    # Household composition.
     hh_size_valid = (households['hhgr'] > 0) & (households['hhgr'] < 12)
     households['hh_n_people'] = np.where(
         hh_size_valid, households['hhgr'].astype(int), -999_999,
@@ -237,8 +238,8 @@ def load_households(context: Context, mzmv_year: int) -> pd.DataFrame:
                       if c.startswith('sd_') or c.startswith('datetime_')]
     households = households.join(people[sd_cols_people])
 
-    # One-hot encode all sd_nominal_*/sd_ordinal_* columns. (Drop-first is left
-    # disabled — kept consistent with the legacy behaviour.)
+    # One-hot encode all sd_nominal_*/sd_ordinal_* columns (no drop-first: every
+    # level gets a dummy).
     sd_cat_cols = [c for c in households.columns
                    if c.startswith(('sd_nominal', 'sd_ordinal'))]
     for col in sd_cat_cols:
@@ -384,8 +385,7 @@ def add_indicators(df: pd.DataFrame, emissions_data: pd.DataFrame | None = None)
 
     if emissions_data is None:
         # Compute emissions per row. Cars use a speed-dependent formula; non-cars
-        # are speed-independent (lookup). The pandas `apply` here is the same shape
-        # as the legacy code and remains the bottleneck — see TODO below.
+        # are speed-independent (lookup). The row-wise `apply` is the bottleneck.
         # TODO(perf): vectorize emissions by groupby('mode') + per-mode formula.
         no_speed = (df['dist_measured'] <= 0) | (df['time_measured'] <= 0)
         for case_name, (case_which, case_veh, case_region) in _EMISSION_CASES.items():
@@ -466,8 +466,8 @@ def process_trips_of_year(context: Context, mzmv_year: int, legs: pd.DataFrame) 
     trips['dist_measured'] = (trips['w_rdist'] * 1000).round().astype(int)
     trips['mode'] = trips['wmittel2'].replace(WMITTEL2_TO_STR)
     trips['mode_simplified'] = trips['mode'].replace(MODE_TO_SIMPLIFIED)
-    _set_plane_mode_detail(trips)
     trips['is_land_based'] = (~trips['mode'].isin(['plane', 'boat'])).astype(int)
+    _set_plane_mode_detail(trips)   # after is_land_based: renames 'plane'
     trips['trip_id'] = _vectorized_leg_ids(mzmv_year, trips['HHNR'], trips['WEGNR'])
 
     trips = trips[(trips['w_rdist'] > 0) & (trips['dauer1'] > 0)].copy()
@@ -564,8 +564,8 @@ def process_legs_of_year(context: Context, mzmv_year: int,
     legs['mode'] = legs['f51300'].replace(F51300_TO_STR)
     legs['mode_simplified'] = legs['mode'].replace(MODE_TO_SIMPLIFIED)
     legs['mode_is_passenger'] = legs['f51300'].isin([8, 10]).astype(int)
-    _set_plane_mode_detail(legs)
     legs['is_land_based'] = (~legs['mode'].isin(['plane', 'boat'])).astype(int)
+    _set_plane_mode_detail(legs)   # after is_land_based: renames 'plane'
     legs['car_occupancy'] = legs['f51320']
     invalid_occupancy = (
         (legs['car_occupancy'] <= 0) | (legs['car_occupancy'] > 9) |
@@ -573,11 +573,11 @@ def process_legs_of_year(context: Context, mzmv_year: int,
     )
     legs.loc[invalid_occupancy, 'car_occupancy'] = np.nan
 
-    # +1 min so that ":30" consistently rounds up — self-reported start times bunch
-    # heavily on the half-hour. Hour 24 wraps to 0; trips after 24:29 dropped.
-    legs['hour_of_day'] = ((legs['f51100'] + 1) / 60).round().fillna(-1).astype(int)
-    legs.loc[legs['hour_of_day'] == 24, 'hour_of_day'] = 0
-    legs.loc[legs['f51100'] > (24 * 60), 'hour_of_day'] = -1
+    # Departure hour, rounded; +1 min so that most ":30" reports round up (self-reported start
+    # times bunch on the half-hour). `f51100` counts minutes from the survey day's midnight, so
+    # departures after 24:00 wrap to the next day's hours. Missing or negative → -1.
+    minutes = legs['f51100'].where(legs['f51100'] >= 0) % (24 * 60)
+    legs['hour_of_day'] = (((minutes + 1) / 60).round() % 24).fillna(-1).astype(int)
 
     households = load_households(context, mzmv_year)
     other_cols = list(_HH_JOIN_COLS) + ['datetime_day']
@@ -624,7 +624,7 @@ def process_legs_of_year(context: Context, mzmv_year: int,
     dem_path = dem_ctx.path_for(Storage.PUBLIC, 'dem_switzerland.tif')
     standardize.attach_endpoint_elevation(legs, dem_path=dem_path)
     # Composite elevation gate (data-quality + alpine exclusion) —
-    # single source of truth consumed by 04, 07, 02d.
+    # single source of truth consumed by 04, 07a, 02d.
     standardize.attach_within_elevation_band_flag(legs)
     save_ghg_stats(context, legs, mzmv_year, n_households=households.index.nunique())
 
@@ -640,12 +640,13 @@ def process_legs_of_year(context: Context, mzmv_year: int,
     # 07a_road_overhead_coefs, 09a_utility_estimation) filter on
     # `is_within_speed_envelope==1 & is_within_detour_envelope==1`
     # alongside `is_valid_domestic_trip==1`.
-    # MTMC self-reports times in ~5-min steps + may include unlock /
-    # trip-overhead time — this deflates apparent speed on very short
-    # trips (esp. walks under ~1 km). Skip the LOWER envelope bound
-    # below 1 km; the upper bound still catches gross misclassifications.
-    standardize.attach_speed_envelope_flag(legs, short_trip_dist_m=1_000.0)
+    # MTMC self-reports times mostly in 5-min steps, so the speed gate
+    # accepts a leg if any time its report can stand for gives an
+    # in-envelope speed (`rounded_reports=True`).
+    standardize.attach_speed_envelope_flag(legs, rounded_reports=True)
     standardize.attach_within_detour_envelope_flag(legs)
+    standardize.attach_within_gap_envelope_flag(
+        legs, departure_col='datetime_departure', arrival_col='datetime_arrival')
     # Per-reason validity flags + composite `is_valid_domestic_trip`.
     standardize.attach_validity_flags(legs, validity_checks={
         'is_valid_dist_time': f_dist_time,

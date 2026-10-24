@@ -9,7 +9,7 @@ description: |
   and each survey stage self-skips via `scenario_needs_survey_prep()` when
   no Calibrate() coef is declared. So one invocation works for both cases:
 
-      # Calibrate scenario — full run (all 22 stages)
+      # Calibrate scenario — full run (all 23 stages)
       python -m aperta_atlas.pipeline run main/pipeline.yml \
           --scenario switzerland-h10
 
@@ -19,9 +19,9 @@ description: |
 
   Mode variants are hard-coded to walk/bike/car — scripts read the
   scenario's own `mode_configs[mode].profiles` inside each per-mode run,
-  so a scenario with only rwalk still works under `variants: [walk]`.
-  Scenarios that drop a mode entirely will error at that mode's stage
-  (drop the corresponding variant in a copy of this file if needed).
+  and a per-mode stage skips modes the scenario doesn't configure (e.g. a
+  car-only scenario). Transit stages, and the transit parts of the others,
+  skip when the scenario has `transit_source=None`.
 
 # Run from src/ so `python -m main.X` and `python -m survey.X` resolve.
 working_dir: ..
@@ -43,9 +43,7 @@ stages:
     module: main.02c_active_flags
 
   # ---- Survey prep: legs (needs graphs from 02a + cells/zones from 01) --
-  # Calibrate-only stage in practice — for ImportFrom scenarios the
-  # calibration scripts short-circuit and never read survey_legs.csv, so
-  # this stage can be safely --skip'd.
+  # Calibrate-only: self-skips when the scenario declares no Calibrate() coef.
   - name: prepare_survey_legs
     module: survey.02d_prepare_survey_legs
 
@@ -73,7 +71,7 @@ stages:
   - name: survey_leg_times
     module: survey.05_leg_times
 
-  # ---- Public-transit per-cell access (uses 05 walk + bike + transit) --
+  # ---- Public-transit per-cell access (05's walk + bike skims, stop POIs)
   - name: public_transit_access
     module: main.06_public_transit_access
 
@@ -103,10 +101,10 @@ stages:
   - name: dist_line_od
     module: main.08b_dist_line_od
 
-  # ---- Utility model (needs survey/{02d,05,08a,08b} on Calibrate) ------
-  # Only `default` is declared in shipped scenarios' coefs dicts as
-  # `utility_default`. Add more here if you register additional
-  # `utility_<name>` variants in scenarios.py.
+  # ---- Utility model (needs survey/{02d,05,08a,08c} on Calibrate) ------
+  # The pipeline fits / transfers only `default` (`utility_default`). The
+  # spec-comparison variants `default_single` / `default_route` (declared in
+  # switzerland-h10 only) are run by hand with --variant.
   - name: utility_estimation
     module: main.09a_utility_estimation
     variants: [default]
@@ -119,3 +117,7 @@ stages:
   # subprocess is enough.
   - name: accessibilities
     module: main.10_accessibilities
+
+  # ---- Effective reach of each setting (released as access_reach.csv) ---
+  - name: access_reach
+    module: main.11_access_reach

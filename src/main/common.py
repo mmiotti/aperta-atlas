@@ -1,14 +1,15 @@
 """Shared helpers for the overhead + disutility + accessibility stages.
 
 Families:
-  - Accessibility grid: `bins_from_edges_min`, `gravity_decays_from_half_decay_min`.
+  - Accessibility grid: `bins_from_edges_{min,m}`, `gravity_decays_from_half_decay_{min,m}`.
   - Flatten / scale: `flatten_*_dest_columns`, `scaled_weights_for_nearest_k`.
-  - Overhead: `resolve_road_overhead_column`, `per_cell_road_overheads`,
-    `per_cell_transit_overhead` — baked into 08's gross ODMs.
+  - Overhead: `resolve_road_overhead_column`, `route_time_alpha`,
+    `per_cell_road_overheads`, `per_cell_transit_overhead` — baked into 08a's
+    gross ODMs.
   - Disutility spec: `profile_to_util_mode`, `build_disutility_spec`,
     `build_disutility_odm`, `apply_log_time_utility` — consumed by 09b/10.
   - Survey-leg helpers: `SURVEY_LEG_SETS`, `survey_file`, `npvm_transit_z2z_lookup`,
-    `car_overhead_by_peak`.
+    `car_overhead_by_peak`, `car_routed_bias_by_peak`, `aggregate_transit_trips`.
 """
 import logging
 import math
@@ -22,6 +23,7 @@ from aperta import utility as _utility
 from aperta.accessibility import Bin, Decay, exp_decay
 from aperta.od_pairs import TieredODGeoPairs, TieredODPairs
 from aperta.utility import Utility
+from preparation.switzerland.private.surveys.common import in_trip_order
 
 # Preserves the concrete subclass (GeoPairs / NodePairs) in helpers'
 # return annotations. Mirrors aperta's `floor_intrazonal_costs`.
@@ -50,12 +52,6 @@ def survey_file(name: str, leg_set: str) -> str:
         return name
     stem, ext = name.rsplit('.', 1)
     return f'{stem}_{leg_set}.{ext}'
-
-
-# Cells-frame columns that are NOT accessibility destinations.
-NON_DESTINATION_COLS: frozenset[str] = frozenset({
-    'n_pois', 'cell_id', 'zone_id', 'node_id', 'geometry', 'combined_total',
-})
 
 
 # Pop + employment counts overwhelm POI counts at a shared `k` grid; scale by
@@ -189,14 +185,15 @@ def resolve_road_overhead_column(
 
 def route_time_alpha(coefs_for_profile: pd.Series) -> float:
     """Extract the fitted `t_routed` slope (α) from an overhead-coef series.
-    Defaults to 1.0 when the row is absent (constrained-α fits, or older
-    coefs). α ≠ 1 encodes a multiplicative bias correction on the routed
-    time; downstream code applies it as `gross = t_routed + orig_ov +
+    Defaults to 1.0 when the row is absent or NaN (α fixed at 1, e.g. 07b's
+    constrained specs). α ≠ 1 encodes a multiplicative bias correction on the
+    routed time; downstream code applies it as `gross = t_routed + orig_ov +
     dest_ov − (1 − α) × t_routed` (or `gross = α × t_routed + …` for
     ODM-level assemblies). See `main/07a_road_overhead_coefs.py` and
     `main/07b_transit_overhead_coefs.py` for the fitting side.
     """
-    return float(coefs_for_profile.get('t_routed', 1.0))
+    alpha = coefs_for_profile.get('t_routed')
+    return 1.0 if pd.isna(alpha) else float(alpha)
 
 
 def _shared_or_split_coef(
@@ -214,13 +211,18 @@ def _shared_or_split_coef(
     )
 
 
+# Per-node density column of the road-overhead model. 07a fits on it, and every place that
+# applies the fitted coefficients (08a, survey/08a, validation, figures) must use the same one.
+ROAD_OVERHEAD_DENSITY_COL = 'density_r500_norm'
+
+
 def per_cell_road_overheads(
     cells: pd.DataFrame, coefs_for_profile: pd.Series,
     density_col: str, snap_dist_col: str,
 ) -> tuple[pd.Series, pd.Series]:
-    """Full per-cell road overhead (`orig`, `dest`) from 07's OLS fit,
+    """Full per-cell road overhead (`orig`, `dest`) from 07a's fit,
     per side: `const/2 + density_coef · density + snap_dist_coef · snap_dist`.
-    Baked into 08's gross ODM.
+    Baked into 08a's gross ODMs.
     """
     half_const = float(coefs_for_profile.get('const', 0.0)) / 2.0
     density_orig_coef, density_dest_coef = _shared_or_split_coef(
@@ -253,11 +255,13 @@ def per_cell_transit_overhead(
 
     Reserved rows in `transit_coefs.index`:
       - `cap_s`: symmetric clipping bound (required).
-      - `const_s`: trip-level intercept from 07b's constrained OLS
-        (optional; default 0). Split in half so orig + dest sum to
-        `const_s` at trip level.
-    All other rows name columns in `cells` (typically stage 06's
-    `*_zone_dev` features); NaN column values contribute 0.
+      - `const_s`: trip-level intercept from 07b's fit (optional;
+        default 0). Split in half so orig + dest sum to `const_s` at
+        trip level.
+      - `t_routed`: α, skipped here (see `route_time_alpha`).
+    All other rows name columns in `cells` (stage 06's
+    `cells_transit_access` features); NaN coefficients (features the spec
+    doesn't use) and NaN column values contribute 0.
     """
     if 'cap_s' not in transit_coefs.index:
         raise ValueError("overheads_transit coef missing required `cap_s` row.")
@@ -266,13 +270,12 @@ def per_cell_transit_overhead(
         const_half = float(transit_coefs.loc['const_s', 'transit']) / 2.0
     else:
         const_half = 0.0
-    # `t_routed` (z2z scaling) can appear in informational columns from
-    # 07b's unconstrained fits, but the applied model uses α=1 (adds
-    # overheads to raw z2z without scaling), so the row is skipped here.
+    # `t_routed` (α, the z2z scaling) is not an overhead: callers apply it to
+    # z2z separately (`route_time_alpha`), so the row is skipped here.
     _RESERVED = ('cap_s', 'const_s', 't_routed')
     combined = pd.Series(const_half, index=cells.index)
     for param, row in transit_coefs.iterrows():
-        if param in _RESERVED:
+        if param in _RESERVED or pd.isna(row['transit']):   # NaN: feature not in the spec
             continue
         if param not in cells.columns:
             raise ValueError(f"overheads_transit references column {param!r} not in "
@@ -323,6 +326,15 @@ def coefs_for_unrun_profiles(keys, run_profile_labels) -> set[str]:
 
 # Endpoint point-feature sources (single source of truth in main.utility_config).
 from main.utility_config import FEATURE_SCALE, POINT_FEATURE_SOURCES
+
+
+# Reference door-to-door time (minutes) at which 09a centers the time terms,
+# `β_t · (t − T) + β_ln · log(t / T)`: the constants are then the utility of a
+# trip of T minutes rather than of 1 minute, which lies far outside the data for
+# transit and leaves its constant poorly determined. Common to all modes, so that
+# constants compare modes at equal travel time; fixed, so that they compare
+# across fits. 09a stores it in the coef file (`t_ref_min`).
+UTILITY_T_REF_MIN = 20.0
 
 
 @dataclass(frozen=True)
@@ -383,7 +395,7 @@ def load_util_cutoffs_from_summary(
     metric: str = 't_gross_min',
     percentile: str = 'p95',
 ) -> dict[str, float]:
-    """Per-mode `{mode: t_cut_min}` from survey/08b's `survey_summary.csv`,
+    """Per-mode `{mode: t_cut_min}` from survey/08c's `survey_summary.csv`,
     for `build_disutility_spec(..., t_cut_min_per_mode=)`. Beyond `t_cut_min`
     the log-time term switches to linear extrapolation.
     """
@@ -437,7 +449,8 @@ def build_disutility_spec(
 
     Steps:
       1. ASC / constant (walk is base at 0).
-      2. Linear + log-time coefs (per-minute in 09a's calibration).
+      2. Linear + log-time coefs (per-minute in 09a's calibration), with the
+         centering offset at `t_ref_min` moved into the ASC.
       3. Car peak/night modifier: apply whichever of `asc_car_{peak,night}`
          (ASC shift) or `b_time_car_{peak,night}` (time-coef additive) 09a
          fit. Feature-interaction peak/night coefs are flagged but ignored
@@ -575,6 +588,20 @@ def build_disutility_spec(
 
     constant += sd_correction
 
+    # 09a centers the time terms at `t_ref_min` (see `UTILITY_T_REF_MIN`):
+    #   β_t·(t − T) + β_ln·log(t/T) = β_t·t + β_ln·log(t) − β_t·T − β_ln·log(T).
+    if 't_ref_min' not in values.index:
+        raise ValueError("utility coefs lack 't_ref_min' (fitted before the time terms were "
+                         "centered) — re-run main/09a for this scenario's source.")
+    t_ref = float(values['t_ref_min'])
+    # The released utilities keep the zero point of the uncentered form, a 1-min walk
+    # (log 1 = 0), rather than a T-minute walk: adding walking's centering offset to every
+    # mode leaves the choice probabilities unchanged.
+    walk_offset = (float(values['b_time_walk']) * t_ref
+                   + float(values['b_time_log_walk']) * math.log(t_ref))
+    constant = (constant - cost_coefficient * t_ref - b_time_log * math.log(t_ref)
+                + walk_offset)
+
     # 09a fit on minutes, aperta routes on seconds:
     #   β_time_eff = β_time / 60;   ASC_eff = ASC − β_time_log · log(60).
     cost_coefficient = cost_coefficient / 60.0
@@ -675,10 +702,19 @@ def join_util_node_features(
     """Join per-node point features onto `cells_m`/`zones_m` in place.
     Each feature from its source graph (per `POINT_FEATURE_SOURCES`), via
     `node_id_<source_mode>`; missing features silently skipped. Applies
-    `FEATURE_SCALE` matching 09a's fit-time scaling.
+    `FEATURE_SCALE` matching 09a's fit-time scaling. If the source mode isn't
+    in the scenario, a point feature is read from a configured mode instead:
+    02b computes the same point features for every network.
     """
+    from scenarios import get_scenario
+    modes = list(get_scenario(context.scenario).mode_configs)
     files_cache: dict[str, pd.DataFrame] = {}
     for feat, (source_mode, data_name) in POINT_FEATURE_SOURCES.items():
+        if source_mode not in modes:
+            if not data_name.endswith('_extended'):
+                continue
+            source_mode = modes[0]
+            data_name = f'{source_mode}_extended'
         if data_name not in files_cache:
             files_cache[data_name] = context.get_properties('nodes', data_name)
         node_props = files_cache[data_name]
@@ -755,7 +791,6 @@ def check_util_matches_cost_shape(
                             f"(cost={'set' if cost_tier else 'None'}, "
                             f"util={'set' if util_tier else 'None'}).")
             continue
-        cost_nans = 0
         util_extra_nans = 0
         cost_finite_total = 0
         for origin, cost_arr in cost_tier.items():
@@ -765,7 +800,6 @@ def check_util_matches_cost_shape(
                 util_nan_mask = np.ones_like(cost_nan_mask)
             else:
                 util_nan_mask = ~np.isfinite(np.asarray(util_arr))
-            cost_nans += int(cost_nan_mask.sum())
             cost_finite_total += int((~cost_nan_mask).sum())
             util_extra_nans += int((util_nan_mask & ~cost_nan_mask).sum())
         if util_extra_nans > 0:
@@ -837,6 +871,13 @@ def car_routed_bias_by_peak(df: pd.DataFrame) -> pd.Series:
 
 _TRANSIT_BIKE_MODES: frozenset[str] = frozenset({'rbike', 'ebike25', 'ebike45'})
 
+# Trip-level plausibility flags (0/1; leg flags aggregated as `min` by
+# `aggregate_transit_trips`, survey prep's `is_within_gap_envelope` is
+# trip-level already); consumers keep trips with all flags == 1.
+TRIP_QUALITY_FLAGS: tuple[str, ...] = (
+    'is_within_speed_envelope', 'is_within_detour_envelope', 'is_within_gap_envelope',
+)
+
 
 def _classify_transit_access(mode_set: frozenset[str]) -> str:
     """Categorical access-mode label for a transit-containing trip.
@@ -854,8 +895,8 @@ def _classify_transit_access(mode_set: frozenset[str]) -> str:
 
 def aggregate_transit_trips(legs: pd.DataFrame) -> pd.DataFrame:
     """Filter `legs` to trips containing ≥1 transit leg, aggregate legs
-    → one row per trip. Ordering within a trip is by `leg_id` (the
-    DataFrame index); first leg's orig / last leg's dest define the
+    → one row per trip. Legs are ordered by the leg number in `leg_id` (the
+    DataFrame index; `in_trip_order`); first leg's orig / last leg's dest define the
     trip's door-to-door endpoints.
 
     Shared by `survey/08b_trip_transit_times.py` (production per-trip
@@ -865,27 +906,40 @@ def aggregate_transit_trips(legs: pd.DataFrame) -> pd.DataFrame:
     Requires `legs` to have `trip_id`, `time_measured`, `dist_measured`,
     `orig_x/y`, `dest_x/y`, `orig_cell_id`, `dest_cell_id`,
     `orig_zone_id`, `dest_zone_id`, `mode_simplified`, `peak_str`,
-    `weight_person`. Envelope flags (`is_within_speed_envelope`,
-    `is_within_detour_envelope`) are aggregated as `min` (0 if ANY
-    leg fails) when present.
+    `weight_person`. `TRIP_QUALITY_FLAGS` are aggregated as `min` (0 if
+    ANY leg fails) when present.
 
     Output columns:
         (index) trip_id
-        trip_time_measured, trip_dist_measured, trip_dist_line
+        trip_time_measured      # last arrival − first departure (door to door,
+                                # incl. waiting between legs); needs the legs'
+                                # datetime_departure / datetime_arrival, else
+                                # falls back to trip_time_legs
+        trip_time_legs          # Σ leg time_measured (excl. waiting between legs)
+        trip_dist_measured, trip_dist_line
         trip_orig_{x,y,cell,zone}, trip_dest_{x,y,cell,zone}
-        weight_person, peak_str
+        weight_person, peak_str, datetime_departure (first leg, if present)
         n_legs_in_trip, n_transit_legs
         has_walk_access, has_car_access, has_bike_access (0/1)
         access_pattern (walk_only|park_and_ride|bike_and_ride|mixed)
         is_within_speed_envelope, is_within_detour_envelope (0/1, if present)
+        is_within_gap_envelope (0/1; survey prep, `standardize.
+            attach_within_gap_envelope_flag`)
     """
     trip_has_transit = legs.groupby('trip_id')['mode_simplified'].apply(
         lambda s: 'transit' in set(s))
     keep_trips = trip_has_transit[trip_has_transit].index
 
-    # Sort by (trip_id, leg_id) so first/last leg per trip is well-defined.
-    sub = legs.loc[legs['trip_id'].isin(keep_trips)].reset_index()
-    sub = sub.sort_values(['trip_id', 'leg_id']).set_index('leg_id')
+    # In trip order, so that first / last leg per trip are well-defined.
+    sub = in_trip_order(legs.loc[legs['trip_id'].isin(keep_trips)])
+    # Only trips with all their legs (survey/02d drops legs that fail its filters): a trip
+    # missing its first or last leg would start or end at a station. As in 07a.
+    if 'n_legs_in_trip' in sub.columns:
+        g = sub.groupby('trip_id')
+        complete = g.size() == g['n_legs_in_trip'].first()
+        logging.info(f"  → {int((~complete).sum()):,} of {len(complete):,} transit trips "
+                     f"dropped: legs missing from survey_legs")
+        sub = sub[sub['trip_id'].isin(complete.index[complete])]
 
     first_leg = sub.groupby('trip_id').head(1).set_index('trip_id')
     last_leg = sub.groupby('trip_id').tail(1).set_index('trip_id')
@@ -893,7 +947,18 @@ def aggregate_transit_trips(legs: pd.DataFrame) -> pd.DataFrame:
     agg = pd.DataFrame(index=first_leg.index)
     agg.index.name = 'trip_id'
 
-    agg['trip_time_measured'] = sub.groupby('trip_id')['time_measured'].sum()
+    agg['trip_time_legs'] = sub.groupby('trip_id')['time_measured'].sum()
+    if {'datetime_departure', 'datetime_arrival'} <= set(sub.columns):
+        dep = pd.to_datetime(first_leg['datetime_departure'], errors='coerce')
+        arr = pd.to_datetime(last_leg['datetime_arrival'], errors='coerce')
+        span = (arr - dep).dt.total_seconds()
+        span = span.where(span >= 0, span + 86_400)   # trips across midnight
+        agg['trip_time_measured'] = span
+    else:
+        logging.warning("  ⚠ legs lack datetime_departure / datetime_arrival — "
+                        "trip_time_measured falls back to the summed leg times "
+                        "(excludes waiting between legs).")
+        agg['trip_time_measured'] = agg['trip_time_legs']
     agg['trip_dist_measured'] = sub.groupby('trip_id')['dist_measured'].sum()
     agg['trip_orig_x'] = first_leg['orig_x']
     agg['trip_orig_y'] = first_leg['orig_y']
@@ -905,6 +970,8 @@ def aggregate_transit_trips(legs: pd.DataFrame) -> pd.DataFrame:
     agg['trip_dest_zone'] = last_leg['dest_zone_id']
     agg['weight_person'] = first_leg['weight_person']
     agg['peak_str'] = first_leg['peak_str']
+    if 'datetime_departure' in first_leg.columns:
+        agg['datetime_departure'] = first_leg['datetime_departure']
     agg['n_legs_in_trip'] = sub.groupby('trip_id').size()
     agg['n_transit_legs'] = sub.groupby('trip_id').apply(
         lambda g: int((g['mode_simplified'] == 'transit').sum()),
@@ -922,10 +989,8 @@ def aggregate_transit_trips(legs: pd.DataFrame) -> pd.DataFrame:
         (agg['trip_dest_x'] - agg['trip_orig_x']) ** 2
         + (agg['trip_dest_y'] - agg['trip_orig_y']) ** 2)
 
-    for flag in ('is_within_speed_envelope', 'is_within_detour_envelope'):
+    for flag in TRIP_QUALITY_FLAGS:
         if flag in sub.columns:
             agg[flag] = sub.groupby('trip_id')[flag].min().astype('Int64')
 
     return agg
-
-

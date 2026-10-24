@@ -3,16 +3,15 @@ Calibrate per-mode traffic-flow coefficients for stage 03b.
 
 For each calibrated mode:
   - `node_trip_weights_<mode>`: per-cell Poisson-GLM coefs for trip
-    generation. Exposure offset is `log(combined_total)`; features come
-    from `_NODE_TRIP_FEATURES`. 03b applies the fit to weight cells
-    when sampling origins (replaces the old hardcoded
-    `combined_total × max(1 − density·coef, 0.25)` heuristic).
+    generation. No exposure offset: population + employment enter as
+    features from `_NODE_TRIP_FEATURES`. 03b applies the fit to weight
+    cells when sampling origins and destinations.
   - `flow_cost_bins_<mode>`: percentile bin edges over the observed
-    travel-cost distribution. 03b's `bin_adjusted_dest_weights` reads
-    them as the target P(C) shape per origin.
+    travel-cost distribution. 03b passes them to `nested_node_sample` as
+    the target P(C) shape per origin.
 
-Only `'car'` is calibrated for now. Other modes follow when their
-ground-truth cost distributions land.
+Only `'car'` is calibrated; other modes need ground-truth cost
+distributions first.
 
 Feature set is intentionally narrow and easy to extend — edit
 `_NODE_TRIP_FEATURES` near the top to add density / topology /
@@ -26,7 +25,7 @@ to undo 5-min reporting quantization; gross times are used as-is
 
 Inputs:
     generic/survey_legs.csv                            (PRIVATE, from survey/02d)
-    properties/cells_{population,employment,snap}.csv
+    properties/cells_{population,employment,snap}.csv + shapes/cells.gpkg
     properties/nodes_car_extended.csv                  (density features)
 
 Outputs (per scenario's coef declaration in `src/scenarios.py`):
@@ -94,17 +93,16 @@ def _derive_features(cells: pd.DataFrame) -> pd.DataFrame:
     return cells
 
 
-# ---------- Cost-bin extraction ------------------------------------------ Cost
-# distribution derived from MTMC self-reported car trip times. MTMC values are
-# (a) heaped on 5-min bins, and (b) gross (include parking + walking overheads).
-# We jitter within the reporting half- width to undo the quantization
-# (Uniform(-half, +half) — standard maximum-entropy fix for rounded continuous
-# data). Constants are hardcoded for now — MTMC 2015 + 2021 both use ~5-min
-# self-report.
+# ---------- Cost-bin extraction ------------------------------------------
+# Cost distribution derived from MTMC self-reported car trip times. MTMC values
+# are (a) heaped on 5-min bins, and (b) gross (include parking + walking
+# overheads). We jitter within the reporting half-width to undo the
+# quantization (Uniform(-half, +half) — standard maximum-entropy fix for
+# rounded continuous data). MTMC 2015 + 2021 both use ~5-min self-report.
 #
-# Gross→net overhead subtraction is currently DISABLED (overhead=0): Small bias
-# (~3-7 % relative for typical trips); acceptable for now. Possible solution:
-# piecewise overhead min(120, 0.3 * t) so short trips get less subtraction.
+# Gross→net overhead subtraction is DISABLED (overhead=0): small bias (~3-7 %
+# relative for typical trips). Possible fix: piecewise overhead
+# min(120, 0.3 * t) so short trips get less subtraction.
 _COST_BIN_MIN_S = 30.0
 _COST_BIN_MAX_S = 5400.0
 _N_COST_BINS = 25

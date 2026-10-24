@@ -9,13 +9,12 @@ this schema; then these helpers run identically on both.
 
 Design principles:
 
-  - `peak_str` middle bucket is `'base'` (not `'offpeak'`), and the
-    corresponding column is `hour_base` (not `hour_offpeak`). Matches
+  - `peak_str` buckets are `'peak'`, `'base'`, `'night'` (columns
+    `hour_peak` / `hour_base` / `hour_night`), matching
     `04_edge_weights.py`'s car-bucket naming.
 
-  - Column filter is prefix-only (`ALLOWED_SURVEY_PREFIXES`). No
-    `'_id' in c` substring catch-all. Explicit ID columns downstream
-    consumers need must be in the prefix list.
+  - Column filter is prefix-only (`ALLOWED_SURVEY_PREFIXES`): ID
+    columns that downstream consumers need must be in the prefix list.
 
   - Flag names describe PROPERTIES of the trip (e.g.
     `is_within_speed_envelope`), never a consumer (avoid names like
@@ -43,6 +42,12 @@ legs.csv — no row removals from these flags):
                                     where the reported distance reflects
                                     the full walked path rather than the
                                     OD-relevant path)
+    is_within_gap_envelope       — TRIP-level (same value on every leg of
+                                    a trip): time between legs (last
+                                    arrival − first departure − Σ leg
+                                    times) within the gap envelope.
+                                    Catches trips with stops / activities
+                                    along the way; single-leg trips pass
     elev_orig, elev_dest         — endpoint elevation in metres ASL,
                                     sampled from the Copernicus DEM at
                                     each leg's orig / dest centroids
@@ -56,11 +61,11 @@ legs.csv — no row removals from these flags):
                                     (both surveys)
     include_in_route_matching    — has usable route geometry
 
-Person-level cascade (`is_person_diary_clean`) is INTENTIONALLY NOT
-pre-computed. Cascade rules depend on the analysis question (a trip
-outside Switzerland is out-of-scope, not "bad data"), so it's a
-downstream operation. Call `person_has_any_bad_trip` to compute it
-against whichever combination of flags matches your analysis.
+A person-level cascade is INTENTIONALLY NOT pre-computed. Cascade rules
+depend on the analysis question (a trip outside Switzerland is
+out-of-scope, not "bad data"), so it's a downstream operation. Call
+`person_has_any_bad_trip` to compute it against whichever combination
+of flags matches your analysis.
 
 Row REMOVALS (before flagging) — separate concern, applied by the two
 `b_*_process.py` scripts:
@@ -89,7 +94,6 @@ canonical example of composing trip-quality gates.
 """
 
 import logging
-from collections.abc import Iterable
 
 import numpy as np
 import pandas as pd
@@ -102,9 +106,8 @@ from preparation.switzerland.common import CRS_CH, CRS_LATLON
 from preparation.switzerland.private.surveys import common
 from preparation.switzerland.private.surveys.common import (
     ALLOWED_SURVEY_PREFIXES, MAXIMUM_GEOMETRY_SIZE,
-    MAX_DETOUR_RATIO,
-    MODES_MODE_CHOICE_MODEL, MODES_TRAVEL_TIME_MODEL,
-    SPEED_ENVELOPES_KMH,
+    MAX_DETOUR_RATIO, MAX_TRIP_GAP_RATIO, MAX_TRIP_GAP_S, MIN_TRIP_GAP_S,
+    SPEED_ENVELOPES_KMH, TRIP_GAP_RATIO_FLOOR_S, report_intervals,
 )
 
 
@@ -251,9 +254,8 @@ def attach_validity_flags(
     they care about (edge-weight training, mode-choice training, person
     stats).
 
-    Log line per reason: CUMULATIVE excluded-row count (only rows this
-    filter contributes on top of previous filters — order-dependent, so
-    the sum matches the total excluded).
+    Log line per reason: rows this filter excludes on top of the earlier
+    ones (order-dependent; the counts sum to the total excluded).
     """
     exclude = pd.Series(False, index=legs.index)
     for flag_name, mask in validity_checks.items():
@@ -294,7 +296,7 @@ def attach_speed_envelope_flag(
     legs: pd.DataFrame,
     *,
     envelopes: dict[str, tuple[float, float]] = SPEED_ENVELOPES_KMH,
-    short_trip_dist_m: float | None = None,
+    rounded_reports: bool = False,
 ) -> pd.Series:
     """Write `is_within_speed_envelope` (0/1) onto `legs` in place; also
     return the exclude mask (== `is_within_speed_envelope == 0`) so
@@ -307,20 +309,21 @@ def attach_speed_envelope_flag(
     km/h → actually car). Modes not in `envelopes` (transit,
     motorbike, etc.) are treated as in-envelope (flag stays 1).
 
-    Requires `mode_simplified`, `speed_kmh`, `dist_measured` on `legs`.
+    Requires `mode_simplified` and `speed_kmh` on `legs`; with
+    `rounded_reports`, also `time_measured` and `dist_measured`.
 
-    `short_trip_dist_m`: for surveys with self-reported times rounded
-    to a coarse grid (e.g. MTMC's 5-min steps + trip-overhead
-    inclusion), short trips can produce artificially LOW implied
-    speeds that hit the LOWER envelope bound spuriously. When set,
-    trips shorter than this threshold skip the lower bound; only the
-    upper bound applies. Pass `None` (default) for precise
-    GPS-tracked surveys like MOBIS.
+    `rounded_reports`: for self-reported times rounded to a coarse grid
+    (MTMC's 5-min steps), a leg is out of envelope only if every true
+    time its report can stand for (`common.report_intervals`: exact
+    ± 0.5 min, or on 5-min steps the rounding interval, "5" → 0–7.5
+    min) gives a speed (`dist_measured` / time) outside the envelope;
+    e.g. a 700 m walk reported as "5 min" passes. Leave False (the
+    default: `speed_kmh` as is) for precise GPS-tracked surveys like
+    MOBIS.
 
     Absolute trip-length filtering is intentionally NOT part of this
-    flag — it's the CONSUMER's per-mode concern. `04_edge_weights.py`
-    sets `min_trip_distance` per profile (100 m walk, 250 m bike,
-    500 m car), which acts as the effective minimum for training.
+    flag — it's the CONSUMER's per-mode concern (e.g. the per-profile
+    `min_trip_distance` in `04_edge_weights.py`).
 
     Logs per-mode: pre-envelope n, min/max/mean/median observed
     speed, envelope bounds, and out-of-envelope count + rate.
@@ -330,11 +333,20 @@ def attach_speed_envelope_flag(
     """
     exclude = pd.Series(False, index=legs.index)
 
-    is_short_leniency = (
-        legs['dist_measured'] < short_trip_dist_m
-        if short_trip_dist_m is not None
-        else pd.Series(False, index=legs.index)
-    )
+    if rounded_reports:
+        exact_lo, exact_hi, rounded_lo, rounded_hi, on_step = report_intervals(
+            legs['time_measured'].to_numpy(dtype=float))
+        # On a 5-min step the rounded interval contains the exact one.
+        t_lo = np.where(on_step, rounded_lo, exact_lo)
+        t_hi = np.where(on_step, rounded_hi, exact_hi)
+        dist_km = legs['dist_measured'].to_numpy(dtype=float) / 1_000.0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            slowest = pd.Series(dist_km / (t_hi / 3_600.0), index=legs.index)
+            fastest = pd.Series(np.where(t_lo > 0, dist_km / (t_lo / 3_600.0), np.inf),
+                                index=legs.index)
+    else:
+        slowest = fastest = legs['speed_kmh']
+    rounding_note = " (tolerant to rounded reports)" if rounded_reports else ""
     for mode, (lo, hi) in envelopes.items():
         in_mode = legs['mode_simplified'] == mode
         n_mode = int(in_mode.sum())
@@ -344,24 +356,20 @@ def attach_speed_envelope_flag(
         s_min, s_max = float(speeds.min()), float(speeds.max())
         s_mean, s_med = float(speeds.mean()), float(speeds.median())
 
-        over_upper = in_mode & (legs['speed_kmh'] > hi)
-        under_lower = in_mode & ~is_short_leniency & (legs['speed_kmh'] < lo)
+        over_upper = in_mode & (slowest > hi)
+        under_lower = in_mode & (fastest < lo)
         bad_env = over_upper | under_lower
         n_over = int(over_upper.sum())
         n_under = int(under_lower.sum())
         n_bad = int(bad_env.sum())
         pct = 100.0 * n_bad / n_mode
-        short_note = (
-            f" (short-trip leniency: lower bound skipped below "
-            f"{short_trip_dist_m:.0f} m)" if short_trip_dist_m is not None else ""
-        )
         logging.info(
             f"  Speed envelope [{mode}]: n={n_mode:,}  "
             f"observed {s_min:.1f}-{s_max:.1f} km/h "
             f"(mean {s_mean:.1f}, median {s_med:.1f})  "
             f"envelope ({lo}, {hi}) km/h  → out-of-envelope {n_bad:,} "
             f"({pct:.1f}%): over_upper={n_over:,}, under_lower={n_under:,}"
-            f"{short_note}")
+            f"{rounding_note}")
         exclude = exclude | bad_env
     legs['is_within_speed_envelope'] = (~exclude).astype(int)
     logging.info(
@@ -422,6 +430,60 @@ def attach_within_detour_envelope_flag(
     logging.info(
         f"  → is_within_detour_envelope == 1: {(~exclude).sum():,} "
         f"of {len(legs):,} trip(s)")
+    return exclude
+
+
+def attach_within_gap_envelope_flag(
+    legs: pd.DataFrame,
+    *,
+    departure_col: str,
+    arrival_col: str,
+    max_gap_s: float = MAX_TRIP_GAP_S,
+    max_gap_ratio: float = MAX_TRIP_GAP_RATIO,
+    ratio_floor_s: float = TRIP_GAP_RATIO_FLOOR_S,
+    min_gap_s: float = MIN_TRIP_GAP_S,
+) -> pd.Series:
+    """Write `is_within_gap_envelope` (0/1) onto `legs` in place; also
+    return the exclude mask (`is_within_gap_envelope == 0`).
+
+    Trip-level flag, broadcast to every leg of the trip. Per trip, with
+    legs in leg order (`common.in_trip_order`):
+    `gap = (last arrival − first departure) − Σ time_measured`, i.e. the
+    time spent between legs (waiting at stops, transfers, parking). A
+    trip passes iff `min_gap_s ≤ gap ≤ min(max_gap_s, max(ratio_floor_s,
+    max_gap_ratio × Σ time_measured))`, i.e. it fails beyond `max_gap_s`, or
+    beyond both the ratio term and its floor. Spans < 0 (survey clocks wrapping past midnight)
+    get +24 h. Trips with NaN times / no `trip_id` are treated as
+    in-envelope (defer to other filters); single-leg trips pass by
+    construction.
+
+    Requires `trip_id`, `time_measured`, `departure_col`, `arrival_col`.
+    """
+    sub = legs[['trip_id', 'time_measured']].copy()
+    sub['_dep'] = pd.to_datetime(legs[departure_col], errors='coerce')
+    sub['_arr'] = pd.to_datetime(legs[arrival_col], errors='coerce')
+    sub = common.in_trip_order(sub.dropna(subset=['trip_id']))
+    g = sub.groupby('trip_id')
+    span = (g['_arr'].last() - g['_dep'].first()).dt.total_seconds()
+    span = span.where(span >= 0, span + 86_400)
+    legs_sum = g['time_measured'].sum(min_count=1)
+    gap = span - legs_sum
+    upper = np.minimum(max_gap_s, np.maximum(ratio_floor_s, max_gap_ratio * legs_sum))
+    bad_trip = ((gap < min_gap_s) | (gap > upper)).fillna(False)
+    beyond_max = (gap > max_gap_s).fillna(False)
+    ratio_only = ((gap > upper) & ~beyond_max).fillna(False)
+    below_min = (gap < min_gap_s).fillna(False)
+    exclude = legs['trip_id'].map(bad_trip).fillna(False).astype(bool)
+    legs['is_within_gap_envelope'] = (~exclude).astype(int)
+    multi = g.size() > 1
+    logging.info(
+        f"  Gap envelope: {int(multi.sum()):,} multi-leg trips, gap median "
+        f"{gap[multi].median() / 60:.1f} min, P90 {gap[multi].quantile(0.9) / 60:.1f} min "
+        f"→ out-of-envelope {int(bad_trip.sum()):,} trips "
+        f"({100 * bad_trip[multi].mean():.1f}% of multi-leg): "
+        f"{int(beyond_max.sum()):,} beyond {max_gap_s / 60:.0f} min, "
+        f"{int(ratio_only.sum()):,} only beyond the ratio term, "
+        f"{int(below_min.sum()):,} below {min_gap_s / 60:.0f} min")
     return exclude
 
 

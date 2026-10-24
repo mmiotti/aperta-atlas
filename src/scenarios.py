@@ -2,8 +2,8 @@
 Typed scenario definitions for the Accessibility Atlas project.
 
 Each `Scenario` declares its `Area` (extent + buffers), pop/employment
-data sources (private = STATPOP/STATENT dasymetric, public = GHS-POP
-coefficient-based), default `Storage`, and per-coef provenance
+data sources (STATPOP / STATENT, GHS-POP, or per-OSM-tag coefficients),
+default `Storage`, and per-coef provenance
 (`Calibrate()` / `ImportFrom(...)` / `HandWritten()`).
 
 Scenario names route outputs to `<DATA_DIR_*>/<PROJECT_NAME>/<scenario>/...`
@@ -11,9 +11,9 @@ via `init_context`. `DEFAULT_SCENARIO` is the fallback when no
 `--scenario` is passed.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-from aperta_atlas.coefs import Calibrate, CoefSource, ImportFrom
+from aperta_atlas.coefs import Calibrate, CoefSource, HandWritten, ImportFrom
 from aperta_atlas.context import Storage
 from mode_configs import MODE_CONFIGS, ModeConfig
 from preparation.world.areas import AREAS
@@ -79,9 +79,11 @@ class AccessibilityGrid:
     bin_edges_min: tuple[int, ...] = (0, 5, 10, 15, 30, 60)
     bin_edges_m: tuple[float, ...] = (0, 300, 1000, 3_000, 10_000, 30_000)
     nearest_k: tuple[int, ...] = (1, 3, 10, 30, 100)
-    gravity_half_decay_min: tuple[float, ...] = (5, 10, 15, 20, 30)
-    gravity_util_betas: tuple[float, ...] = (0.5, 0.8, 1.0, 1.5, 2.0)
-    gravity_half_decay_m: tuple[float, ...] = (300, 1_000, 3_000, 10_000, 30_000)
+    # Gravity parameters span local (1 min, 100 m, β = 2: about the nearest
+    # destinations) to broad catchments, roughly matched across the three.
+    gravity_half_decay_min: tuple[float, ...] = (1, 2, 5, 10, 20)
+    gravity_util_betas: tuple[float, ...] = (0.3, 0.5, 0.7, 1.0, 2.0)
+    gravity_half_decay_m: tuple[float, ...] = (100, 300, 1_000, 3_000, 10_000)
     dest_cols: tuple[str, ...] | None = None
     travel_cost: str = 'time_gross'
     utility: str = 'default'
@@ -114,8 +116,8 @@ class Scenario:
         of `'mtmc'` (MZMV 2015 + 2021 self-reported), `'mobis_precovid'`
         (MOBIS pre-2020 GPS-tracked, ttf-filtered), or `'mobis_covid'`
         (MOBIS COVID-era 2020-wk13 through 2022-03 — anomalous traffic
-        regime, use with care). Blending is intentionally NOT supported — pick one source per
-        mode; MOBIS otherwise dominates by sample count.
+        regime, use with care). One source per mode, no blending (MOBIS
+        would dominate by sample count).
       - `zone_h3_resolution`: `None` = load NPVM Swiss traffic zones;
         non-None = build H3 zones at that resolution (required for
         non-Swiss cases).
@@ -126,9 +128,16 @@ class Scenario:
         01's aggregation. Must contain ≥1 `*_total` (used to derive
         `combined_total`). STATPOP/STATENT scenarios can extend with
         age bands / industry codes.
-      - `mode_configs`: active modes (dict keys) with their per-mode
+      - `mode_configs`: active road modes (dict keys) with their per-mode
         config. Override via `dataclasses.replace`; drop keys to
-        deactivate modes.
+        deactivate modes (per-mode stages then skip them).
+      - `car_network_source`: `'osm'` (default) or `'tlmregio'` (swissTLMRegio
+        main roads, `preparation/switzerland/public/tlmregio`; simplified-
+        network test). Read by 02a; walk / bike always use OSM.
+      - `transit_source`: `'npvm'` (Swiss NPVM zone-to-zone times, refined
+        per cell) or `None` (no public transport: the transit stages and the
+        transit parts of the others skip). Transit needs walk + bike in
+        `mode_configs` (06: walking time to stops, cycling time to stations).
       - `accessibility_grids`: `{grid_key: AccessibilityGrid}`; each grid
         becomes a `--variant` in 10.
       - `poi_cols` / `transit_stops_cols`: destination columns; the
@@ -155,6 +164,8 @@ class Scenario:
     )
     mode_configs: dict[str, ModeConfig] = field(
         default_factory=lambda: dict(MODE_CONFIGS))
+    car_network_source: str = 'osm'
+    transit_source: str | None = None
     edge_weights_sources: dict[str, str] = field(
         default_factory=lambda: {'walk': 'mtmc', 'bike': 'mtmc', 'car': 'mobis_precovid'})
     snap: SnapConfig = field(default_factory=SnapConfig)
@@ -216,6 +227,23 @@ class Scenario:
         if unknown:
             raise ValueError(f"mode_configs keys must be ⊆ ('walk','bike','car'); "
                              f"got {unknown!r}.")
+        if self.car_network_source not in ('osm', 'tlmregio'):
+            raise ValueError(f"car_network_source must be 'osm' or 'tlmregio', "
+                             f"got {self.car_network_source!r}.")
+        if self.transit_source not in (None, 'npvm'):
+            raise ValueError(f"transit_source must be 'npvm' or None, "
+                             f"got {self.transit_source!r}.")
+        if self.transit_source and not {'walk', 'bike'} <= set(self.mode_configs):
+            raise ValueError(f"transit_source={self.transit_source!r} needs walk + bike "
+                             f"in mode_configs (06 computes access by both); "
+                             f"got {sorted(self.mode_configs)!r}.")
+        fits_utility = any(isinstance(src, Calibrate) for name, src in self.coefs.items()
+                           if name.startswith('utility_'))
+        if fits_utility and (self.transit_source is None
+                             or set(self.mode_configs) != {'walk', 'bike', 'car'}):
+            raise ValueError("Fitting the mode-choice model (09a) needs walk, bike, car and "
+                             "transit; import the utility coefs instead (ImportFrom / "
+                             "HandWritten).")
         _EW_SOURCES = ('mtmc', 'mobis_precovid', 'mobis_covid')
         missing_ew = [m for m in self.mode_configs
                       if m not in self.edge_weights_sources]
@@ -298,8 +326,9 @@ class Scenario:
             valid_cost = {'time_gross', 'util', 'dist_line'}
             reserved_cost = {'time_net'}
             if g.travel_cost in reserved_cost:
-                raise NotImplementedError(f"accessibility_grids[{grid_key!r}].travel_cost="
-                                          f"{g.travel_cost!r} reserved; use {sorted(valid_cost)!r}.")
+                raise NotImplementedError(
+                    f"accessibility_grids[{grid_key!r}].travel_cost="
+                    f"{g.travel_cost!r} reserved; use {sorted(valid_cost)!r}.")
             if g.travel_cost not in valid_cost:
                 raise ValueError(f"accessibility_grids[{grid_key!r}].travel_cost="
                                  f"{g.travel_cost!r} must be one of "
@@ -375,15 +404,26 @@ _SWISS_UTILITY_SPEC_VARIANTS: dict[str, CoefSource] = {
     'utility_default_route_stats':  Calibrate(),
 }
 _IMPORTED_FROM_SWISS: dict[str, CoefSource] = {
-    'edge_weights_walk':            ImportFrom('switzerland-h10'),
-    'edge_weights_bike':            ImportFrom('switzerland-h10'),
-    'edge_weights_car':             ImportFrom('switzerland-h10'),
-    'overheads_road':               ImportFrom('switzerland-h10'),
-    'overheads_transit':            ImportFrom('switzerland-h10'),
-    'node_trip_weights_car':        ImportFrom('switzerland-h10'),
-    'flow_cost_bins_car':           ImportFrom('switzerland-h10'),
-    'utility_default':              ImportFrom('switzerland-h10'),
-    'utility_default_stats':        ImportFrom('switzerland-h10'),
+    name: ImportFrom('switzerland-h10') for name in _SWISS_CALIBRATED_COEFS
+}
+
+# Coefficients published with the accessibility Zenodo record
+# (`coefficients.zip`), unpacked by hand into `coefs/manual/`.
+_PUBLISHED_SWISS_COEFS: dict[str, CoefSource] = {
+    name: HandWritten() for name in _SWISS_CALIBRATED_COEFS
+}
+
+_SWISS_ACCESSIBILITY_GRIDS: dict[str, AccessibilityGrid] = {
+    'time': AccessibilityGrid(
+        travel_cost='time_gross',
+    ),
+    'util': AccessibilityGrid(
+        bin_edges_min=(),
+        travel_cost='util',
+    ),
+    'dist': AccessibilityGrid(
+        travel_cost='dist_line',
+    ),
 }
 
 SCENARIOS: dict[str, Scenario] = {
@@ -394,22 +434,42 @@ SCENARIOS: dict[str, Scenario] = {
     'switzerland-h10': Scenario(
         name='switzerland-h10',
         area_name='switzerland',
+        transit_source='npvm',
         population_source='statpop',
         employment_source='statent',
         storage=Storage.PRIVATE,
         coefs={**_SWISS_CALIBRATED_COEFS, **_SWISS_UTILITY_SPEC_VARIANTS},
-        accessibility_grids={
-            'time': AccessibilityGrid(
-                travel_cost='time_gross',
-            ),
-            'util': AccessibilityGrid(
-                bin_edges_min=(),
-                travel_cost='util',
-            ),
-            'dist': AccessibilityGrid(
-                travel_cost='dist_line',
-            ),
-        },
+        accessibility_grids=_SWISS_ACCESSIBILITY_GRIDS,
+    ),
+    # switzerland-h10 reproduced from public inputs only: every survey-
+    # derived coefficient set is read from `coefs/manual/` (the published
+    # coefficients) instead of being fitted, so the survey stages self-skip
+    # and no private data is read.
+    'switzerland-h10-public': Scenario(
+        name='switzerland-h10-public',
+        area_name='switzerland',
+        transit_source='npvm',
+        population_source='statpop',
+        employment_source='statent',
+        coefs=_PUBLISHED_SWISS_COEFS,
+        accessibility_grids=_SWISS_ACCESSIBILITY_GRIDS,
+    ),
+    # Car only, no public transport: Bern-Mittelland on public data with the
+    # published coefficients (placed in coefs/manual/). Checks that the
+    # pipeline runs for a single mode / profile and without transit, as in
+    # regions without a transit model. No utility grid: with a single mode,
+    # utilities can't be estimated, and on their own add little to time.
+    'bern-metro-car-public': Scenario(
+        name='bern-metro-car-public',
+        area_name='bern-metro',
+        population_source='statpop',
+        employment_source='statent',
+        coefs={name: HandWritten() for name in (
+            'edge_weights_car', 'overheads_road', 'node_trip_weights_car',
+            'flow_cost_bins_car')},
+        mode_configs={'car': replace(MODE_CONFIGS['car'], profiles=['base'])},
+        accessibility_grids={k: g for k, g in _SWISS_ACCESSIBILITY_GRIDS.items()
+                             if g.travel_cost != 'util'},
     ),
     # Cambridge UK — GHS + coef-based; employment β still Swiss-derived.
     'cambridgeuk-public': Scenario(
@@ -425,11 +485,10 @@ SCENARIOS: dict[str, Scenario] = {
 }
 
 
-# Technical Validation scenarios (for the aperta-atlas data descriptor
-# paper) live in a sibling file to keep this one focused on core project
-# scenarios. Merged in here; the sibling only imports the `Scenario`
-# class + the `_IMPORTED_FROM_SWISS` preset (both already defined above),
-# so no circular-import risk at load time.
+# Technical Validation scenarios (for the data descriptor) live in a sibling
+# file, merged in here. The sibling imports names defined above from this
+# module, so import `scenarios` before `scenarios_technical_validation`:
+# importing the sibling first fails on the circular import.
 from scenarios_technical_validation import SCENARIOS as _TV_SCENARIOS  # noqa: E402
 SCENARIOS.update(_TV_SCENARIOS)
 
@@ -446,15 +505,12 @@ def scenario_needs_survey_prep(scenario: Scenario) -> bool:
     """True if this scenario's coefs include any calibrator that fits
     from survey microdata (MZMV / MOBIS legs).
 
-    Used by the four `survey/*` scripts to self-skip when the pipeline runs a
-    fully-imported scenario (e.g. res-*): downstream calibration scripts
-    short-circuit via `coefs.resolve`, so producing
-    survey_legs/routed/overhead/summary would be wasted work — the outputs have
-    no consumer in that run.
+    The `survey/*` scripts and 07b use it to skip survey prep on fully
+    imported scenarios (e.g. res-*): `coefs.resolve` never calls the fit
+    there, so the survey outputs would have no consumer.
 
-    Currently equivalent to "any Calibrate() in scenario.coefs" — every
-    calibrator in this codebase is survey-driven. If a non-survey calibrator is
-    added later (e.g. traffic-counter-only, GPS-only), narrow this check
-    accordingly (e.g. inspect specific coef names).
+    Implemented as "any `Calibrate()` in `scenario.coefs`", since every
+    calibrator here is survey-driven. Narrow the check (e.g. by coef name)
+    if a non-survey calibrator is added.
     """
     return any(isinstance(s, Calibrate) for s in scenario.coefs.values())

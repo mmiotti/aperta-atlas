@@ -12,11 +12,11 @@ within its tier radius carries `hypot(x_o - x_d, y_o - y_d)` between
 centroids in `scenario.crs_main`. "Line" (straight-line / crow-flies)
 contrasts with network distance, which this pipeline doesn't compute.
 
-Inputs (PUBLIC, under `<scenario>/`):
+Inputs (scenario storage, under `<scenario>/`):
     shapes/cells.gpkg + properties/cells_snap.csv           # for zone_id
     shapes/zones.gpkg
 
-Outputs (PUBLIC, under `<scenario>/`):
+Outputs (scenario storage, under `<scenario>/`):
     odm/dist_line_geo_pairs.npz     # mode-agnostic pair index (dest ids per origin)
     odm/dist_line_dist_line.npz     # straight-line distances aligned to those pairs
 

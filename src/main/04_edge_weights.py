@@ -10,10 +10,11 @@ Ground truth per mode is set by `scenario.edge_weights_sources[mode]`:
 Blending sources is intentionally NOT supported — MOBIS otherwise
 dominates by sample count. Pick one source per mode.
 
-For walk + car (peak / base / night), each profile is fit independently.
-The three car variants share the network + prior coefficients — only
-the time-of-day bucket filtering the legs differs (survey prep's
-`peak_str`, the same label every downstream car consumer uses).
+For walk (rwalk) + car (peak / base / night), each fitted profile is fit
+independently. The three car variants share the network + prior
+coefficients — only the time-of-day bucket filtering the legs differs
+(survey prep's `peak_str`, the same label every downstream car consumer
+uses).
 
 For bike, only the regular bike (rbike) is fit. Ebike profiles
 (ebike25 / ebike45) are DERIVED from rbike's fit by:
@@ -24,12 +25,17 @@ For bike, only the regular bike (rbike) is fit. Ebike profiles
      multipliers (see `_EBIKE_DERIVATIONS`). Examples:
        elevation_gain × 0.33  (motor assist eases climbs)
        elevation_loss × 0.50 (ebike25) / 0 (ebike45) (downhill help shrinks)
-       is_4way / is_traffic_signal × 1.5 (ebike25) / 2.0 (ebike45)
+       is_4way / is_traffic_signal × 1.30 (ebike25) / 1.80 (ebike45)
                                           (faster baseline → bigger relative
                                            cost of stop/start at intersections)
+  3. Capping each edge's duration at the slower bicycle profiles'
+     (`not_slower_than`): ebike25 ≤ rbike, ebike45 ≤ ebike25 and rbike.
 All three bike columns are written to a single `edges_bike_calibrated.csv`
 (mirroring car's multi-profile-in-one-file pattern). Edit
-`_EBIKE_DERIVATIONS` to tune the ebike rules.
+`_EBIKE_DERIVATIONS` to tune the ebike rules. Walk's `walk_prm` (persons
+with reduced mobility) is derived from rwalk the same way
+(`_WALK_DERIVATIONS`: 3.5 km/h, elevation coefs × 3, steps and
+slopes > 20 % impassable).
 
 Inputs (PRIVATE) — subset actually read depends on the scenario's
 `edge_weights_sources` mapping:
@@ -37,12 +43,17 @@ Inputs (PRIVATE) — subset actually read depends on the scenario's
     preparation/switzerland/surveys/mzmv_2021/legs.csv         # 'mtmc'
     preparation/switzerland/surveys/mobis_precovid/legs.csv    # 'mobis_precovid'
     preparation/switzerland/surveys/mobis_covid/legs.csv       # 'mobis_covid'
+Inputs (scenario storage, under <scenario>/):
+    nw/<mode>.graphml + properties/nodes_<mode>_core.csv       # from 02a
+    properties/edges_<mode>_{core,from_nodes,extended}.csv     # from 02a / 02b
+    properties/edges_car_flows.csv                             # from 03b (car only)
 
-Outputs (PUBLIC, under <scenario>/):
+Outputs (scenario storage, under <scenario>/):
     properties/edges_<mode>_calibrated.csv
         # duration_calibrated_<profile> + effective_speed_kph_<profile>
         # + duration_baseline_<profile> for every profile under <mode>.
-        # Bike's file has 3 profile columns each (bike, ebike25, ebike45).
+        # Bike's file has 3 profile columns each (rbike, ebike25, ebike45);
+        # walk's 2 (rwalk, walk_prm).
         # `duration_baseline_*` is the per-edge naive baseline duration
         # (length / baseline_speed): OSM `speed_kph` for car; uniform
         # `cfg.baseline_speed_kph` for walk / bike. Consumed by
@@ -51,8 +62,8 @@ Outputs (PUBLIC, under <scenario>/):
         # <kind> ∈ {calibrated, transferred, manual} per the scenario's
         # `coefs={'edge_weights_<mode>': ...}` declaration (see
         # README "Coefficients" + aperta_atlas.coefs).
-        # One column per profile; bike's file shows rbike's fitted
-        # coefs alongside the rule-derived ebike coefs.
+        # One column per profile; bike's / walk's file shows the fitted
+        # parent's coefs alongside the rule-derived ones.
 
 Run all variants (walk / bike / car) sequentially (default):
     python -m main.04_edge_weights --scenario <name>
@@ -62,7 +73,7 @@ Single mode:
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import networkx as nx
 import numpy as np
@@ -78,9 +89,8 @@ from scenarios import get_scenario
 
 
 _N_ITERATIONS = 5
-# Minimum R² improvement per iteration to accept the update and continue.
-# Fits typically converge before hitting `_N_ITERATIONS` because sub-1e-4
-# improvements aren't practically meaningful. Lower to keep iterating past
+# Minimum R² improvement per iteration to accept the update and continue;
+# fits usually stop before `_N_ITERATIONS`. Lower to keep iterating past
 # marginal gains; raise to stop earlier.
 _R2_TOLERANCE = 1e-5
 
@@ -103,6 +113,11 @@ class DerivedFromCalibrated:
     edge matching any predicate gets duration = inf (impassable). Each
     callable receives the edges GeoDataFrame with post-calibration
     attributes attached; returns an index-aligned bool Series.
+
+    `not_slower_than` — profiles derived or fitted earlier whose per-edge
+    durations cap this profile's (an e-bike can always ride like a regular
+    bicycle), e.g. where the OSM speed cap or the larger stop penalties
+    would otherwise make it slower.
     """
     profile: str
     target_speed_kph: float
@@ -111,6 +126,7 @@ class DerivedFromCalibrated:
     coef_multipliers: dict[str, float] = field(default_factory=dict)
     edge_exclusions: list[Callable[[pd.DataFrame], pd.Series]] = field(
         default_factory=list)
+    not_slower_than: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -133,6 +149,7 @@ class ProfileCalibration:
     max_speed_kph: float = 120.0
     min_trip_distance: float = 1_000.0
     max_trip_distance: float = 50_000.0
+    max_snap_distance: float = 300.0  # legs with an endpoint farther from the network are dropped
     derived_profiles: list[DerivedFromCalibrated] = field(default_factory=list)
 
 
@@ -180,6 +197,7 @@ _EBIKE_DERIVATIONS: list[DerivedFromCalibrated] = [
             'is_4way':           1.30,  # faster baseline → bigger relative stop cost
             'is_traffic_signal': 1.30,
         },
+        not_slower_than=('rbike',),
     ),
     DerivedFromCalibrated(
         profile='ebike45',
@@ -192,6 +210,7 @@ _EBIKE_DERIVATIONS: list[DerivedFromCalibrated] = [
             'is_4way':           1.80,
             'is_traffic_signal': 1.80,
         },
+        not_slower_than=('rbike', 'ebike25'),
     ),
 ]
 
@@ -267,6 +286,38 @@ _PROFILE_CONFIG: list[ProfileCalibration] = [
 ]
 
 
+# Car on the swissTLMRegio network (`scenario.car_network_source == 'tlmregio'`;
+# simplified-network test). The 2 × 2 classes as in LUMOS: the baseline is the
+# class speed prior from preparation (motorway by legal limit, otherwise 50 km/h
+# urban / 80 km/h rural, ramps 60 km/h); the fit scales motorway, urban and urban
+# motorway against rural roads, plus congestion. No density term (overlaps the
+# urban class) and no signals (swissTLMRegio has none); instead, urban 4-way
+# junctions get an extra delay on top of `is_4way` (most signals are in towns).
+# Endpoints snap up to the scenario's 2 km, so access to the main roads is part of
+# `snap_dist`.
+_TLMREGIO_CAR_CONFIG = replace(
+    next(c for c in _PROFILE_CONFIG if c.mode == 'car'),
+    multiplier_features={
+        'is_motorway':        0.0,
+        'is_urban':           0.2,
+        'is_motorway_urban':  0.0,
+        'vc_beta_2.0':        0.2,
+    },
+    additive_route_features={
+        'is_4way':            10.0,
+        'is_4way_urban':      5.0,
+    },
+    max_snap_distance=2_000.0,
+)
+
+
+def _profile_config(mode: str, scenario) -> ProfileCalibration:
+    """Calibration config of `mode` for `scenario`; the swissTLMRegio car network has its own."""
+    if mode == 'car' and scenario.car_network_source == 'tlmregio':
+        return _TLMREGIO_CAR_CONFIG
+    return next(c for c in _PROFILE_CONFIG if c.mode == mode)
+
+
 # One variant per mode (walk / bike / car). Each runs the corresponding
 # entry in `_PROFILE_CONFIG` — car's 3 hour-bucket profiles fit together
 # under `--variant car` (they share the graph load; splitting into
@@ -281,14 +332,16 @@ _SPEED_ENVELOPE_COL = 'is_within_speed_envelope'
 _DETOUR_ENVELOPE_COL = 'is_within_detour_envelope'
 _LAND_BASED_COL = 'is_land_based'
 _ELEVATION_BAND_COL = 'is_within_elevation_band'
+# Survey `mode_simplified` labels fitted per graph mode (bike: regular bicycles only).
+_SURVEY_MODES: dict[str, set[str]] = {'walk': {'walk'}, 'bike': {'rbike'}, 'car': {'car'}}
 
 
 def _apply_survey_gates(legs: pd.DataFrame) -> pd.DataFrame:
     """Trip-level quality gates common to MTMC + MOBIS calibration
-    training. Applied at load time because MOBIS goes straight from
-    the surveys directory into 04 (no equivalent of `02d_prepare_
-    survey_legs.py` pre-filter), so BOTH sources need every flag
-    enforced here symmetrically. Gates:
+    training. Applied at load time because 04 reads both sources
+    straight from the preparation surveys directory (not through
+    `survey/02d_prepare_survey_legs.py`'s pre-filter), so every flag is
+    enforced here, symmetrically. Gates:
 
       - is_valid_domestic_trip == 1 (dist/time OK, in Switzerland,
         MOBIS `implausible` False)
@@ -299,7 +352,7 @@ def _apply_survey_gates(legs: pd.DataFrame) -> pd.DataFrame:
       - is_within_elevation_band == 1 (DEM-valid endpoints + not
         alpine; composite gate from `standardize.attach_within_
         elevation_band_flag` — thresholds live there as single
-        source of truth, shared with 07 + 02d)
+        source of truth, shared with 07a + 02d)
 
     Mode filtering is applied by each caller (they know which mode
     set they're training on). Person-level diary integrity is NOT
@@ -334,8 +387,7 @@ def _load_mtmc_legs(context, mode: str) -> pd.DataFrame:
         dfs.append(pd.read_csv(path, low_memory=False))
     legs = pd.concat(dfs, ignore_index=True, sort=False)
     legs = _apply_survey_gates(legs)
-    mode_values = {'walk': {'walk'}, 'bike': {'rbike'}, 'car': {'car'}}
-    legs = legs[legs['mode_simplified'].isin(mode_values[mode])]
+    legs = legs[legs['mode_simplified'].isin(_SURVEY_MODES[mode])]
     return legs
 
 
@@ -358,8 +410,7 @@ def _load_mobis_legs(context, mode: str, cohort: str) -> pd.DataFrame:
     path = surveys_ctx.path_for(Storage.PRIVATE, f'{cohort}/legs.csv')
     legs = pd.read_csv(path, low_memory=False)
     legs = _apply_survey_gates(legs)
-    mode_values = {'walk': {'walk'}, 'bike': {'rbike'}, 'car': {'car'}}
-    legs = legs[legs['mode_simplified'].isin(mode_values[mode])]
+    legs = legs[legs['mode_simplified'].isin(_SURVEY_MODES[mode])]
     if mode == 'bike' and len(legs) == 0:
         logging.warning(
             f"  ⚠ MOBIS bike training set is EMPTY for cohort "
@@ -373,7 +424,7 @@ def _load_survey_legs(
     context, mode: str, profile: str | None, source: str,
 ) -> pd.DataFrame:
     """Load ground-truth legs from the requested `source`, mode-filtered
-    (and, for car under mtmc/mobis, time-of-day-bucketed by `profile` via `peak_str`).
+    (and, for car, time-of-day-bucketed by `profile` via `peak_str`).
     Returns the schema `aperta.calibration.calibrate_edge_weights`
     expects: `orig_x, orig_y, dest_x, dest_y, time_measured,
     dist_measured, dist_line` (LV95 coords; times in s; distances in m).
@@ -408,24 +459,17 @@ def _load_survey_legs(
     logging.info(
         f"  → loaded {len(legs):,} legs (mode={mode!r}, profile={profile!r}, "
         f"source={source!r})")
-    # Return the FULL frame — `calibrate_edge_weights` requires
-    # `orig_x/y, dest_x/y, time_measured, dist_measured, dist_line` but
-    # ignores extras. Downstream code in `_fit_coefs` needs the extras
-    # too: `weight_person` for WLS, `elev_orig`/`elev_dest` for the
-    # alpine filter that was already applied by `_apply_survey_gates`.
+    # Return the FULL frame — `calibrate_edge_weights` ignores extra
+    # columns, and `_fit_coefs` needs `weight_person` for WLS.
     return legs.reset_index(drop=True)
 
 
 def _prepare_edge_features(graph, baseline_speed_kph: float | None) -> None:
-    """Write a uniform `speed_kph` onto every edge of `graph`. Mutates in place.
+    """Write a uniform `speed_kph` onto every edge of `graph`, in place.
+    No-op when `baseline_speed_kph` is None (car keeps the OSM speeds).
     """
-    edge_attrs = {}
-    for u, v, k, d in graph.edges(keys=True, data=True):
-        attrs = {}
-        if baseline_speed_kph is not None:
-            attrs['speed_kph'] = baseline_speed_kph
-        edge_attrs[(u, v, k)] = attrs
-    nx.set_edge_attributes(graph, edge_attrs)
+    if baseline_speed_kph is not None:
+        nx.set_edge_attributes(graph, baseline_speed_kph, 'speed_kph')
 
 
 _KMH_TO_MS = 1.0 / 3.6
@@ -434,8 +478,8 @@ _KMH_TO_MS = 1.0 / 3.6
 def _stash_osm_speed_kph(graph) -> None:
     """Copy each edge's current `speed_kph` to `osm_speed_kph` before
     `_prepare_edge_features` overwrites it with a uniform baseline.
-    Used by `_derive_ebike_profile` to compute per-edge ebike baselines
-    that respect the original speed-limit cap."""
+    `_set_per_edge_derived_baseline` uses it to cap derived profiles'
+    per-edge baselines at the original speed limit."""
     osm = nx.get_edge_attributes(graph, 'speed_kph')
     nx.set_edge_attributes(graph, osm, 'osm_speed_kph')
 
@@ -468,15 +512,15 @@ def _derive_ebike_profile(
     rbike_coefs: pd.DataFrame,
     derivation: DerivedFromCalibrated,
 ) -> tuple[dict, dict, pd.DataFrame]:
-    """Apply derivation rules to rbike's fitted coefficients and write
+    """Apply derivation rules to the parent profile's fitted coefficients
+    (rbike → ebike25 / ebike45, rwalk → walk_prm) and write
     `duration_calibrated_<derivation.profile>` on the graph. Returns
     `(durations_dict, effective_speeds_dict, derived_coefs_df)` suitable
     for stacking into 04's output frames.
 
-    `rbike_coefs` is the `CalibrationResult.coefficients` DataFrame:
-    indexed by feature name (`baseline_time`, `bike_infra_score`,
-    `is_traffic_signal`, …) with columns `kind`, `coef`, `p`,
-    `mean_effect`.
+    `rbike_coefs` is the parent's `CalibrationResult.coefficients`
+    DataFrame: indexed by feature name (`baseline_time`, `is_4way`,
+    `elevation_gain`, …) with columns `coef`, `p`.
     """
     alpha = float(rbike_coefs.loc['baseline_time', 'coef'])
     mult = {
@@ -516,6 +560,16 @@ def _derive_ebike_profile(
             min_speed_kph=derivation.min_speed_kph,
             max_speed_kph=derivation.max_speed_kph,
         )
+        for other in derivation.not_slower_than:
+            other_attr = f'duration_calibrated_{other}'
+            n_capped = 0
+            for _u, _v, _k, data in graph.edges(keys=True, data=True):
+                cap = data.get(other_attr)
+                if cap is not None and cap < data[edge_duration_attr]:
+                    data[edge_duration_attr] = cap
+                    n_capped += 1
+            logging.info(f"  → {derivation.profile}: {n_capped:,} edges capped at "
+                         f"{other}'s duration")
         # Apply hard exclusions: any predicate matching → duration = inf.
         if derivation.edge_exclusions:
             edges_df = ox.graph_to_gdfs(graph, nodes=False)
@@ -536,8 +590,8 @@ def _derive_ebike_profile(
         eff_speed_kph = {k: lengths[k] / v * 3.6
                          for k, v in durations.items() if v != float('inf')}
 
-    # Derived coefs: scale coef + mean_effect by the same factor; NaN out
-    # p-values since no OLS fit was done for derived profiles.
+    # Derived coefs: scale coef (and mean_effect, if present) by the same
+    # factor; NaN out p-values since derived profiles aren't fitted.
     derived_coefs = rbike_coefs.copy()
     for name in (*mult.keys(), *add_route.keys()):
         factor = derivation.coef_multipliers.get(name, 1.0)
@@ -557,16 +611,17 @@ def _derive_ebike_profile(
 def _fit_coefs(context, cfg: ProfileCalibration) -> pd.DataFrame:
     """Fit OLS per profile in `cfg`; return the coef DataFrame with MultiIndex
     columns `(profile, coef|p)`. Graph reloaded fresh per profile — calibrate
-    mutates per-edge attrs. Bike's ebike25 / ebike45 are rule-derived from the
-    rbike fit. Does NOT write to disk; `coefs.resolve` handles that.
+    mutates per-edge attrs. `cfg.derived_profiles` (ebike25 / ebike45,
+    walk_prm) are rule-derived from the fit. Does NOT write to disk;
+    `coefs.resolve` handles that.
     """
     profiles = cfg.profile if isinstance(cfg.profile, list) else [cfg.profile]
     out_coef_dfs: dict[str, pd.DataFrame] = {}
-    # Scope training legs to the scenario's AOI. Pass-through for
-    # switzerland-h10 (AOI = Switzerland); load-bearing for the CV
-    # scenarios and any other sub-country AOI.
+    # Scope training legs to the scenario's AOI (both endpoints inside). For
+    # switzerland-h10 this drops legs leaving Switzerland; for the CV scenarios
+    # and other sub-country AOIs it also restricts the region.
     scenario = get_scenario(context.scenario)
-    with step('load AOI polygon (union of is_aoi cells)'):
+    with step('load AOI polygon (area outline, as in 01)'):
         aoi_polygon = load_aoi_polygon(context)
 
     for profile in profiles:
@@ -595,10 +650,9 @@ def _fit_coefs(context, cfg: ProfileCalibration) -> pd.DataFrame:
                 label=f'{source} {cfg.mode}')
             leg_filter = ((legs.dist_line > cfg.min_trip_distance) &
                           (legs.dist_line <= cfg.max_trip_distance))
-            # WLS weight = `weight_person`. On MZMV/MTMC this is BFS's
-            # stratification correction (0.3-3.0 range); on MOBIS it's
-            # uniformly 1.0 so WLS reduces to OLS. `weight_col=None`
-            # (no `weight_person` column) skips weighting entirely.
+            # WLS weight = `weight_person`: BFS's stratification correction
+            # on MTMC (0.3-3.0 range), uniformly 1 on MOBIS (WLS = OLS).
+            # Without the column, `weight_col=None` skips weighting.
             if 'weight_person' in legs.columns:
                 weight_col = 'weight_person'
             else:
@@ -619,6 +673,7 @@ def _fit_coefs(context, cfg: ProfileCalibration) -> pd.DataFrame:
                 constant=cfg.constant,
                 n_iterations=_N_ITERATIONS,
                 r2_tolerance=_R2_TOLERANCE,
+                max_distance=cfg.max_snap_distance,
                 edge_duration_attr=f"duration_calibrated_{profile}",
                 eligible_node_ids=snap_eligible,
                 weight_col=weight_col,
@@ -705,7 +760,7 @@ def _apply_coefs_and_save(
                 # Per-edge naive baseline duration (length / baseline_speed).
                 # For car: baseline = OSM speed_kph. For walk/bike: uniform
                 # `cfg.baseline_speed_kph`. Used by 05 for the naive-routing
-                # comparison in validation/times_vs_* scripts.
+                # comparison in technical_validation/times_vs_* scripts.
                 f'duration_baseline_{profile}': baseline_durations,
             }))
 
@@ -754,7 +809,14 @@ def main(variant) -> None:
     """Resolve coefs for one mode (walk / bike / car) per the scenario's
     declaration in scenarios.py, then apply to the local graph."""
     context = init_context(variant)
-    cfg = next(c for c in _PROFILE_CONFIG if c.mode == variant.mode)
+    scenario = get_scenario(context.scenario)
+    mode = variant.mode
+    if mode not in scenario.mode_configs:
+        logging.info(f"mode={mode!r} not in scenario mode_configs "
+                     f"({list(scenario.mode_configs)}); skipping")
+        context.close()
+        return
+    cfg = _profile_config(mode, scenario)
     coefs_df = coefs.resolve(
         context,
         name=f'edge_weights_{cfg.mode}',

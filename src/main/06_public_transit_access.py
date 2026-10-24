@@ -7,23 +7,27 @@ Per-cell access metrics (routed travel time, seconds):
   - `t_bike_to_train_nearest`    bike to nearest 1 heavy-rail stop
 
 Each metric also gets a `<metric>_zone_dev` deviation column (negative =
-better than zone mean). These per-cell deviations are then applied as a
-bonus / penalty on top of NPVM's zone-to-zone PT times to sharpen the
-zone-level PT skim back to cell resolution for accessibility.
+better than zone mean). These per-cell deviations are then applied, with
+07b's coefficients, as a bonus / penalty on top of NPVM's zone-to-zone PT
+times to sharpen the zone-level PT skim back to cell resolution.
+Also written: the cell's density (`density_r500_norm` of its
+walking-network node, as in the road overheads), another 07b feature
+(denser areas: more frequent service, shorter waits).
 
 Pipeline per metric: load 05's pre-routed costs → `reindex_by_geo_unit`
 to cell-keyed → `lookup_dest_column_geo` on the POI count column
 (clipped at 1 per cell to avoid multi-direction bus-stop double-count)
 → `accessibility.nearest_k` → weighted zone-mean deviation.
 
-Inputs (PUBLIC, under <scenario>/):
+Inputs (scenario storage, under <scenario>/):
     properties/cells_pois.csv                              # `mobility_transit`, `mobility_transit_train`
     properties/cells_population.csv + cells_snap.csv + shapes/cells.gpkg
     properties/zones_population.csv + zones_snap.csv + shapes/zones.gpkg
     odm/walk_node_pairs.npz + odm/walk_time_net_rwalk.npz  # from 05
     odm/bike_node_pairs.npz + odm/bike_time_net_rbike.npz  # from 05 (rbike profile)
+    properties/nodes_walk_extended.csv                     # from 02b (density)
 
-Output (PUBLIC, under <scenario>/):
+Output (scenario storage, under <scenario>/):
     properties/cells_transit_access.csv
 
 Run:
@@ -42,6 +46,7 @@ from aperta_atlas.context import init_context
 from aperta_atlas.utils import step
 
 from aperta.data_processing import weighted_group_mean
+from main.common import ROAD_OVERHEAD_DENSITY_COL
 from scenarios import get_scenario
 
 
@@ -50,7 +55,6 @@ from scenarios import get_scenario
 # is absent get skipped with a warning at runtime. Add entries to
 # extend (e.g. walk→train separately).
 _TRANSIT_ANALYSES: tuple[tuple[str, str | None, str, str, tuple[int, ...]], ...] = (
-    # (mode, profile, transit-col, output-label, ks)
     ('walk', 'rwalk', 'mobility_transit',       'transit', (1, 3)),
     ('bike', 'rbike', 'mobility_transit_train', 'train',   (1,)),
 )
@@ -129,6 +133,10 @@ def _compute_nearest(
 def main():
     context = init_context()
     scenario = get_scenario(context.scenario)
+    if scenario.transit_source is None:
+        logging.info(f"Scenario {scenario.name!r} has no transit; skipping.")
+        context.close()
+        return
 
     # Resolve which analyses actually run — an entry in `_TRANSIT_ANALYSES`
     # only fires if its column is in `scenario.transit_stops_cols`
@@ -172,7 +180,7 @@ def main():
 
     # Output column naming: `t_{mode}_to_{label}_{suffix}` with
     # `suffix = 'nearest'` for k=1 and `f'mean{k}'` for k>1. Matches
-    # what 07's transit-access overheads expect.
+    # what 07b's transit-access overheads expect.
     out_data: dict[str, pd.Series] = {}
     for mode, profile, col, label, ks in analyses:
         result = _compute_nearest(
@@ -216,6 +224,13 @@ def main():
                 f"dev IQR=[{dev_finite.quantile(0.25):+.1f}, "
                 f"{dev_finite.quantile(0.75):+.1f}] s"
                 if len(dev_finite) else f"  → {col}: ALL NaN")
+
+    with step('add cell density (walking network, as in the road overheads)'):
+        density = context.get_properties('nodes', 'walk_extended')[ROAD_OVERHEAD_DENSITY_COL]
+        out[ROAD_OVERHEAD_DENSITY_COL] = cells['node_id_walk'].map(density).fillna(0.0)
+        logging.info(f"  → {ROAD_OVERHEAD_DENSITY_COL}: median "
+                     f"{out[ROAD_OVERHEAD_DENSITY_COL].median():.3f}, P99 "
+                     f"{out[ROAD_OVERHEAD_DENSITY_COL].quantile(0.99):.3f}")
 
     with step('save properties/cells_transit_access.csv'):
         context.create_properties(out, data_name='transit_access')

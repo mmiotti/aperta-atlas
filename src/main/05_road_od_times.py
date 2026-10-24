@@ -32,12 +32,12 @@ prepared zones layer. Origins are further restricted to `is_active == 1`
 (cells that snapped to ALL network types); destinations include the
 buffer-only cells that only snap to some networks.
 
-Inputs (PUBLIC, under <scenario>/):
+Inputs (scenario storage, under <scenario>/):
     properties/cells_{population,snap}.csv + shapes/cells.gpkg
     properties/zones_{population,snap}.csv + shapes/zones.gpkg
     nw/<mode>.graphml + properties/edges_<mode>_calibrated.csv   # from 04
 
-Outputs (PUBLIC, under <scenario>/):
+Outputs (scenario storage, under <scenario>/):
     odm/<mode>_node_pairs.npz                             # section A — node-keyed tiered pair index
     odm/walk_time_net_rwalk.npz                           # section B (mode=walk)
     odm/bike_time_net_{rbike,ebike25,ebike45}.npz         # section B (mode=bike)

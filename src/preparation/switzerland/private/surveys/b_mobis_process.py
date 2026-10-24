@@ -8,14 +8,16 @@ through end-of-March 2022).
 > as documentation of the method.
 
 Reads the raw `legs.csv` plus the simplified trajectories produced by
-`a_mobis_trajectories_process.py`, attaches mode / peak / weekday flags, joins
-zone metadata, applies the inclusion filters for the mode-choice and travel-time
-models, and writes the result.
+`a_mobis_trajectories_process.py`, attaches mode / peak / weekday flags and the
+per-leg validity / plausibility flags (see `standardize.py`), joins the route
+geometry sizes, and writes the result.
 
 Inputs (under <DATA_DIR_PRIVATE>/raw/switzerland/mobis/tracking/):
     legs.csv                                                 # raw MOBIS legs
 Inputs (prepared, prior stage):
     mobis_all/trajectories.npy / trajectories.csv            # simplified routes
+Inputs (PUBLIC, under preparation/world/elevation/):
+    dem_switzerland.tif                                      # endpoint elevation
 Inputs (cross-namespace; not yet migrated — TODO):
     preparation/switzerland/zones :: properties + shapes for zones.
     -> TODO: finalize. Moved zone-based information away from here so that this script doesn't need zones.
@@ -131,8 +133,9 @@ def process(context: Context, pre_covid: bool, zones: gpd.GeoDataFrame,
     raw_path = context.raw_path(Storage.PRIVATE, 'switzerland/mobis/tracking/legs.csv')
     legs = pd.read_csv(raw_path)
 
-    legs['started_at'] = pd.to_datetime(legs['started_at'])
-    legs['finished_at'] = pd.to_datetime(legs['finished_at'])
+    # Raw timestamps are UTC (`…Z`); hours, weekdays and cohort weeks are local Swiss time.
+    for col in ('started_at', 'finished_at'):
+        legs[col] = pd.to_datetime(legs[col], utc=True).dt.tz_convert('Europe/Zurich')
     legs['year_month'] = (legs['started_at'].dt.year +
                           legs['started_at'].dt.month / 100).round(2)
     legs['year_week'] = (legs['started_at'].dt.year +
@@ -144,7 +147,7 @@ def process(context: Context, pre_covid: bool, zones: gpd.GeoDataFrame,
                  f"samples ({legs['participant_id'].nunique():,} participants)")
 
     legs['sd_bool_weekday'] = (legs['started_at'].dt.dayofweek < 5).astype(int)
-    # Vectorized round-to-hour and hour extraction.
+    # Departure hour, rounded to the nearest hour.
     legs['hour_of_day'] = legs['started_at'].dt.round('h').dt.hour
     standardize.attach_hour_flags(legs)
 
@@ -187,9 +190,8 @@ def process(context: Context, pre_covid: bool, zones: gpd.GeoDataFrame,
     f_dist_time = (legs['dist_measured'] <= 0) | (legs['time_measured'] <= 0) | legs['trip_id'].isna()
     f_implausible = legs['implausible'] == True  # noqa: E712 — keep explicit for clarity on Series
     f_outside_ch = legs['in_switzerland'] != True  # noqa: E712
-    # Land-based: excludes air / water modes (matches MZMV's semantic).
-    # Depends on the extended `_MOBIS_MODE_MAP` above mapping the
-    # non-land raw modes to short canonical names.
+    # Land-based: excludes air / water / aerial-cable modes (as in MZMV);
+    # relies on `_MOBIS_MODE_MAP` mapping them to 'plane' / 'boat' / 'aerialway'.
     non_land_modes = ('plane', 'boat', 'aerialway')
     legs['is_land_based'] = (~legs['mode_str'].isin(non_land_modes)).astype(int)
     # Speed + detour envelopes: flags only. Downstream (04_edge_weights,
@@ -217,6 +219,8 @@ def process(context: Context, pre_covid: bool, zones: gpd.GeoDataFrame,
     legs = standardize.attach_lat_lon_and_dist_line(legs)
     # Now `dist_line` exists — attach the detour envelope flag.
     standardize.attach_within_detour_envelope_flag(legs)
+    standardize.attach_within_gap_envelope_flag(
+        legs, departure_col='started_at', arrival_col='finished_at')
     # Sample the Swiss DEM at each leg's endpoints — supplies
     # `elev_orig` / `elev_dest` for downstream feature engineering,
     # alpine-trip filtering, and person-environment analyses.
@@ -224,7 +228,7 @@ def process(context: Context, pre_covid: bool, zones: gpd.GeoDataFrame,
     dem_path = dem_ctx.path_for(Storage.PUBLIC, 'dem_switzerland.tif')
     standardize.attach_endpoint_elevation(legs, dem_path=dem_path)
     # Composite elevation gate (data-quality + alpine exclusion) —
-    # single source of truth consumed by 04, 07, 02d.
+    # single source of truth consumed by 04, 07a, 02d.
     standardize.attach_within_elevation_band_flag(legs)
     # TODO(zones-migration): both calls below need the endpoint zone spatial
     # join that isn't migrated yet. Re-enable together with the join.
@@ -233,7 +237,7 @@ def process(context: Context, pre_covid: bool, zones: gpd.GeoDataFrame,
 
     legs = standardize.filter_columns_by_prefix(legs)
 
-    # Vectorized id composition (was a row-apply with f-string).
+    # Output leg id: `<participant_id>__<leg_id>`.
     legs['id_column'] = (legs['participant_id'].astype(str) + '__' +
                         legs['leg_id'].astype(str))
     leg_id_to_new_id = dict(zip(legs['leg_id'], legs['id_column']))

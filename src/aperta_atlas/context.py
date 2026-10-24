@@ -46,20 +46,21 @@ pass through to do filesystem work. It owns:
   - **Per-namespace preparation storage**: each preparation sub-package's
     `__init__.py` declares `STORAGE = Storage.PUBLIC` (or `PRIVATE`),
     used as that namespace's `default_storage`. So a script writing
-    Swiss historic data writes to PRIVATE without needing
+    survey data writes to PRIVATE without needing
     `storage=Storage.PRIVATE` on every call; a script writing OSM
     derivatives writes to PUBLIC the same way.
 
   - **Typed I/O methods** — `Context.create_/get_shapes`, `_properties`,
-    `_odm`, `_tiered_odm`, `_nw`, `_generic`, `_results`. Each enforces
+    `_tiered_odm`, `_nw`, `_generic`, `_results`, `_coefs`. Each enforces
     the `aperta_atlas` filesystem conventions (typed subfolders, index-name
     → geo_unit mapping, ODM CSR layout, network skeleton + companion
     properties). Geo-units are a fixed canonical set defined in this
-    module (`CANONICAL_UNITS`: `cells`, `zones`, `nodes`, `edges`).
+    module (`CANONICAL_UNITS`: `cells`, `zones`, `nodes`, `edges`,
+    `buildings`).
 
 Cross-namespace reads use `context.source('<path>', storage=...)` where
 `<path>` mirrors the on-disk layout:
-    context.source('preparation/switzerland/historic')        # preparation
+    context.source('preparation/switzerland/general')         # preparation
     context.source(f'{context.project}/switzerland-h10')      # same project,
                                                                 # other scenario
     context.source('lumos/2020')                              # cross-project (rare)
@@ -84,20 +85,23 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Literal, Self, cast, overload
+from typing import Any, Literal, Self, overload
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 from dotenv import dotenv_values
 
+# Custom NOTE log level, registered by `aperta` at import (level number, plain
+# "NOTE" name, `logging.note()` helper). Needed here for the level summary;
+# `init_context` replaces the name with a yellow "⚠ NOTE" label.
+from aperta import NOTE as NOTE_LEVEL
 from aperta.errors import ContextError, DataError
 from aperta_atlas import tracking
-from aperta_atlas.utils import tracked_namedtuple
 
 
-# Load .env once. The .env determines where config files live, so it can't itself
-# be in the YAML config.
+# Load .env once. Without a path, python-dotenv searches upward from this
+# module's directory (from the cwd only in interactive sessions / debuggers).
 env_values = dotenv_values()
 
 
@@ -105,13 +109,6 @@ env_values = dotenv_values()
 # (i.e. preparation). Real scenario names cannot collide with this.
 _NO_SCENARIO = '_'
 
-
-# Custom NOTE log level. Registered by the `aperta` library at import
-# (level number + plain "NOTE" name + `logging.note()` helper). See
-# `aperta/__init__.py`. Here we just re-export the level number for the
-# summary handler below; the yellow "⚠ NOTE   " label is installed in
-# `init_context` (which overrides `aperta`'s plain "NOTE" name).
-from aperta import NOTE as NOTE_LEVEL   # noqa: E402
 
 
 class _LevelCounterHandler(logging.Handler):
@@ -164,40 +161,35 @@ class Storage(Enum):
     RESULTS = "results"
 
 
-# Process-lifetime cache. Key is `(relative_path, storage)` so the same relative
-# path under different storage classes doesn't alias.
-cache: dict[tuple[str, Storage], any] = {}
+# Process-lifetime cache, keyed by the resolved file path: the same relative
+# path in different scenarios, namespaces or storage classes doesn't alias.
+cache: dict[str, Any] = {}
 
 
 # =============================================================================
 # Canonical geo-units — registry consumed by the typed I/O methods
 # =============================================================================
 #
-# Four canonical units in two conceptual groups, mapped to the on-disk index
-# column they use:
+# Canonical units, mapped to the on-disk index column they use:
 #
 #   Aggregation: `cells` (finest spatial unit; the only level routed
 #                cell-to-cell) and `zones` (coarser, many-cells-per-zone).
 #   Network:     `nodes` and `edges` of a routable mode-specific graph.
+#   `buildings`: scaffolding-only (see below).
 #
-# Anything else (municipalities, cantons, buildings, locations, …) is
-# *project-specific source data* that gets mapped into one of these four
-# during preparation. The library knows about these four and only these four.
+# Anything else (municipalities, cantons, locations, …) is project-specific
+# source data that gets mapped onto one of these during preparation.
 
 CANONICAL_UNITS: dict[str, str] = {
     "cells": "cell_id",
     "zones": "zone_id",
     "nodes": "node_id",
     "edges": "edge_id",
-    # Scaffolding-only addition (2026-05-06). `buildings` is NOT a
-    # routing primitive in the aperta algorithm library — that contract
-    # remains tight at cells/zones/nodes/edges. This entry is here so
-    # the typed-I/O methods (`create_shapes` / `create_properties` etc.)
-    # recognise buildings, dedupe geometry across multiple per-building
-    # property files, and follow the same `shapes/`+`properties/`
-    # layout cells/zones use. Index values are OSM way IDs (globally
-    # unique + stable across PBF refreshes); column name stays
-    # consistent with the `<unit>_id` pattern.
+    # Not a routing primitive in the aperta library (that contract stays at
+    # cells/zones/nodes/edges). Registered so the typed-I/O methods handle
+    # buildings like cells/zones: `shapes/` + `properties/` layout, one
+    # geometry file shared by several per-building property files. Index
+    # values are OSM way IDs (globally unique + stable across PBF refreshes).
     "buildings": "building_id",
 }
 
@@ -397,15 +389,12 @@ def _edges_to_gdf(network) -> gpd.GeoDataFrame:
 
 
 def _expand_nw_property_names(nw_name: str, value: str | list[str]) -> str | list[str]:
-    """Expand short property suffixes to fully-qualified property names by
-    prefixing the network's `data_name`.
+    """Prefix short property suffixes with the network's `data_name`
+    (`'core'` → `'<nw_name>_core'`).
 
-    A value equal to `nw_name` itself passes through unchanged — this is
-    how callers ask for the network's own base property file (the
-    `properties/{nodes,edges}_<nw_name>.csv` written by
-    `create_nw(save_properties=True)` with no `properties_name`), as
-    promised by `get_nw`'s docstring. Without this carve-out the bare
-    `nw_name` would expand to `<nw_name>_<nw_name>`, which has no file.
+    A value equal to `nw_name` passes through unchanged: it names the
+    network's base property file (`properties/{nodes,edges}_<nw_name>.csv`,
+    written by `create_nw(save_properties=True)` without `properties_name`).
     """
     def expand(s: str) -> str:
         return s if s == nw_name else f'{nw_name}_{s}'
@@ -415,7 +404,7 @@ def _expand_nw_property_names(nw_name: str, value: str | list[str]) -> str | lis
 
 
 # =============================================================================
-# ODM-shape helpers (used by Context.create_odm / Context.get_odm)
+# ODM-shape helpers (used by Context.create_tiered_odm / get_tiered_odm)
 # =============================================================================
 
 # `.npz` sub-array names for tiered ODMs. One file holds all populated tiers;
@@ -480,13 +469,11 @@ def _unpack_odm(
 def verify_match(a, b) -> None:
     """Verify two datasets are aligned by index (DataFrames) or keys (ODM dicts).
 
-    Index comparison is order-insensitive (uses set semantics via
-    `symmetric_difference`): two DataFrames with the same set of index
-    values in different orders are considered matching. This matters for
-    layered loads where one source (e.g. `networks_decorate.py`'s
-    `_decorated` overlay) re-extracts edges from a graph after a
-    `project_graph` round-trip, which changes osmnx's edge iteration
-    order without changing the edge set.
+    Index comparison is order-insensitive: the same index values in a
+    different order match. Layered loads need this, e.g. the `_decorated`
+    overlay of `networks_decorate.py` re-extracts edges after a
+    `project_graph` round-trip, which reorders osmnx's edges without
+    changing the edge set.
     """
     if len(a) != len(b):
         raise DataError(f"Datasets are of different size ({len(a)} vs {len(b)}).")
@@ -513,8 +500,8 @@ def verify_match(a, b) -> None:
 
 # Tiered-ODM tier order. Tuple of `TieredODNodePairs` field names —
 # used both for iteration order and as the per-tier prefix inside the
-# saved `.npz` archive (`<tier>__keys` etc.). `cells_to_cells` is
-# always required; the others are optional.
+# saved `.npz` archive (`<tier>__keys` etc.). Any non-empty subset of
+# tiers may be populated.
 _TIER_ODM_NAMES: tuple[str, ...] = (
     'cells_to_cells',
     'cells_to_zones',
@@ -533,10 +520,10 @@ def combine_properties(*dfs: pd.DataFrame) -> pd.DataFrame:
     Use this to compose properties from multiple sources (or to add a transformed
     frame to a loaded one):
 
-        historic = context.source('preparation/switzerland/historic')
+        general  = context.source('preparation/switzerland/general')
         surveys  = context.source('preparation/switzerland/surveys')
         df = combine_properties(
-            historic.get_properties('cells', 'core'),
+            general.get_properties('cells', 'core'),
             surveys.get_properties('cells', 'survey_extras').rename(columns={'foo': 'survey_foo'}),
         )
 
@@ -571,10 +558,10 @@ class Context:
     """
 
     parent: Self | None
-    variant: any
+    variant: Any
     project: str | None
     scenario: str | None
-    namespace: str   # e.g. 'preparation/switzerland/historic', 'atlas/main'
+    namespace: str   # e.g. 'preparation/switzerland/general', 'atlas/main'
     caller_root_path: str
     caller_file_path: str
     caller_base_name: str
@@ -587,10 +574,9 @@ class Context:
     env: dict
     created_data: set
     used_data: set
-    # Per-source override for `default_storage`. Set by `source(path,
-    # storage=...)` to pin a source context to a specific storage class
-    # (useful when a namespace's STORAGE constant is wrong for this read,
-    # or unreachable cross-repo). None → fall back to dynamic-import lookup.
+    # Override for `default_storage`: set by `init_context` (a preparation
+    # script's own `STORAGE`) or by `source(path, storage=...)`. None → fall
+    # back to the scenario lookup (see `default_storage`).
     default_storage_override: 'Storage | None' = None
 
     # ----------------------- namespace introspection ----------------------
@@ -611,7 +597,7 @@ class Context:
     def namespace_remainder(self) -> str:
         """Namespace with leading role-segment stripped.
 
-        For preparation: `'preparation/switzerland/historic'` → `'switzerland/historic'`.
+        For preparation: `'preparation/switzerland/general'` → `'switzerland/general'`.
         For project namespaces: strips the leading `<project>/` segment so a script
         in `src/main/x.py` (namespace `atlas/main`) yields remainder `'main'`.
         """
@@ -725,9 +711,7 @@ class Context:
         """
         if self.default_storage_override is not None:
             return self.default_storage_override
-        if self.project is None:
-            return Storage.PUBLIC
-        if self.scenario is None:
+        if self.project is None or self.scenario is None:
             return Storage.PUBLIC
         storage = _read_scenario_storage(self.scenario)
         return storage if storage is not None else Storage.PUBLIC
@@ -769,14 +753,15 @@ class Context:
             logging.info(f"Task `{script}` completed; took {elapsed:.1f} seconds.")
         else:
             status = tracking.update_status(self)
-            cur = status[self.status_script_name][self.status_scenario_name][self.status_variant_name]
+            cur = (status[self.status_script_name][self.status_scenario_name]
+                   [self.status_variant_name])
             logging.info(f"Task `{script}` completed; took {cur['runtime']:.1f} seconds.")
         self._log_level_summary()
 
     @staticmethod
     def _log_level_summary() -> None:
         """Emit a one-line color-coded summary of log records emitted at
-        each severity during this script run (WARNING / NOTE / INFO).
+        each severity during this script run (ERROR if any, WARNING / NOTE / INFO).
         Counts are collected by the module-level `_LEVEL_COUNTER` handler
         attached in `_install_level_counter`."""
         if _LEVEL_COUNTER is None:
@@ -811,7 +796,7 @@ class Context:
         """Read-only Context for another namespace; used to read data created
         elsewhere. The `path` argument mirrors the on-disk layout:
 
-          context.source('preparation/switzerland/historic')
+          context.source('preparation/switzerland/general')
               → preparation read (scenario-free).
 
           context.source('atlas/cambridgeuk-public')
@@ -839,6 +824,7 @@ class Context:
                 f"with no leading/trailing slash. Got {path!r}.")
         parts = path.split('/')
         first = parts[0]
+        sub_namespace = path
 
         if first == 'preparation':
             if len(parts) < 2:
@@ -847,7 +833,6 @@ class Context:
                     f"after 'preparation/'. Got {path!r}.")
             sub_project = None
             sub_scenario = None
-            sub_namespace = path
         else:
             # Project source: '<project>/<scenario>[/<extra>]'
             if len(parts) < 2:
@@ -857,7 +842,6 @@ class Context:
                     f"use f'{{context.project}}/{{other_scenario}}'.")
             sub_project = first
             sub_scenario = parts[1]
-            sub_namespace = path
 
         return replace(
             self,
@@ -895,7 +879,7 @@ class Context:
         if storage == Storage.RESULTS or self.project is None:
             return relative_path
         p = Path(relative_path)
-        return f"generic/{p.parent}/{p.stem}{p.suffix}".replace('/./', '/')
+        return f"generic/{p.parent}/{p.name}".replace('/./', '/')
 
     # ------------------------ shapes (geometries) ------------------------
 
@@ -952,10 +936,10 @@ class Context:
         geo_type_str = _get_geo_type_str(geo_type=geo_type)
         _warn_if_unknown_unit(geo_type_str, where='get_shapes')
         relative = f"shapes/{geo_type_str}{_file_suffix(data_name)}.gpkg"
-        cache_key = (relative, storage)
+        full = self.path_for(storage, relative)
+        cache_key = full
         if cache_key in cache:
             return cache[cache_key]
-        full = self.path_for(storage, relative)
         gdf = gpd.read_file(full)
         gdf = gdf.set_index(gdf.columns[0])
         _verify_index_matches_geo_type(gdf, geo_type_str, where='get_shapes')
@@ -1003,10 +987,10 @@ class Context:
         geo_type_str = _get_geo_type_str(geo_type=geo_type)
         _warn_if_unknown_unit(geo_type_str, where='get_properties')
         relative = f"properties/{geo_type_str}{_file_suffix(data_name)}.csv"
-        cache_key = (relative, storage)
+        full = self.path_for(storage, relative)
+        cache_key = full
         if cache_key in cache:
             return cache[cache_key]
-        full = self.path_for(storage, relative)
         # `low_memory=False` disables pandas' chunked-read dtype-inference,
         # which throws `IndexError: list index out of range` in
         # `_concatenate_chunks` on multi-million-row property files where
@@ -1068,12 +1052,11 @@ class Context:
         else:
             for i in range(len(dfs) - 1):
                 verify_match(dfs[i], dfs[i + 1])
-            # "Later wins" on column-name collisions — supports the canonical
-            # overlay-layering pattern (e.g., `networks_decorate.py`'s
-            # `_decorated` CSV intentionally re-emits some base columns with
-            # refined values: collapsed `highway`, NaN-filled `lanes`).
-            # Walk dfs from last back to first; drop any column from an
-            # earlier df that is also present in a later one.
+            # Later files win on column-name collisions, for overlay layering
+            # (e.g. the `_decorated` CSV of `networks_decorate.py` re-emits
+            # some base columns with refined values: collapsed `highway`,
+            # NaN-filled `lanes`). Drop from each earlier df any column that
+            # a later one also has.
             seen: set[str] = set()
             kept: list[pd.DataFrame] = []
             for d in reversed(dfs):
@@ -1085,9 +1068,8 @@ class Context:
             # case where verify_match accepted same-set/different-order indices.
             df = pd.concat(kept, axis=1)
 
-        # Defensive backstop: after the override dedup above, duplicates
-        # should be impossible from layered loads. Still useful if a single
-        # property file somehow ships duplicate columns.
+        # Defensive backstop; the dedup above already rules out duplicates
+        # from layered loads.
         if len(df.columns) > len(set(df.columns)):
             vc = df.columns.value_counts()
             raise DataError(f"Duplicate columns in loaded data: {list(vc.index[vc > 1])}")
@@ -1118,8 +1100,7 @@ class Context:
         Conceptually an ODM "belongs" to a network (more precisely, a set
         of nodes for that network).
 
-        The three tiers have fixed origin / destination key types — the
-        tier name tells you unambiguously what each row/column is:
+        The tier name fixes the origin / destination key types:
             `cells_to_cells`  — origin = cell_id, destination = cell_id
                                 (close-range pairs at cell resolution).
             `cells_to_zones`  — origin = cell_id, destination = zone_id
@@ -1127,8 +1108,6 @@ class Context:
                                 preserved, dest aggregated to zones).
             `zones_to_zones`  — origin = zone_id, destination = zone_id
                                 (long-range pairs at zone resolution).
-        (This is why there's no `'type'` data_name anymore — the tier name
-        already encodes the destination geo-type.)
 
         `data_name` describes what the per-OD-pair values mean across all
         tiers:
@@ -1139,19 +1118,15 @@ class Context:
             `<other>`       — typically np.float32 (travel times, line
                               distances, generalised utilities, …).
 
-        If you genuinely need only one tier (`cells_to_cells`), construct
-        the `TieredODNodePairs` with `cells_to_zones=None` /
-        `zones_to_zones=None` and pass it here — only the populated tier
-        is written. Variants of the same logical ODM go via the
+        Tiers set to `None` are not written (e.g. a `cells_to_cells`-only
+        `TieredODNodePairs`). Variants of the same logical ODM go via the
         `data_name` (e.g. `'travel_time_detoured'`).
 
-        On-disk format: `.npz` (numpy zipped archive) with
-        `allow_pickle=False` — pickle-free (safe to load from untrusted
-        sources), preserves array dtypes (int8/float32), zlib-compressed
-        for compactness. Each populated tier `<t>` contributes three
-        CSR-style arrays under a `<t>__*` prefix (`<t>__keys`,
-        `<t>__offsets`, `<t>__values`); a top-level `__tier_names__` array
-        lists which tiers are present.
+        On-disk format: compressed `.npz` with `allow_pickle=False` (safe
+        to load, array dtypes preserved). Each populated tier `<t>` stores
+        three CSR-style arrays (`<t>__keys`, `<t>__offsets`,
+        `<t>__values`); a top-level `__tier_names__` array lists which
+        tiers are present.
 
         To check an ODM matches the network it claims to belong to, call
         `aperta.network_processing.verify_odm_against_network(odm, nodes)`
@@ -1190,7 +1165,7 @@ class Context:
         # Runtime is correct — our keys are all our own sentinels/suffixes.
         np.savez_compressed(full, **payload)  # type: ignore[arg-type]
         if allow_cache:
-            cache[(relative, storage)] = pairs
+            cache[full] = pairs
         self.register_created_data(relative, storage, total_items)
 
     def get_tiered_odm(
@@ -1200,29 +1175,26 @@ class Context:
         storage: Storage | None = None,
         allow_cache: bool = True,
     ):
-        """Load a `TieredODPairs` from the single `.npz` written by
-        `create_tiered_odm`.
+        """Load the `.npz` written by `create_tiered_odm` as a
+        `TieredODNodePairs`.
 
         Returned numeric arrays are read-only views into one shared
-        backing buffer (the `.npz`'s `values` array). Mutate via
+        backing buffer per tier (the `.npz`'s `values` array). Mutate via
         `arr.copy()` — direct in-place writes raise `ValueError`.
         String-dest ODMs (`data_name='idx'`) come back as native lists
         and don't share storage.
 
-        At least one tier must be populated on-disk — raises `DataError`
-        otherwise. Mirrors `create_tiered_odm`'s "any populated tier
-        suffices" behavior; tiers not present in the file load as
-        `None` on the returned `TieredODPairs`. (Example: the NPVM PT
-        zone-to-zone matrix has only `zones_to_zones` populated; both
-        cell-tier fields come back as `None`.)
+        Tiers not present in the file load as `None` (e.g. the NPVM
+        transit ODM has only `zones_to_zones`); a file with no populated
+        tier raises `DataError`.
         """
-        from aperta.od_pairs import TieredODNodePairs  # local import — avoid cycle
+        from aperta.od_pairs import TieredODNodePairs  # lazy: od_pairs pulls in numba
         storage = storage or self.default_storage
         relative = f"odm/{network_name}_{data_name}.npz"
-        cache_key = (relative, storage)
+        full = self.path_for(storage, relative)
+        cache_key = full
         if cache_key in cache:
             return cache[cache_key]
-        full = self.path_for(storage, relative)
 
         loaded: dict[str, dict | None] = {f: None for f in _TIER_ODM_NAMES}
         total_items = 0
@@ -1295,12 +1267,10 @@ class Context:
                 `create_properties`
                 (`properties/{nodes,edges}_<data_name>[_<properties_name>].csv`).
             properties_name: **suffix** appended to `data_name` for property
-                files. When None, the file is just
-                `properties/edges_<data_name>.csv`; otherwise it becomes
-                `properties/edges_<data_name>_<properties_name>.csv`. This
-                matches the suffix convention used by `get_nw`'s
-                `add_*_properties=`, so a `properties_name='core'` write pairs
-                cleanly with an `add_edge_properties='core'` read.
+                files (`properties/edges_<data_name>[_<properties_name>].csv`).
+                Matches `get_nw`'s `add_*_properties=`: a
+                `properties_name='core'` write pairs with an
+                `add_edge_properties='core'` read.
             properties_columns: optional column allowlist when `save_properties`
                 is set. Restricts the written CSV to these columns (applies to
                 nodes and/or edges, whichever side `save_properties` enables).
@@ -1371,21 +1341,19 @@ class Context:
         Args:
             add_node_properties: data_name (or list) for `get_properties('nodes', ...)`
                 on `self`, attached to the loaded graph as node attributes.
-                Short forms (`'core'`, `'land_use'`) are auto-prefixed with
-                `<data_name>_` so you don't have to repeat the network name;
-                fully-qualified names (`'nw_2020_core'`, or a bare `'nw_2020'`
-                for the property file written by `create_nw(save_properties=True)`)
-                are also accepted.
+                Names are suffixes, prefixed with `<data_name>_` (`'core'` →
+                `'<data_name>_core'`); `data_name` itself selects the base
+                property file written by `create_nw(save_properties=True)`.
             add_edge_properties: same, for edges.
         """
         storage = storage or self.default_storage
         nw_name = data_name or 'network'
         relative = f'nw/{nw_name}.graphml'
-        cache_key = (relative, storage)
+        full = self.path_for(storage, relative)
+        cache_key = full
         if allow_cache and cache_key in cache:
             nw = cache[cache_key]
         else:
-            full = self.path_for(storage, relative)
             ox = _require_osmnx()
             nw = ox.load_graphml(full)
             self.register_used_data(relative, storage, None)
@@ -1423,17 +1391,12 @@ class Context:
         verify_unique_index: bool = True,
         kws: dict | None = None,
     ) -> None:
-        """Write `payload` to `<typed_sub>/<relative_path>` based on the file
-        extension.
-
-        Dispatches on the file extension of `relative_path`:
+        """Write `payload` to `relative_path`, dispatching on its extension:
           .csv, .gpkg, .npy, .asc, .graphml, .json — via the obvious writer
-          .png/.pdf/.svg/.jpg — `payload` is a matplotlib Figure (saved via .savefig)
+          .png/.pdf/.svg/.jpg/.jpeg — `payload` is a matplotlib Figure (saved via .savefig)
 
-        In project namespaces, generic files live under a `generic/` typed-
-        subfolder so they don't collide with shapes/properties/odm conventions.
-        Preparation outputs are scenario-free and skip the segment. Results
-        files live under their own root and keep their relative path verbatim.
+        In project namespaces the file goes under a `generic/` subfolder
+        (see `_generic_relative_path`).
         """
         storage = storage or self.default_storage
         self._verify_writable(storage)
@@ -1487,18 +1450,19 @@ class Context:
         storage: Storage | None = None,
         allow_cache: bool = True,
         kws: dict | None = None,
-    ) -> any:
-        """Load a previously-saved generic file by extension. Inverse of
-        `create_generic`. See its docstring for the dispatch table and the
-        typed-subfolder rules.
+    ) -> Any:
+        """Load a file written by `create_generic`, dispatching on extension:
+        .csv (`index_col=0` unless `kws` says otherwise), .gpkg, .npy (a
+        pickled object, returned via `.item()`), .graphml, .json. `.asc` and
+        figures are write-only.
         """
         storage = storage or self.default_storage
         p = Path(relative_path)
         relative = self._generic_relative_path(storage, relative_path)
-        cache_key = (relative, storage)
+        full = self.path_for(storage, relative)
+        cache_key = full
         if cache_key in cache:
             return cache[cache_key]
-        full = self.path_for(storage, relative)
 
         n: int | None
         match p.suffix:
@@ -1537,7 +1501,7 @@ class Context:
         """
         self.create_generic(payload, relative_path, storage=Storage.RESULTS, kws=kws)
 
-    def get_results(self, relative_path: str, kws: dict | None = None) -> any:
+    def get_results(self, relative_path: str, kws: dict | None = None) -> Any:
         """Convenience for `get_generic(..., storage=Storage.RESULTS, ...)`."""
         return self.get_generic(
             relative_path, storage=Storage.RESULTS, allow_cache=True, kws=kws,
@@ -1579,8 +1543,6 @@ class Context:
             raise FileNotFoundError(
                 f"Coef {name!r} expected at {path} but not found. "
                 f"Source declaration: {source_repr}.")
-        # Header-row count: detect MultiIndex columns (calibrated bike's
-        # multi-level (profile, kind) layout) by sniffing the second row.
         df = _read_coefs_csv(path)
         self.register_used_data(rel, self.default_storage, n=len(df))
         return df
@@ -1599,9 +1561,9 @@ class Context:
           by the `coefs.resolve` dispatcher when copying from another
           scenario). Manual files are placed by hand, not via this method.
         - **Namespace context** (preparation) — `coefs/<name>.csv`
-          (no `<kind>/` subfolder). The `kind` argument is rejected for
-          namespace contexts: preparation has a single source ("computed
-          during this run"), no dispatcher choosing between options.
+          (no `<kind>/` subfolder). Only the default `kind` is accepted:
+          preparation has a single source ("computed during this run"),
+          no dispatcher choosing between options.
         """
         storage = self.default_storage
         self._verify_writable(storage)
@@ -1629,9 +1591,9 @@ def _read_coefs_csv(path: str) -> pd.DataFrame:
     """Load a coef CSV with auto-detected header layout.
 
     The standard layout is `param` index + one column per profile (single
-    header row). Bike's calibrated file uses a 2-row header to bundle
+    header row). `edge_weights_<mode>` files use a 2-row header to bundle
     `coef` / `p` per profile — detected by peeking at the second row's
-    first cell (non-numeric → 2-row header).
+    first value cell (non-numeric → 2-row header).
     """
     with open(path) as f:
         f.readline()  # header row 0
@@ -1763,10 +1725,6 @@ def init_context(
     logging.getLogger('pyogrio').setLevel(logging.WARNING)
     _install_level_counter()
 
-    # init_context always returns a writable context. Read-only contexts come only
-    # from `.source(...)`, which constructs Context() directly (not via init_context).
-    read_only = False
-
     if caller_base_name is None:
         caller_base_name = os.path.basename(inspect.stack()[1][1])
 
@@ -1788,16 +1746,13 @@ def init_context(
             parts = res.group(3).split('/')
             if parts[0] == 'preparation':
                 # preparation/<region>/<sub>/<file>.py → preparation/<region>/<sub>.
-                # `private`/`public` segments are **organizational** — they
-                # group scripts by data-visibility class but don't appear in
-                # the on-disk namespace, so consumers can keep using stable
-                # paths like `preparation/switzerland/historic` regardless of
-                # where the producing script physically lives.
+                # `private`/`public` segments are organizational: dropped from
+                # the namespace, so consumers use stable paths like
+                # `preparation/switzerland/surveys` wherever the script lives.
                 #
-                # STORAGE is read directly from the caller's __init__.py at
-                # its physical location (private/public preserved) and
-                # stashed as `default_storage_override` so the running script's
-                # writes go to the right root — no reverse lookup needed.
+                # STORAGE is read from the caller's own package (private/public
+                # preserved) and set as `default_storage_override`, so the
+                # script's writes go to the right root.
                 caller_storage = _read_storage_from_module('.'.join(parts))
                 parts = [p for p in parts if p not in ('private', 'public')]
                 namespace = '/'.join(parts)
@@ -1813,9 +1768,9 @@ def init_context(
                         f"`namespace=...` explicitly.")
                 if project_name == 'preparation':
                     raise ContextError(
-                        f"`PROJECT_NAME = 'preparation'` is reserved (clashes with "
-                        f"the shared preparation namespace). Pick a different name "
-                        f"in src/scenarios.py.")
+                        "`PROJECT_NAME = 'preparation'` is reserved (clashes with "
+                        "the shared preparation namespace). Pick a different name "
+                        "in src/scenarios.py.")
                 namespace = f'{project_name}/{parts[0]}'
     assert namespace is not None
 
@@ -1877,7 +1832,8 @@ def init_context(
                                   env_values.get('DATA_DIR_PRIVATE_MACHINE2'),
                                   env_values.get('OS_NAME_MACHINE2')),
         working_dir=working_dir,
-        read_only=read_only,
+        # Always writable here; read-only contexts come only from `.source(...)`.
+        read_only=False,
         track_dependencies=_parse_bool_env('APERTA_TRACK_DEPENDENCIES'),
         start_time=time.perf_counter(),
         env=env_values,
@@ -1885,8 +1841,7 @@ def init_context(
         used_data=set(),
         default_storage_override=caller_storage,
     )
-    if not read_only:
-        tracking.log_context_info(context)
+    tracking.log_context_info(context)
     return context
 
 

@@ -7,30 +7,42 @@ virtual nodes at cell centroids → snap cells + zones to nearest
 network nodes → persist. The lighter `02b_networks_features.py` can
 then iterate on features without re-running snap.
 
-Per invocation writes one per-mode snap CSV. The merged
+Each invocation writes per-mode snap CSVs. The merged
 `cells_snap.csv` / `zones_snap.csv` (with `is_active`) is assembled
 later by `02c_active_flags.py`.
 
 Zone centroids:
-  - NPVM path (Swiss): population-weighted centroids from BFS;
+  - NPVM path (Swiss): NPVM's weighted centroids for Swiss zones;
     foreign zones' placeholders replaced with `transport_centroid`
     on the car network.
   - H3 path (non-Swiss): `transport_centroid` for every zone (car
     network — densest, most representative routable centre).
 
-Outputs (under <scenario>/, PUBLIC):
+Inputs:
+    shapes/{cells,zones}.gpkg                          # from 01
+    preparation/world/osm/nw/<area>_<mode>_consolidated.graphml
+        + properties/{nodes,edges}_<area>_<mode>_consolidated[_decorated].csv
+        # car from preparation/switzerland/tlmregio/ if car_network_source='tlmregio'
+    preparation/switzerland/general/traffic_zones_centroids.gpkg   # NPVM zones only
+
+Outputs (scenario storage, under <scenario>/):
     nw/<mode>.graphml                  # network (with cell virtuals)
+    properties/{nodes,edges}_<mode>_core.csv   # OSM tags + decorated attrs
     shapes/nodes_<mode>.gpkg           # post-insertion node geometries
     shapes/edges_<mode>.gpkg           # post-insertion edge geometries
     shapes/zones_centroids.gpkg        # custom-for-CH, transport-for-foreign
-    properties/cells_<mode>_snap.csv   # node_id + distance (raw)
-    properties/zones_<mode>_snap.csv   # same for zones
+    properties/cells_snap_<mode>.csv   # node_id + distance (raw)
+    properties/zones_snap_<mode>.csv   # same for zones
+
+Run all variants (walk / bike / car) sequentially (default):
+    python -m main.02a_networks_snap --scenario <name>
+Single mode:
+    python -m main.02a_networks_snap --scenario <name> --variant car
 """
 
 import logging
 
 import geopandas as gpd
-import numpy as np  # noqa: F401  (used implicitly by aperta helpers)
 import osmnx as ox
 import pandas as pd
 
@@ -42,7 +54,7 @@ from aperta_atlas.variant import Variants
 from scenarios import get_scenario
 
 
-# Modes to process. For the Swiss case these match `case.buffers.keys()`.
+# Modes to process; main() skips any mode not in `scenario.mode_configs`.
 variants = Variants([('mode', str)])
 for _m in ('walk', 'bike', 'car'):
     variants.add(name=_m, mode=_m)
@@ -52,47 +64,50 @@ for _m in ('walk', 'bike', 'car'):
 # radii than dense urban).
 #
 # All atlas graphs are directed (one-way streets + elevation gradients
-# need direction). compute_snap_eligibility + compute_snap_eligible_nodes
-# are called with this setting → snap eligibility = largest STRONGLY
-# connected component (no traps).
+# need direction) → snap eligibility = largest STRONGLY connected
+# component (no traps).
 _DIRECTEDNESS = 'directed_scc'
-# No tag-based cost exclusions on top of what the PBF extraction already
-# filters per-mode (walk doesn't get motorways, etc.) — the user's
-# constraint is "finite cost + connected to the rest of the network",
-# both of which the SCC computation handles directly.
+# No tag-based cost exclusions on top of the PBF extraction's per-mode
+# filter (walk doesn't get motorways, etc.). The remaining requirement,
+# "finite cost + connected to the rest of the network", is what the SCC
+# computation checks.
 _COST_EXCLUDED_TAGS: frozenset[str] = frozenset()
-# Network-type label per mode — accurate for our pipeline (PBF extraction
-# already mode-filters the graphs). Reported to aperta's `compute_snap_eligibility`
-# so its warning policies have the correct context.
+# Network-type label per mode (the PBF extraction already mode-filters the
+# graphs). Passed to `compute_snap_eligibility` for its warning policies.
 _NETWORK_TYPE_BY_MODE: dict[str, str] = {
     'walk': 'walk', 'bike': 'bike', 'car': 'drive',
 }
 
 # Per-node intersection-type flags that mark "priority-for-zone-snap"
-# nodes. ANY of these → priority. They're written by networks_decorate.py.
+# nodes. ANY of these → priority. Written by networks_decorate.py (OSM)
+# or tlmregio/car_network.py.
 _PRIORITY_NODE_FLAGS = (
     'is_t_junction_anchor', 'is_4way_anchor',
     'is_t_junction_major',  'is_4way_major',
 )
 
 
-def _load_mode_graph(osm_ctx, area_name: str, mode: str, to_crs: str):
-    """Load `<area>_<mode>_consolidated` and reproject to `to_crs`.
+# Preparation namespace of each car network source (walk / bike: always OSM).
+_CAR_NETWORK_NAMESPACES = {'osm': 'preparation/world/osm',
+                           'tlmregio': 'preparation/switzerland/tlmregio'}
 
-    Centralised loader so the projection step can't be forgotten at one
-    call site and not another. Consolidated graphs ship in WGS84 (per
-    `networks_consolidate.py`); everything downstream (insert / snap /
-    sum_within_radius / transport_centroid) wants metric coordinates.
+
+def _load_mode_graph(context, scenario, mode: str):
+    """Load `<area>_<mode>_consolidated` from the mode's network source and
+    reproject it from WGS84 to `scenario.crs_main`: insertion, snap and
+    `transport_centroid` need metric coordinates.
     """
-    name = f'{area_name}_{mode}_consolidated'
+    namespace = (_CAR_NETWORK_NAMESPACES[scenario.car_network_source] if mode == 'car'
+                 else _CAR_NETWORK_NAMESPACES['osm'])
+    name = f'{scenario.area_name}_{mode}_consolidated'
     return ox.project_graph(
-        osm_ctx.get_nw(
+        context.source(namespace).get_nw(
             name,
             add_node_properties='decorated',
             add_edge_properties=[name, 'decorated'],
             allow_cache=False,
         ),
-        to_crs=to_crs,
+        to_crs=scenario.crs_main,
     )
 
 
@@ -100,18 +115,21 @@ def main(variant) -> None:
     context = init_context(variant)
     mode = variant.mode
     scenario = get_scenario(context.scenario)
+    if mode not in scenario.mode_configs:
+        logging.info(f"mode={mode!r} not in scenario mode_configs "
+                     f"({list(scenario.mode_configs)}); skipping")
+        context.close()
+        return
     crs_main = scenario.crs_main
 
-    # ---------- Load cells + zones once (reused per mode) ----------------
+    # ---------- Load cells + zones ----------------------------------------
     cells = context.get_shapes('cells').to_crs(crs_main)
     logging.info(f"  → {len(cells):,} cells loaded")
     zones = context.get_shapes('zones').to_crs(crs_main)
     logging.info(f"  → {len(zones):,} zones loaded")
 
-    # Pre-compute cell centroids (reused per mode for insertion + snap).
+    # Cell centroids, used for both virtual-node insertion and snap.
     cell_centroids = gpd.GeoDataFrame(geometry=cells.geometry.centroid)
-
-    osm_ctx = context.source('preparation/world/osm')
 
     # Zone centroids — see module docstring. Both paths produce
     # `shapes/zones_centroids.gpkg` with schema (geometry, is_in_ch).
@@ -123,13 +141,13 @@ def main(variant) -> None:
                 .set_index('zone_id')
                 .to_crs(crs_main)
                 .loc[zones.index])  # restrict to atlas-kept zones (01's filter)
-            # Carry `is_in_ch` from zones (cells.gpkg) so the swap below
+            # Carry `is_in_ch` from zones (01's flag) so the swap below
             # + downstream consumers can rely on a single canonical flag.
             zone_centroids['is_in_ch'] = zones['is_in_ch'].astype(bool)
 
         with step('replace foreign-zone centroids with transport_centroid (car network)'):
-            # Pre-loop, no virtuals inserted → car graph is pristine here.
-            car_graph = _load_mode_graph(osm_ctx, scenario.area_name, 'car', crs_main)
+            # Freshly loaded car graph, without cell virtual nodes.
+            car_graph = _load_mode_graph(context, scenario, 'car')
             # Restrict the centroid basis to the car SCC — isolated islands
             # would otherwise pull the median toward an unreachable node.
             car_snap_eligible, _ = routing_prep.compute_snap_eligibility(
@@ -147,8 +165,8 @@ def main(variant) -> None:
             zone_centroids.loc[foreign_idx, 'geometry'] = transport_foreign.geometry
             logging.info(f"  → {len(foreign_idx):,} foreign zones updated")
     else:
-        with step(f'compute transport_centroid for all H3 zones (car-network node median)'):
-            car_graph = _load_mode_graph(osm_ctx, scenario.area_name, 'car', crs_main)
+        with step('compute transport_centroid for all H3 zones (car-network node median)'):
+            car_graph = _load_mode_graph(context, scenario, 'car')
             car_snap_eligible, _ = routing_prep.compute_snap_eligibility(
                 car_graph, 'car',
                 directedness=_DIRECTEDNESS,
@@ -168,7 +186,7 @@ def main(variant) -> None:
                 f"{int((~zone_centroids['is_in_ch']).sum()):,} buffer)")
 
     context.create_shapes(zone_centroids[['is_in_ch', 'geometry']], data_name='centroids')
-    graph = _load_mode_graph(osm_ctx, scenario.area_name, mode, crs_main)
+    graph = _load_mode_graph(context, scenario, mode)
 
     with step(f'mode={mode}: compute snap eligibility (largest SCC)'):
         # Pre-insertion: writes cost_excluded_<mode> per edge; returns
@@ -199,11 +217,10 @@ def main(variant) -> None:
             f"  → inserted {graph.number_of_nodes() - n_before:,} virtual nodes")
 
     with step(f'mode={mode}: recompute SCC eligibility (post-insertion)'):
-        # Pure compute, no graph mutation. Picks up the per-edge
-        # cost-mask flag that was written in the pre-insertion
-        # compute_snap_eligibility above (child edges from insertion
-        # inherited the parent's flag value). The post-insertion SCC
-        # = pre-insertion SCC plus the inserted virtuals.
+        # No graph mutation. Reads the per-edge cost-mask flag written by
+        # the pre-insertion compute_snap_eligibility (edges split by the
+        # insertion inherit their parent's value). Post-insertion SCC =
+        # pre-insertion SCC plus the inserted virtuals.
         snap_eligible = routing_prep.compute_snap_eligible_nodes(
             graph, directedness=_DIRECTEDNESS,
             cost_excluded_flag=cost_excluded_flag,
@@ -217,8 +234,8 @@ def main(variant) -> None:
         # Anchor and/or major (4-way or T-junction) intersections —
         # the nodes a router would treat as "real" decision points.
         # Passed via priority_node_ids= below, no graph mutation. The
-        # 500 m radius cap is enforced by snap_to_network_nodes via
-        # `priority_node_max_distance`, not by pre-filtering here.
+        # radius cap (`scenario.snap.zone_priority_radius_m`) is applied
+        # by snap_to_network_nodes, not by pre-filtering here.
         priority_nodes = frozenset(
             n for n, data in graph.nodes(data=True)
             if any(data.get(f, 0) for f in _PRIORITY_NODE_FLAGS)
@@ -244,9 +261,8 @@ def main(variant) -> None:
             priority_node_ids=priority_nodes,
             priority_node_max_distance=scenario.snap.zone_priority_radius_m,
         )
-        # Self-contained per-mode output (one variant invocation = one
-        # file pair). The merged shape with per-mode columns + the active
-        # flag is built later by `02c_active_flags.py`.
+        # Per-mode output; `02c_active_flags.py` merges the modes and adds
+        # `is_active`.
         cell_snap = pd.DataFrame(
             {'node_id': cell_node_ids, 'distance': cell_dists},
             index=cells.index,

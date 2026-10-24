@@ -2,10 +2,10 @@
 Estimate per-edge AADT (annual average daily traffic) on the car network.
 
 Pipeline: initial duration priors on edges → tiered OD pairs → shortest-
-path costs → sample origins (pop-weighted from 03a's calibrated
-`node_trip_weights_car`) + destinations (employment-weighted with
-bin-adjusted cost weights from 03a's `flow_cost_bins_car`) → edge
-betweenness → scale to AADT.
+path costs → sample origins + destinations, both weighted by 03a's
+calibrated `node_trip_weights_car` (destinations reweighted per cost
+bin to match 03a's `flow_cost_bins_car`) → edge betweenness → scale
+to AADT.
 
 Simplifications: single deterministic shortest path per OD pair, no
 capacity-based slowdown. Net effect: over-predicts highways / main
@@ -14,13 +14,19 @@ roads, under-predicts parallel local routes. Acceptable for a relative
 scale downstream.
 
 Inputs:
-    coefs/calibrated/{node_trip_weights_car,flow_cost_bins_car}.csv  # from 03a
-    properties/cells_*.csv + properties/nodes_car_extended.csv
+    coefs/<kind>/{node_trip_weights_car,flow_cost_bins_car}.csv  # from 03a
+    nw/car.graphml + properties/{nodes_car_core,edges_car_{core,from_nodes}}.csv
+    properties/cells_{population,employment,snap}.csv + shapes/cells.gpkg
+    properties/zones_{population,snap}.csv + shapes/zones.gpkg
+    properties/nodes_car_extended.csv
 
-Outputs (under <scenario>/, PUBLIC):
-    properties/edges_car_flows.csv       # flow_estimate + vc + vc_beta_*
+Outputs (scenario storage, under <scenario>/):
+    properties/edges_car_flows.csv       # flow_estimate + capacity + vc + vc_beta_*
     properties/nodes_car_flows_avg.csv   # per-node r{250,500} neighborhood avgs
                                          # of traffic_flow + vc_beta_2.0
+
+Run:
+    python -m main.03b_traffic_flows --scenario <name>
 """
 
 import logging
@@ -31,32 +37,31 @@ import pandas as pd
 from scipy.spatial import KDTree
 
 from aperta import network_processing, od_pairs, routing, traffic_flows
-from aperta_atlas.context import init_context, Storage, _edge_id
+from aperta_atlas.context import init_context, _edge_id
 from aperta_atlas.osm import OSM_HIGHWAY_RANKS
 from aperta_atlas.utils import step
 
 from scenarios import get_scenario
 
 
-# Aggregation radii (meters) for the per-node traffic_flow feature.
-# Same 250 / 500 pattern as 02b's bike_infra_score + speed_limit.
+# Aggregation radii (meters) for the per-node traffic_flow / vc_beta features.
 _RADII_NEIGHBORHOOD = (250, 500)
 
 # Per-pair routing cutoff (seconds). Tier radii come from
 # `scenario.mode_configs['car'].radii`.
-_CAR_TIME_CUTOFF_S = 5400
+_CAR_TIME_CUTOFF_S = 3600
 
 # Initial edge-duration prior coefficients
 _BASELINE_DURATION = 1.2
-_INITIAL_MULT = {'density_r1000_norm': 0.15}
+_INITIAL_MULT = {'density_r1000_norm': 0.25}
 _INITIAL_ADD = {'is_4way': 15.0, 'is_traffic_signal': 15.0}
 
 # Trip-generation weights + cost-bin edges are calibrated in 03a and
 # loaded via `context.get_coefs(...)`.
 
 # Sampling. TODO: make configurable / fraction of population count.
-_N_ORIG = 50_000
-_N_DEST = 200
+_N_ORIG = 100_000
+_N_DEST = 100
 _RNG_SEED = 42
 
 # MTMC average. TODO: derive from data in 03a.
@@ -77,8 +82,8 @@ _CAP_PER_LANE_LOCAL   =  10_000.0   # residential, unclassified, ...
 _TIER_HIGHWAY_MIN_RANK = 6
 _TIER_MAIN_MIN_RANK    = 3
 
-# BPR exponent. Textbook β=4 (US Highway Capacity Manual). β=2 was found
-# to fit Swiss data better in the older extended-notebook calibration.
+# BPR exponents. Textbook β=4 (US Highway Capacity Manual); β=2 fit Swiss
+# data better in an earlier calibration and is the one 04 and 09a use.
 _VC_BETA = [2.0, 4.0]
 
 
@@ -239,27 +244,23 @@ def main():
         dest_weights = od_pairs.lookup_dest_column_node('node_weight', pairs, cells, 'node_id', zones=zones)
         cell_to_zone_node = od_pairs.build_cell_to_zone_node_map(cells, zones, node_column='node_id')
 
-    with step('bin-adjusted dest weights (`flow_cost_bins_car` from 03a)'):
-        # Per-bin reweighting so the sampled trip-cost distribution
-        # matches the target P(C) baked into the coef.
+    with step('load cost bins (`flow_cost_bins_car` from 03a)'):
+        # Per-bin reweighting (inside nested_node_sample) so the sampled
+        # trip-cost distribution matches the target P(C) baked into the coef.
         bin_edges = context.get_coefs('flow_cost_bins_car')['car'].to_numpy()
         logging.info(f"  → loaded {len(bin_edges)} bin edges (s)")
-        adjusted_dest_weights = traffic_flows.bin_adjusted_dest_weights(
-            pairs, costs, dest_weights, bin_edges,
-        )
 
     # ---------- Sample destinations + accumulate flows --------------------
     with step(f'sample destinations per origin ({_N_DEST} per origin-pick, {_N_ORIG:,} picks total)'):
         # Pass the pre-sampled `chosen` array so nested_node_sample
-        # skips its own origin draw. With bin-adjusted weights,
-        # `cost_to_weight` is the identity.
+        # skips its own origin draw.
         nested_sample = traffic_flows.nested_node_sample(
             pairs=pairs,
-            weights=adjusted_dest_weights,
+            weights=dest_weights,
             costs=costs,
             cell_to_zone_node=cell_to_zone_node,
             orig_weights=None,            # using `chosen` instead
-            cost_to_weight=np.ones_like,
+            bin_edges=bin_edges,
             n_orig=_N_ORIG,
             n_dest=_N_DEST,
             random_state=rng,

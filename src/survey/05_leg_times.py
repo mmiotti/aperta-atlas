@@ -11,28 +11,30 @@ every mode (09a needs every alternative); the validation-only MOBIS sets
 are routed only on each leg's chosen mode.
 
 Uses `aperta_atlas.routing_mp.shortest_path_metrics_one_to_one_mp` —
-fork-multiprocessing wrapper around nx bidirectional Dijkstra (chosen
-over igraph: ~6× faster on unique-source per-trip queries at country
-scale). Most memory-intensive script in the pipeline; the lean graph
-is shared across workers via fork-COW.
+fork-multiprocessing wrapper around networkx bidirectional Dijkstra
+(suited to per-trip queries with unique origins). Most memory-intensive
+script in the pipeline; the lean graph is shared across workers via
+fork-COW.
 
 Inputs (PRIVATE, under `<scenario>/`):
     generic/survey_legs[_<leg_set>].csv                  # from survey/02d
 
-Inputs (PUBLIC, under `<scenario>/`):
+Inputs (scenario storage, under `<scenario>/`):
     nw/<mode>.graphml
-    properties/edges_<mode>_core.csv
     properties/edges_<mode>_calibrated.csv               # from 04
-    properties/edges_<mode>_extended.csv                 # from 02b — delta_elevation
+    properties/edges_<mode>_extended.csv                 # from 02b — elevation_{gain,loss}
     properties/edges_<mode>_from_nodes.csv               # from 02b — density, bike_infra_score, etc.
+    properties/edges_car_flows.csv                       # from 03b — vc_beta_2.0 (car only)
+    preparation/switzerland/npvm/odm/npvm_2023_transit_{idx,travel_time}.npz  # transit only
 
 Output (PRIVATE, under `<scenario>/`):
     generic/survey_leg_times[_<leg_set>].csv
                                  # per road profile <p>: t_routed_<p>, length_<p>,
                                  # elev_gain_<p>, elev_loss_<p>, density_r500_norm_<p>,
                                  # mean_abs_slope_r250_<p>, n_traffic_signals_<p>;
-                                 # bike-mode extras: bike_infra_score_avg_r{250,500}_<p>;
-                                 # car-mode extras: speed_limit_avg_r{250,500}_<p>, vc_beta_2.0_<p>;
+                                 # bike-mode extras: bike_infra_score_avg_r250_<p>;
+                                 # car-mode extras: speed_limit_avg_r250_<p>, vc_beta_2.0_<p>;
+                                 # t_routed_car: car profiles picked by peak_str;
                                  # naive-baseline routing (04's
                                  # `duration_baseline_<p>` weights):
                                  # t_baseline_<p>, length_baseline_<p>
@@ -89,8 +91,7 @@ _DIST_LINE_MAX: dict[str, float | None] = {
 # cumulative total; `'length_weighted'` = mean weighted by per-edge
 # `length`. Per-profile columns land in `survey_leg_times.csv` as
 # `<attr>_<profile>` (except `is_traffic_signal` → `n_traffic_signals_<profile>`).
-# ⚠ Mirror kept in `main.common._ROUTE_EDGE_FEATURES_*` (used by
-# `build_disutility_spec`'s route classifier) — keep them in sync.
+# 09a's `_ROUTE_FEATURE_DEFAULTS` reads these columns by name.
 _PATH_EDGE_FEATURES_UNIVERSAL: dict[str, str] = {
     'length':              'sum',              # metres — routed distance
     'elev_gain':           'sum',              # metres of climb
@@ -129,7 +130,7 @@ def _path_edge_features_for(mode: str) -> dict[str, str]:
 
 
 def _routable_mask(legs: pd.DataFrame, mode: str) -> pd.Series:
-    """True where the trip's `dist_line` is within the mode's cap. 05a's
+    """True where the trip's `dist_line` is within the mode's cap. 02d's
     completeness filter guarantees every leg has snapped to every mode,
     so no snap-presence check is needed here."""
     cap = _DIST_LINE_MAX[mode]
@@ -174,8 +175,8 @@ def main(variant):
         edges_data_name = sources[0].edges_data_name
 
         with step(f'mode={mode_config.mode}: load graph skeleton'):
-            # Attach weight columns below (post-lean); keeps worker
-            # inherited memory minimal via fork-COW.
+            # Bare graph: weights + path features are attached below, then
+            # it is reduced to a lean copy for the fork-COW workers.
             graph = context.get_nw(data_name=mode_config.mode, allow_cache=False)
             logging.info(f"  → graph {graph.number_of_nodes():,} nodes, {graph.number_of_edges():,} edges")
 
@@ -231,9 +232,8 @@ def main(variant):
                 f"loss = {elev_loss.median():.2f} m per edge")
 
         with step(f'mode={mode_config.mode}: attach weights + lean graph'):
-            # Baseline weights only attached if the columns are present
-            # in the calibrated CSV (older 04 outputs won't have them —
-            # in that case the naive-routing comparison is skipped).
+            # Baseline weights are optional; without them the naive-routing
+            # comparison is skipped.
             baseline_available = [c for c in baseline_cols
                                   if c in calibrated.columns]
             weights_to_attach = list(weight_cols) + baseline_available
@@ -245,12 +245,8 @@ def main(variant):
             lean = routing_mp.lean_graph(graph, lean_attrs)
             logging.info(f"  → lean graph kept {lean.number_of_edges():,} edges with attrs {lean_attrs}")
 
-        # Pre-fork cleanup: everything above is now baked into `lean`
-        # (edge attrs copied in; routing needs only `lean`). Freeing
-        # the raw property frames + full-fat graph BEFORE
-        # `shortest_path_metrics_one_to_one_mp` forks workers means
-        # each of the 6 fork-COW children starts with a smaller
-        # inherited page set. Effect scales linearly with n_workers.
+        # Routing needs only `lean`: free the property frames + full graph
+        # before the workers fork, so each inherits a smaller page set.
         del graph, calibrated, extended
         del elev_gain, elev_loss, feature_sources
 
@@ -260,8 +256,8 @@ def main(variant):
         orig_col = f'orig_node_id_{mode_config.mode}'
         dest_col = f'dest_node_id_{mode_config.mode}'
         routable = legs.loc[mask, [orig_col, dest_col]].copy()
-        # Snap columns round-trip through CSV as float (NaN-friendly). Cast
-        # back to the graph's int node-id type after dropping NaNs above.
+        # Snap columns round-trip through CSV as float; cast back to the
+        # graph's int node ids (02d dropped legs with NaN snaps).
         routable[orig_col] = routable[orig_col].astype(int)
         routable[dest_col] = routable[dest_col].astype(int)
         logging.info(
@@ -274,9 +270,8 @@ def main(variant):
 
         for src in sources:
             with step(f'profile={src.name}: route {len(routable):,} legs (mp, metrics)', 1):
-                # Metrics variant: aggregates `path_features` along each
-                # routed path. Add entries to the module-top dicts to
-                # collect more features without touching this call site.
+                # Aggregates `path_features` (module-top dicts) along each
+                # routed path.
                 metrics = routing_mp.shortest_path_metrics_one_to_one_mp(
                     lean,
                     trip_ids=routable.index.values,
@@ -382,21 +377,24 @@ def main(variant):
                 default=np.nan,
             )
 
-    with step('transit: NPVM z2z lookup per leg → t_routed_transit_z2z'):
-        # Aperta has no native transit router — "routing" here is a
-        # zone-to-zone lookup into NPVM's PT travel-time matrix keyed on
-        # (orig_zone_id, dest_zone_id). Legs whose zone-pair is missing
-        # from NPVM get NaN.
-        lookup = npvm_transit_z2z_lookup(context)
-        keys = list(zip(legs['orig_zone_id'], legs['dest_zone_id']))
-        out['t_routed_transit_z2z'] = pd.Series(
-            [lookup.get(k, float('nan')) for k in keys], index=legs.index)
-        n_with = int(out['t_routed_transit_z2z'].notna().sum())
-        logging.info(
-            f"  → {n_with:,}/{len(legs):,} legs with NPVM z2z entry "
-            f"({100*n_with/max(len(legs),1):.1f} %); "
-            f"median t_routed_transit_z2z = "
-            f"{out['t_routed_transit_z2z'].median():.1f} s")
+    if scenario.transit_source is None:
+        logging.info('no transit in this scenario; skipping the NPVM lookup')
+    else:
+        with step('transit: NPVM z2z lookup per leg → t_routed_transit_z2z'):
+            # Aperta has no native transit router — "routing" here is a
+            # zone-to-zone lookup into NPVM's PT travel-time matrix keyed on
+            # (orig_zone_id, dest_zone_id). Legs whose zone-pair is missing
+            # from NPVM get NaN.
+            lookup = npvm_transit_z2z_lookup(context)
+            keys = list(zip(legs['orig_zone_id'], legs['dest_zone_id']))
+            out['t_routed_transit_z2z'] = pd.Series(
+                [lookup.get(k, float('nan')) for k in keys], index=legs.index)
+            n_with = int(out['t_routed_transit_z2z'].notna().sum())
+            logging.info(
+                f"  → {n_with:,}/{len(legs):,} legs with NPVM z2z entry "
+                f"({100*n_with/max(len(legs),1):.1f} %); "
+                f"median t_routed_transit_z2z = "
+                f"{out['t_routed_transit_z2z'].median():.1f} s")
 
     context.create_generic(out, survey_file('survey_leg_times.csv', leg_set),
                            storage=Storage.PRIVATE, kws={'float_format': '%.3f'})

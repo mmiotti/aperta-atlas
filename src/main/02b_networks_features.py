@@ -10,35 +10,48 @@ without paying the snap cost.
 Per mode (walk, bike, car):
   - Load saved graph (already in scenario.crs_main, with cell virtuals + decorated
     attrs preserved). Extract nodes/edges GDFs.
-  - Per-edge: bike_infra_score (0/1/2, configurable callback),
-    delta_elevation, slope.
-  - Per-node: elevation (DEM raster), per-node pop+emp (via cell→node
-    snap from 02a), density (combined at 500 + 1000 m), mean |slope|
-    ("hilliness"; 500 + 1000 m), decorated intersection flags (passed
-    through for edge aggregation).
-  - Per-mode neighborhood aggregations (r250, r500):
+  - Per-edge: bike_infra_score (0 / 0.5 / 1 / 1.5, `edge_bike_infra_score`),
+    elevation delta / gain / loss, slope (+ uphill / downhill), FIETS
+    uphill index, is_bridge_or_tunnel. Elevation features are scaled
+    down on bridge / tunnel edges.
+  - Per-node: elevation (DEM raster, smoothed over the graph), per-node
+    pop+emp (via cell→node snap from 02a), density at `_RADII_DENSITY`
+    (+ sqrt-normalised `_norm`), mean |slope| ("hilliness") at
+    `_RADII_NEIGHBORHOOD`, decorated intersection flags (passed through
+    for edge aggregation).
+  - Per-mode neighborhood aggregations at `_RADII_NEIGHBORHOOD`:
       * bike_infra_score_avg — on every mode's own edges.
       * speed_limit_avg — on every mode's own edges, FILTERED to
         car-shared road classes (walk / bike graphs also include
         pedestrian-only ways whose OSMnx-filled `speed_kph` is a
         meaningless fallback; excluded via `_car_road_mask`).
-    09a's utility model still picks the source graph per feature.
+    `main/utility_config.py` picks the source graph per feature.
   - Map node features onto edges (mean of endpoints).
 
 The bike-infra-score callback is module-level (`edge_bike_infra_score`)
 so it can be swapped without touching the rest of the pipeline.
 
-Outputs (under <scenario>/, PUBLIC):
+Inputs:
+    nw/<mode>.graphml + properties/{nodes,edges}_<mode>_core.csv   # from 02a
+    properties/cells_snap_<mode>.csv                              # from 02a
+    properties/cells_population.csv                               # from 01 (combined_total)
+    preparation/world/elevation/dem_<area>.tif
+
+Outputs (scenario storage, under <scenario>/):
     properties/nodes_<mode>_extended.csv    # per-node features
-    properties/edges_<mode>_extended.csv    # bike_infra_score, delta_elev, slope, …
+    properties/edges_<mode>_extended.csv    # bike_infra_score, elevation_*, slope_*, …
     properties/edges_<mode>_from_nodes.csv  # node-derived edge features
+
+Run all variants (walk / bike / car) sequentially (default):
+    python -m main.02b_networks_features --scenario <name>
+Single mode:
+    python -m main.02b_networks_features --scenario <name> --variant car
 """
 
 import logging
 import os
-import re
 
-import geopandas as gpd  # noqa: F401  (used implicitly downstream)
+import geopandas as gpd
 import networkx as nx
 import numpy as np
 import osmnx as ox
@@ -48,7 +61,6 @@ from scipy.spatial import KDTree
 
 from aperta import geo_processing, network_processing
 from aperta_atlas.context import init_context, Storage, _edge_id
-from aperta_atlas.osm import OSM_HIGHWAY_RANKS
 from aperta_atlas.variant import Variants
 from aperta_atlas.utils import step
 
@@ -60,23 +72,29 @@ variants = Variants([('mode', str)])
 for _m in ('walk', 'bike', 'car'):
     variants.add(name=_m, mode=_m)
 
-# Density aggregation radii (meters). Density is used as a predictor/proxy in 
+# Density aggregation radii (meters). Density is used as a predictor/proxy in
 # several contexts.
 _RADII_DENSITY = (250, 500, 1000)
 # Neighborhood-metric radii (meters) for the utility-model endpoint
 # features (bike_infra_score, speed_limit, mean_abs_slope).
 _RADII_NEIGHBORHOOD = (100, 250)
 
-# `_SMOOTH_ELEV_SCALE` is the Gaussian 1-σ in metres: elevation assigned to
-# nodes get smoothened at this radius
+# Gaussian 1-σ (metres) for smoothing node elevations over the graph.
 _SMOOTH_ELEV_SCALE = 25.0
+
+
+# Cycleway values that mean "no bike infrastructure on THIS edge's carriageway". `separate` and
+# `use_sidepath` say the bike way is mapped as its own way (scored there, not on the road).
+# They are skipped like `no`, so a real lane tagged on the other side is still found.
+_NO_INFRA_ON_EDGE = ('no', 'none', 'separate', 'use_sidepath')
 
 
 def _parse_cycleway(value_list) -> str:
     for value in value_list:
         if isinstance(value, list):
             value = value[0] if value else None
-        if value and value != 'no' and (isinstance(value, str) or ~np.isnan(value)):
+        if (value and value not in _NO_INFRA_ON_EDGE
+                and (isinstance(value, str) or ~np.isnan(value))):
             return str(value)
     return ''
 
@@ -91,13 +109,14 @@ def edge_bike_infra_score(u, v, data) -> float:
 
     Scale {0, 0.5, 1, 1.5}:
       - 1.5: dedicated separated bike way (`highway=cycleway`,
-        `bicycle=designated`, `cycleway=track|separate|…`). Capped
+        `bicycle=designated`, `cycleway=track|segregated|…`). Capped
         below the natural 2.0 to keep radius-averages inside the
         linear utility fit's data-rich range.
       - 1.0: proper on-road bike lane (`cycleway=lane|lanes|…`,
         `cyclestreet=yes`).
       - 0.5: shared markings (`cycleway=shared_lane|pictogram|…`).
-      - 0.0: no infra (or footway/pedestrian/path — informal only).
+      - 0.0: no infra (or footway/pedestrian/path — informal only). A road tagged
+        `cycleway*=separate|use_sidepath` scores 0 here: its bike way is a separate edge.
 
     Inputs come from post-consolidation edge attrs. PathAggregation-
     compatible signature.
@@ -112,7 +131,7 @@ def edge_bike_infra_score(u, v, data) -> float:
           data.get('cycleway:left'), data.get('cycleway:right')]
     cw = _parse_cycleway(cw)
 
-    if cw in ('track', 'separate', 'designated', 'segregated'):
+    if cw in ('track', 'designated', 'segregated'):
         return 1.5
     if cw in ('lane', 'lanes', 'share_sidewalk', 'share_busway', 'right',
               'yes', 'y', 'opposite_track', '|lane|', 'line', 'crossing',
@@ -121,7 +140,7 @@ def edge_bike_infra_score(u, v, data) -> float:
     if cw in ('shared_lane', 'shared', 'soft_lane', 'shoulder',
               'opposite', 'opposite_lane', 'opposite_share_busway',
               'pictogram', 'opposite_bike_lane', 'link', 'road',
-              'use_sidepath', 'left'):
+              'left'):
         return 0.5
     # Cyclestreets (roads designated as priority for bikes) — 1.
     if data.get('cyclestreet') in ('yes', True, 'true', '1', 1):
@@ -220,9 +239,14 @@ def main(variant) -> None:
     context = init_context(variant)
     mode = variant.mode
     scenario = get_scenario(context.scenario)
+    if mode not in scenario.mode_configs:
+        logging.info(f"mode={mode!r} not in scenario mode_configs "
+                     f"({list(scenario.mode_configs)}); skipping")
+        context.close()
+        return
 
     # ---------- Load cells (with pop+emp totals) -------------------------
-    cells = context.get_properties('cells', 'employment', add_shapes=True)
+    cells = context.get_properties('cells', 'population')
     logging.info(f"  → {len(cells):,} cells loaded")
 
     # ---------- DEM raster path (per-mode-shared) ------------------------
@@ -267,16 +291,13 @@ def main(variant) -> None:
         # (no bike infra); increasing tiers get rarer.
         counts = bike_infra_score.value_counts(normalize=True).sort_index()
         logging.info(
-            f"  → bike_infra_score: "
+            "  → bike_infra_score: "
             + ', '.join(f'{v:g}={p*100:.1f}%' for v, p in counts.items()))
 
     # ---------- Per-node features -------------------------------------
     with step(f'mode={mode}: sample elevation per node'):
-        # Reproject nodes to the DEM's CRS for the sampling call (no
-        # mutation of `nodes` itself — only the temporary view used to
-        # query the raster gets converted). Returned Series is indexed
-        # by nodes.index (preserved through to_crs), so the assignment
-        # back into `nodes` aligns row-by-row.
+        # Sample on a temporary copy reprojected to the DEM's CRS; the
+        # returned Series keeps nodes.index, so the assignment aligns.
         nodes['elevation'] = geo_processing.sample_raster_at_points(
             nodes.to_crs(_dem_crs), dem_path, name='elevation')
 
@@ -284,11 +305,8 @@ def main(variant) -> None:
         f'mode={mode}: topology-smooth elevation '
         f'(Gaussian σ={_SMOOTH_ELEV_SCALE:.0f} m, 1 iteration)'
     ):
-        # Round-trip: write the raw raster-sampled elevation to graph
-        # node attributes, smooth on the graph (uses edge lengths
-        # already present from 02a's decorate step), then read back
-        # into the nodes GDF. The graph's existing `length` attribute
-        # is what gates the Gaussian weight.
+        # Round-trip: write the raw sampled elevation to the graph, smooth
+        # there (Gaussian weight over edge `length`), read back into `nodes`.
         nx.set_node_attributes(graph, nodes['elevation'].to_dict(), 'elevation')
         network_processing.smooth_node_attribute(
             graph, 'elevation', length_scale=_SMOOTH_ELEV_SCALE)
@@ -305,16 +323,15 @@ def main(variant) -> None:
         # Cell → node mapping for this mode comes from 02a's snap.
         cell_to_node = pd.DataFrame({
             'node_id': cell_snap['node_id'].values,
-            'combined_total': cells['employment_total'].values,
+            'combined_total': cells['combined_total'].reindex(cell_snap.index).values,
         }).dropna(subset=['node_id'])
         lu = (cell_to_node.groupby('node_id').sum().reindex(nodes.index, fill_value=0.0))
         nodes = nodes.join(lu)
 
-    with step(f'mode={mode}: density per node (500 m, 1000 m; circular only)'):
-        # Note: `add_filled_densities=True` is INCOMPATIBLE with point
-        # geometries (nodes have zero area → divide-by-zero). For a
-        # "filled" density signal, compute it at cell level upstream
-        # (cells have area) and aggregate to nodes via the snap.
+    with step(f'mode={mode}: density per node, radii {_RADII_DENSITY} m (circular only)'):
+        # `add_filled_densities=True` doesn't work on points (nodes have
+        # zero area → divide-by-zero). A "filled" density would have to be
+        # computed per cell (cells have area) and mapped via the snap.
         density_frames = []
         for r in _RADII_DENSITY:
             density_frames.append(
@@ -333,16 +350,15 @@ def main(variant) -> None:
     # Per-mode neighborhood aggregations.
     #
     # - speed_limit_avg is aggregated over CAR-SHARED road edges only
-    #   (filter via `_CAR_ROAD_HIGHWAYS`). On walk / bike graphs, OSMnx's
-    #   `add_edge_speeds` also fills a fallback 50 km/h onto pedestrian-only
-    #   ways (footway / path / pedestrian / cycleway / steps); those get
-    #   filtered out so the aggregation reflects real road speed limits.
-    # - bike_infra_score is aggregated on every mode's own edges (walk &
-    #   bike & car). Each mode's edge set has its own bike_infra_score
-    #   attribution (walk graph includes cycle paths, car graph includes
-    #   the on-road bike lanes that co-exist with cars, etc.).
+    #   (`_CAR_ROAD_HIGHWAYS`). On walk / bike graphs, OSMnx's
+    #   `add_edge_speeds` (networks_decorate.py) fills a fallback 50 km/h
+    #   onto pedestrian-only ways (footway / path / cycleway / steps …).
+    # - bike_infra_score is aggregated on every mode's own edges, so each
+    #   mode sees its own edge set (walk graph includes cycle paths, car
+    #   graph the on-road bike lanes, etc.).
     cross_cols: list[str] = []
-    with step(f'mode={mode}: bike_infra + speed_limit neighborhood avg (r250, r500)'):
+    with step(f'mode={mode}: bike_infra + speed_limit neighborhood avg, '
+              f'radii {_RADII_NEIGHBORHOOD} m'):
         edge_xy = _edge_midpoints(edges)
         node_xy = np.column_stack(
             [nodes.geometry.x.to_numpy(), nodes.geometry.y.to_numpy()])
@@ -353,9 +369,7 @@ def main(variant) -> None:
             bike_infra_score.to_numpy(dtype=float),
             _RADII_NEIGHBORHOOD, 'bike_infra_score_avg')
 
-        # speed_limit aggregation — over edges on car-shared road classes
-        # only. Pedestrian-only ways have an unreliable OSMnx fallback
-        # value; keeping them would smear the average.
+        # speed_limit aggregation — over edges on car-shared road classes only.
         road_mask = _car_road_mask(edges)
         n_road = int(road_mask.sum())
         logging.info(
@@ -377,12 +391,12 @@ def main(variant) -> None:
         nodes = nodes.join(pd.concat([bike_agg, speed_agg], axis=1))
         cross_cols = list(bike_agg.columns) + list(speed_agg.columns)
 
-    with step(f'mode={mode}: mean |slope| per node ("hilliness", network-weighted, 250 m + 500 m)'):
+    with step(f'mode={mode}: mean |slope| per node ("hilliness", network-weighted), '
+              f'radii {_RADII_NEIGHBORHOOD} m'):
         # Length-weighted mean |slope| within radius = Σ|Δh| / Σlength over all
-        # edges whose centroid is within `r` of the node. Picks up "average
-        # grade you'd actually traverse in this area" (note that this metric is
-        # currently computed BEFORE slopes are set to zero for bridges and
-        # tunnels).
+        # edges whose centroid is within `r` of the node: the average grade
+        # you'd actually traverse in this area. Computed BEFORE the
+        # bridge / tunnel mask below is applied.
         edges_for_slope = edges[['geometry', 'length']].copy()
         delta_elev = _delta_elevation_per_edge(edges, nodes['elevation'])
         edges_for_slope['abs_delta_elevation'] = delta_elev.abs()
@@ -405,14 +419,14 @@ def main(variant) -> None:
         length = edges['length'].astype(float)
         slope = (delta_elev / length.replace(0, np.nan)).fillna(0.0)
         slope.name = 'slope'
-        # FIETS index (delta_h ** 2 / dist; equal to slope * delta_h)
+        # FIETS index, uphill only (delta_h ** 2 / dist; equal to slope * delta_h)
         fiets = (np.maximum(0, delta_elev)**2 / length.replace(0, np.nan)).fillna(0.0)
 
-        # Bridge / tunnel mask: reduce elevation change / slope if a bridge or
-        # tunnel is present on the edge. This underestimates elevation changes
-        # if the bridge or tunnel surface isn't flat, but the alternative can
-        # dramatically overestimate gain/loss, especially if nodes are present
-        # on the bridge or in the tunnel.
+        # Bridge / tunnel mask: scale elevation change / slope down by the
+        # edge's bridge + tunnel share. Underestimates elevation change where
+        # the bridge or tunnel isn't flat, but the alternative can badly
+        # overestimate gain/loss, especially with nodes on the bridge or in
+        # the tunnel.
         bridge_frac = edges['bridge'].astype(float).fillna(0.0)
         tunnel_frac = edges['tunnel'].astype(float).fillna(0.0)
         elev_mask = (1.0 - bridge_frac - tunnel_frac).clip(lower=0.0)
@@ -439,7 +453,7 @@ def main(variant) -> None:
             *[f'density_r{r}' for r in _RADII_DENSITY],
             *[f'density_r{r}_norm' for r in _RADII_DENSITY],
             *[f'mean_abs_slope_r{r}' for r in _RADII_NEIGHBORHOOD],
-            *cross_cols,  # bike_infra_score_avg_r* (bike) / speed_limit_avg_r* (car)
+            *cross_cols,  # bike_infra_score_avg_r* + speed_limit_avg_r* (every mode)
         ]
         edges_from_nodes = network_processing.aggregate_nodes_to_edges(
             nodes, node_feature_cols + is_flag_cols, graph, aggregator='mean',
@@ -456,12 +470,8 @@ def main(variant) -> None:
         edge_id_index = pd.Index(
             [_edge_id(u, v, k) for u, v, k in edges.index],
             name='edge_id')
-        # Bridge + tunnel "presence" in [0, 1] — saved as its own
-        # column so downstream consumers (snap-eligibility filters,
-        # visualizations, ad-hoc analysis) can read a single boolean-
-        # ish value rather than summing `bridge` + `tunnel` themselves.
-        # Clip prevents stacked bridge + tunnel (rare; e.g. a tunnel
-        # under a bridged street) from going above 1.
+        # Bridge + tunnel share in [0, 1], one column for downstream use.
+        # Clipped: a stacked bridge + tunnel (rare) would otherwise exceed 1.
         is_bridge_or_tunnel = (bridge_frac + tunnel_frac).clip(upper=1.0)
 
         extended_edges = pd.DataFrame({

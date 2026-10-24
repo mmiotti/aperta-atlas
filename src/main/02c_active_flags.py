@@ -18,7 +18,7 @@ Inputs:
     shapes/cells.gpkg                    # for is_aoi column
     shapes/zones.gpkg                    # for is_aoi column
 
-Outputs (under <scenario>/, PUBLIC):
+Outputs (scenario storage, under <scenario>/):
     properties/cells_snap.csv            # node_id_<mode> + distance_<mode>
                                          # per scenario.mode_configs + is_active
     properties/zones_snap.csv            # same shape, zones

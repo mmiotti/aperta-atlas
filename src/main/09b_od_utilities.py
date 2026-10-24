@@ -1,36 +1,36 @@
 """
 Materialize per-mode / per-profile cell-baked DISUTILITY ODMs.
 
-Reads 08's cell-baked gross-time ODMs (road + transit) and applies
+Reads 08a's cell-baked gross-time ODMs (road + transit) and applies
 09a's calibrated utility spec to produce disutility-domain ODMs —
 smaller = better, same semantics as time. `build_disutility_spec`
 sign-flips at load time so downstream (10) can consume these as if
 they were time costs (nearest picks smallest, gravity uses `exp(-D)`,
 etc.).
 
-One ODM per (mode, profile, utility-variant) combination is written.
-Utility variants are discovered from the scenario's `coefs` dict —
-every key of the form `utility_<variant>` triggers one utility ODM
-build per profile.
+One ODM is written per (mode, profile, utility variant); the variants
+are the scenario's `utility_<variant>` coef keys (`_stats` sidecars
+excluded).
 
 Formula per OD pair (gross_sec = the corresponding cell in the
 underlying gross-time ODM):
 
     D(i, j) = ASC_effective                    (built into `spec.disutility.constant`)
-            + β_time_effective · gross_sec     (element-wise in this fn)
+            + β_time_effective · gross_sec     (build_disutility_odm)
             + Σ_o β_o · feat_o(i) + Σ_d β_d · feat_d(j)   (aperta's add_endpoint_utility)
-            + β_time_log · log(gross_sec)      (apply_log_time_utility)
+            + β_time_log · log(gross_sec)      (apply_log_time_utility; linear
+                                                beyond t_cut_min)
 
 Every β above is sign-flipped from 09a's raw fit — see
 `build_disutility_spec`.
 
-Inputs (PUBLIC, under `<scenario>/`):
+Inputs (scenario storage, under `<scenario>/`):
     odm/<mode>_time_gross_<profile>.npz     # from 08a (road)
     odm/<mode>_geo_pairs.npz                # from 08a (road; shared across profiles)
     odm/transit_time_gross_npvm.npz         # from 08a (transit)
     odm/transit_geo_pairs.npz               # from 08a (transit)
-    coefs/<kind>/utility_<variant>.csv        # β table from 09a (rows: b_*, asc_*;
-                                              # cols: value, rob_std_err,
+    coefs/<kind>/utility_<variant>.csv        # β table from 09a (rows: b_*, asc_*,
+                                              # t_ref_min; cols: value, rob_std_err,
                                               # rob_t_test, rob_p_value)
     coefs/<kind>/utility_<variant>_stats.csv  # companion sidecar: sd_avg_<sd_col>
                                               # + t_cut_min_<mode> rows (two-col
@@ -39,8 +39,9 @@ Inputs (PUBLIC, under `<scenario>/`):
       nodes_bike_extended.csv,
       nodes_car_extended.csv,
       nodes_car_flows_avg.csv               # per-node endpoint features
+    properties/cells_*.csv + shapes/cells.gpkg, zones likewise
 
-Output (PUBLIC, under `<scenario>/`):
+Output (scenario storage, under `<scenario>/`):
     odm/<mode>_util_<profile>_<variant>.npz     # per-profile disutility ODM (road)
     odm/transit_util_npvm_<variant>.npz         # per-variant disutility ODM (transit)
 
@@ -86,23 +87,19 @@ def main():
 
     utility_variants = _utility_variants_from_scenario(scenario)
     if not utility_variants:
-        logging.warning(
-            "no `utility_*` coefs declared in scenario.coefs — nothing "
-            "for 09b to do. Add e.g. `'utility_default': Calibrate()` "
-            "to build the default variant.")
+        logging.info(
+            "no `utility_*` coefs declared in scenario.coefs (no utility grid); "
+            "skipping")
         context.close()
         return
     logging.info(f"utility variants to build: {utility_variants}")
 
-    # Cache per-variant coefs once — otherwise the inner loop reloads
-    # each CSV per (mode, profile) combination.
+    # Load each variant's coefs once, not per (mode, profile).
     util_coefs_by_variant = {
         v: context.get_coefs(f'utility_{v}') for v in utility_variants
     }
-    # Track every coef key consumed by SOME spec build (across all road
-    # profiles + transit) per variant. Checked at the end — anything
-    # residual is a coef 09a fit that 09b silently ignored (naming-scheme
-    # drift, disabled mode, or feature not wired into build_disutility_spec).
+    # Coef keys consumed by any spec build (road profiles + transit), per
+    # variant. The audit at the end reports 09a coefs that no spec used.
     consumed_by_variant: dict[str, set[str]] = {v: set() for v in utility_variants}
 
     # ---- Prepare cells + zones with endpoint feature columns --------
@@ -116,10 +113,9 @@ def main():
         # NaN-poison every inactive-dest utility.
         cells_m = cells.copy()
         zones_m = zones.copy()
-        # Endpoint features are joined per-feature from each feature's
-        # source graph (density from walk, bike_infra from bike, etc.).
-        # Cells missing the source-mode snap → NaN feature → NaN utility
-        # on any pair involving them.
+        # Each endpoint feature comes from its source graph's node file
+        # (density from walk, bike_infra from bike, ...). A cell without
+        # that mode's snap gets NaN features → NaN utility on its pairs.
         join_util_node_features(cells_m, zones_m, context)
         cells_m['unit_id'] = cells_m.index  # `add_endpoint_utility` uses this
         zones_m['unit_id'] = zones_m.index
@@ -129,10 +125,8 @@ def main():
             f"+ {len(zones_m):,} zones")
 
     with step('load utility stats sidecars (SD averages + t_cut_min)'):
-        # `utility_<v>_stats` companions travel with each `utility_<v>`
-        # under the same CoefSource declaration (validated in
-        # Scenario.__post_init__). ImportFrom copies both files
-        # automatically via `coefs.resolve` in 09a.
+        # `utility_<v>_stats` shares `utility_<v>`'s CoefSource (validated
+        # in Scenario.__post_init__); 09a resolves both.
         stats_by_variant = {
             v: context.get_coefs(f'utility_{v}_stats') for v in utility_variants
         }
@@ -174,9 +168,8 @@ def main():
                     f"(profile has no 09a utility mode). Skipping.")
                 continue
 
-            # Gross cost ODM + geo pair index (dest ids). Both shared
-            # across variants. Aperta's endpoint helpers need the pair
-            # index (dest ids), not the cost ODM (values).
+            # Gross cost ODM + geo pair index, shared across variants. The
+            # endpoint helpers need the pair index (dest ids), not the costs.
             gross_name = f'time_gross_{src.name}'
             with step(f'mode={mode} profile={label}: load gross ODM + geo pairs'):
                 costs_gross = cast(TieredODGeoPairs, context.get_tiered_odm(
@@ -219,47 +212,50 @@ def main():
                         f"constant={spec.disutility.constant:+.3f}")
 
     # ---- Transit: same treatment as road ----------------------------
-    with step('mode=transit: load gross ODM + geo pairs'):
-        transit_costs = cast(TieredODGeoPairs, context.get_tiered_odm(
-            network_name='transit', data_name='time_gross_npvm'))
-        transit_pairs = cast(TieredODGeoPairs, context.get_tiered_odm(
-            network_name='transit', data_name='geo_pairs'))
+    if scenario.transit_source is None:
+        logging.info('no transit in this scenario; skipping transit utilities')
+    else:
+        with step('mode=transit: load gross ODM + geo pairs'):
+            transit_costs = cast(TieredODGeoPairs, context.get_tiered_odm(
+                network_name='transit', data_name='time_gross_npvm'))
+            transit_pairs = cast(TieredODGeoPairs, context.get_tiered_odm(
+                network_name='transit', data_name='geo_pairs'))
 
-    for variant in utility_variants:
-        spec = build_disutility_spec(
-            util_coefs_by_variant[variant], 'transit',
-            sd_averages=sd_averages_by_variant[variant],
-            t_cut_min_per_mode=t_cut_min_by_variant[variant],
-            consumed_out=consumed_by_variant[variant],
-        )
-        if spec is None:
-            logging.warning(
-                f"  ⚠ transit variant={variant!r}: no utility spec — "
-                f"09a coefs don't include transit column. Skipping.")
-            continue
+        for variant in utility_variants:
+            spec = build_disutility_spec(
+                util_coefs_by_variant[variant], 'transit',
+                sd_averages=sd_averages_by_variant[variant],
+                t_cut_min_per_mode=t_cut_min_by_variant[variant],
+                consumed_out=consumed_by_variant[variant],
+            )
+            if spec is None:
+                logging.warning(
+                    f"  ⚠ transit variant={variant!r}: no utility spec — "
+                    f"09a coefs don't include transit column. Skipping.")
+                continue
 
-        with step(f'mode=transit variant={variant!r}: build disutility'):
-            transit_util = build_disutility_odm(
-                cost_odm_sec=transit_costs,
-                pairs_geo=transit_pairs,
-                spec=spec,
-                cells_m=cells_m, zones_m=zones_m,
-            )
-            check_util_matches_cost_shape(
-                cost_odm=transit_costs, util_odm=transit_util,
-                label=f'transit/{variant}',
-            )
-            context.create_tiered_odm(
-                transit_util,
-                network_name='transit',
-                data_name=f'util_npvm_{variant}',
-            )
-            logging.info(
-                f"  → transit disutility ODM saved "
-                f"(transit_util_npvm_{variant}); "
-                f"β_time_eff={spec.disutility.cost_coefficient:+.5f}, "
-                f"β_time_log={spec.b_time_log:+.3f}, "
-                f"constant={spec.disutility.constant:+.3f}")
+            with step(f'mode=transit variant={variant!r}: build disutility'):
+                transit_util = build_disutility_odm(
+                    cost_odm_sec=transit_costs,
+                    pairs_geo=transit_pairs,
+                    spec=spec,
+                    cells_m=cells_m, zones_m=zones_m,
+                )
+                check_util_matches_cost_shape(
+                    cost_odm=transit_costs, util_odm=transit_util,
+                    label=f'transit/{variant}',
+                )
+                context.create_tiered_odm(
+                    transit_util,
+                    network_name='transit',
+                    data_name=f'util_npvm_{variant}',
+                )
+                logging.info(
+                    f"  → transit disutility ODM saved "
+                    f"(transit_util_npvm_{variant}); "
+                    f"β_time_eff={spec.disutility.cost_coefficient:+.5f}, "
+                    f"β_time_log={spec.b_time_log:+.3f}, "
+                    f"constant={spec.disutility.constant:+.3f}")
 
     # ---- Per-variant residual check: any 09a coef no spec consumed? -
     with step('audit: 09a coefs not consumed by any 09b spec'):
