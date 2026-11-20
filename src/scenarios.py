@@ -1,5 +1,5 @@
 """
-Typed scenario definitions for the Accessibility Atlas project.
+Typed scenario definitions for the Aperta Accessibility Atlas project.
 
 Each `Scenario` declares its `Area` (extent + buffers), pop/employment
 data sources (STATPOP / STATENT, GHS-POP, or per-OSM-tag coefficients),
@@ -58,8 +58,8 @@ class AccessibilityGrid:
         gravity, `β = ln(2) / (m · 60)`. Applies to `time_gross` grids
         only; ignored on `util` and `dist_line` grids.
     `gravity_util_betas`: β values applied directly to disutility for
-        `util` grids (`exp(-β·D)`). `β = 1.0` gives the (exponentiated)
-        mode-choice logsum. Ignored on `time_gross` and `dist_line` grids.
+        `util` grids; 10 stores the logsum `(1/β)·ln Σ w·exp(-β·D)`, in
+        utility units for every β. Ignored on `time_gross` and `dist_line` grids.
     `gravity_half_decay_m`: half-decay distances (metres) for `exp(-β·d)`
         gravity on `dist_line` grids, `β = ln(2) / m`. Ignored otherwise.
     `dest_cols`: subset of destination columns; `None` = pop + emp + poi
@@ -75,18 +75,30 @@ class AccessibilityGrid:
         bin edges and decays. `'time_net'` is reserved.
     `utility`: 09a variant name for `'util'` grids; the coefs dict must
         declare a matching `utility_<name>` entry.
+    `crossmodal_car_profiles`: `util` grids only. Per car profile (e.g.
+        `'base'`), 10 also writes the profile `crossmodal_<car profile>`:
+        the cross-modal logsum over the four modes of the mode-choice model
+        (walking, cycling, that car profile, public transport) for every
+        β, per OD pair then over destinations for β ≤ 1, from the per-mode
+        logsums for β > 1; cycling and public transport take 09a's
+        constants for that hour. Empty = none.
     """
-    bin_edges_min: tuple[int, ...] = (0, 5, 10, 15, 30, 60)
-    bin_edges_m: tuple[float, ...] = (0, 300, 1000, 3_000, 10_000, 30_000)
-    nearest_k: tuple[int, ...] = (1, 3, 10, 30, 100)
-    # Gravity parameters span local (1 min, 100 m, β = 2: about the nearest
-    # destinations) to broad catchments, roughly matched across the three.
-    gravity_half_decay_min: tuple[float, ...] = (1, 2, 5, 10, 20)
-    gravity_util_betas: tuple[float, ...] = (0.3, 0.5, 0.7, 1.0, 2.0)
-    gravity_half_decay_m: tuple[float, ...] = (100, 300, 1_000, 3_000, 10_000)
+    # Seven settings per metric family, placed so that each family spans about the same
+    # range of effective reach (11's r50; national sweep in misc/reach_sweep, 2026-11-15:
+    # by car, from about 1 km to 17-28 km for groceries) in steps of at most about 2x, except where
+    # a mode's cutoff or its nearest destinations bound the reach.
+    bin_edges_min: tuple[int, ...] = (0, 5, 10, 15, 20, 30, 45, 60)
+    bin_edges_m: tuple[float, ...] = (0, 300, 500, 1_000, 2_000, 5_000, 10_000, 30_000)
+    nearest_k: tuple[int, ...] = (1, 3, 10, 30, 100, 300, 1_000)
+    gravity_half_decay_min: tuple[float, ...] = (1, 2, 3, 5, 7, 10, 20)
+    # Utility: reach falls fastest between β = 1 and 2 (steep time slopes on short trips) and
+    # is capped by the cutoffs below 0.5; β up to 4 reaches local scale by car and transit.
+    gravity_util_betas: tuple[float, ...] = (0.3, 0.7, 1.0, 1.5, 2.0, 3.0, 4.0)
+    gravity_half_decay_m: tuple[float, ...] = (100, 200, 500, 1_000, 2_000, 5_000, 10_000)
     dest_cols: tuple[str, ...] | None = None
     travel_cost: str = 'time_gross'
     utility: str = 'default'
+    crossmodal_car_profiles: tuple[str, ...] = ()
 
 
 # First segment of on-disk output paths (`<DATA_DIR_*>/<PROJECT_NAME>/…`).
@@ -136,8 +148,9 @@ class Scenario:
         network test). Read by 02a; walk / bike always use OSM.
       - `transit_source`: `'npvm'` (Swiss NPVM zone-to-zone times, refined
         per cell) or `None` (no public transport: the transit stages and the
-        transit parts of the others skip). Transit needs walk + bike in
-        `mode_configs` (06: walking time to stops, cycling time to stations).
+        transit parts of the others skip). Transit needs walk, bike and car in
+        `mode_configs` (06: walking time to stops, cycling time to stations,
+        driving time to park-and-ride).
       - `accessibility_grids`: `{grid_key: AccessibilityGrid}`; each grid
         becomes a `--variant` in 10.
       - `poi_cols` / `transit_stops_cols`: destination columns; the
@@ -233,10 +246,10 @@ class Scenario:
         if self.transit_source not in (None, 'npvm'):
             raise ValueError(f"transit_source must be 'npvm' or None, "
                              f"got {self.transit_source!r}.")
-        if self.transit_source and not {'walk', 'bike'} <= set(self.mode_configs):
-            raise ValueError(f"transit_source={self.transit_source!r} needs walk + bike "
-                             f"in mode_configs (06 computes access by both); "
-                             f"got {sorted(self.mode_configs)!r}.")
+        if self.transit_source and not {'walk', 'bike', 'car'} <= set(self.mode_configs):
+            raise ValueError(f"transit_source={self.transit_source!r} needs walk, bike "
+                             f"and car in mode_configs (06 computes access by all "
+                             f"three); got {sorted(self.mode_configs)!r}.")
         fits_utility = any(isinstance(src, Calibrate) for name, src in self.coefs.items()
                            if name.startswith('utility_'))
         if fits_utility and (self.transit_source is None
@@ -337,6 +350,15 @@ class Scenario:
                 raise NotImplementedError(f"accessibility_grids[{grid_key!r}]: "
                                           f"cumulative on utility not implemented — "
                                           f"set `bin_edges_min=()` for util grids.")
+            if g.crossmodal_car_profiles:
+                car = self.mode_configs.get('car')
+                car_profiles = car.profiles if car is not None else []
+                if (g.travel_cost != 'util' or not g.gravity_util_betas
+                        or self.transit_source is None
+                        or not set(g.crossmodal_car_profiles) <= set(car_profiles)):
+                    raise ValueError(f"accessibility_grids[{grid_key!r}].crossmodal_car_profiles "
+                                     f"needs a util grid with gravity, transit, and car profiles "
+                                     f"among {car_profiles!r}; got {g.crossmodal_car_profiles!r}.")
         # All util grids share `utility` — 10 loads one coefs file up front.
         util_variants = {g.utility for g in self.accessibility_grids.values()
                          if g.travel_cost == 'util'}
@@ -394,12 +416,10 @@ _SWISS_CALIBRATED_COEFS: dict[str, CoefSource] = {
     'utility_default':              Calibrate(),
     'utility_default_stats':        Calibrate(),
 }
-# Utility-spec comparison variants (09a `default_single` / `default_route`), fitted only in
-# switzerland-h10. Kept out of the shared presets because 09b builds every declared
-# `utility_*` variant, and the pipeline fits / transfers only `default`.
+# Utility-spec comparison variant (09a `default_route`), fitted by hand only in
+# switzerland-h10 (the pipeline fits / transfers only `default`). 09b builds no ODMs for it:
+# no grid uses it.
 _SWISS_UTILITY_SPEC_VARIANTS: dict[str, CoefSource] = {
-    'utility_default_single':       Calibrate(),
-    'utility_default_single_stats': Calibrate(),
     'utility_default_route':        Calibrate(),
     'utility_default_route_stats':  Calibrate(),
 }
@@ -420,6 +440,7 @@ _SWISS_ACCESSIBILITY_GRIDS: dict[str, AccessibilityGrid] = {
     'util': AccessibilityGrid(
         bin_edges_min=(),
         travel_cost='util',
+        crossmodal_car_profiles=('night', 'base', 'peak'),
     ),
     'dist': AccessibilityGrid(
         travel_cost='dist_line',

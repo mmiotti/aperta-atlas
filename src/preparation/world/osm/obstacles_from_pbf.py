@@ -2,8 +2,7 @@
 Stream OSM obstacle features from a locally clipped PBF — traffic signals,
 stops, give-ways, crossings, mini-roundabouts, and roundabout-way centroids.
 
-Independent of the network preparation chain; only depends on
-`clip_pbf.py`'s output. Consumed by `networks_decorate.py`, which
+Consumed by `networks_decorate.py`, which
 snaps each obstacle to the nearest consolidated-network node and writes
 a per-node boolean attribute (`is_traffic_signal`, etc.).
 
@@ -14,7 +13,9 @@ mode), so the same file feeds all per-mode decoration runs.
 Obstacle kinds collected:
 
   Node features (`highway=...`):
-    - traffic_signals — signalized intersection
+    - traffic_signals — signalized intersection, or signalized crossing
+                        (`highway=crossing` with `crossing=traffic_signals` or
+                        `crossing:signals=yes`; emitted as both kinds)
     - stop            — stop sign
     - give_way        — yield sign
     - crossing        — pedestrian / cyclist crossing
@@ -24,7 +25,7 @@ Obstacle kinds collected:
     - roundabout      — full roundabout loop; output as the way's
                         geometric centroid
 
-Cases are defined in `preparation/world/areas.py`; this script registers
+Areas are defined in `preparation/world/areas.py`; this script registers
 one `<area_name>_obstacles` variant per area.
 
 Inputs (PUBLIC, under raw/global/osm/):
@@ -33,18 +34,15 @@ Inputs (PUBLIC, under raw/global/osm/):
 Outputs (PUBLIC, under preparation/world/osm/):
     obstacles_<area_name>.gpkg      # point features, WGS84
 
-Requires `osmium-tool` (CLI) AND `pyosmium` (Python).
-
-Run after `clip_pbf.py`.
-
 Run all variants sequentially (default):
     python -m preparation.world.osm.obstacles_from_pbf
 Single variant:
     python -m preparation.world.osm.obstacles_from_pbf --variant switzerland_obstacles
-    python -m preparation.world.osm.obstacles_from_pbf --variant bern_obstacles
+    python -m preparation.world.osm.obstacles_from_pbf --variant bern-metro_obstacles
 """
 
 import logging
+from collections import Counter
 
 import geopandas as gpd
 import osmium
@@ -89,7 +87,8 @@ class ObstacleHandler(osmium.SimpleHandler):
     """Streaming pyosmium handler that collects OSM obstacle features.
 
     Nodes whose `highway` tag is in `_OBSTACLE_NODE_HIGHWAYS` are emitted
-    as Point features with `kind = highway-tag-value`. Ways with
+    as Point features with `kind = highway-tag-value`; signalized crossings
+    a second time as `traffic_signals`. Ways with
     `junction=roundabout` are emitted as Point features with
     `kind='roundabout'`, located at the way's geometric centroid.
 
@@ -110,6 +109,12 @@ class ObstacleHandler(osmium.SimpleHandler):
         kind = n.tags['highway']
         if kind in _OBSTACLE_NODE_HIGHWAYS:
             self.features.append((kind, 'n', n.id, n.location.lon, n.location.lat))
+        # A signalized crossing is also a traffic signal, for every mode (it stops motor
+        # traffic too): `crossing=traffic_signals`, or `crossing:signals=yes` (newer scheme).
+        if kind == 'crossing' and (n.tags.get('crossing') == 'traffic_signals'
+                                   or n.tags.get('crossing:signals') == 'yes'):
+            self.features.append(
+                ('traffic_signals', 'n', n.id, n.location.lon, n.location.lat))
 
     def way(self, w) -> None:
         if w.tags.get('junction') != 'roundabout':
@@ -124,34 +129,25 @@ class ObstacleHandler(osmium.SimpleHandler):
 
 def features_to_gdf(features: list[tuple[str, str, int, float, float]]) -> gpd.GeoDataFrame:
     """Convert a list of `(kind, osm_type, osm_id, lon, lat)` tuples to
-    a GeoDataFrame of WGS84 points with a default integer index.
-
-    `osm_id` alone isn't unique across element types (a node and a way
-    can share the same numeric id), so we keep `osm_type` + `osm_id` as
-    columns for traceability and use a fresh integer index that
-    `Context.create_generic`'s uniqueness check accepts.
-    """
+    a GeoDataFrame of WGS84 points with a fresh integer index (`osm_id` alone
+    is not unique across element types)."""
     df = pd.DataFrame(features, columns=['kind', 'osm_type', 'osm_id', 'lon', 'lat'])
     df.index.name = 'obstacle_id'
-    gdf = gpd.GeoDataFrame(
+    return gpd.GeoDataFrame(
         df[['kind', 'osm_type', 'osm_id']],
         geometry=gpd.points_from_xy(df['lon'], df['lat']),
         crs='EPSG:4326',
     )
-    return gdf
 
 
 def main(variant) -> None:
     context = init_context(variant)
     out_name = f'obstacles_{variant.area_name}'
 
-    with clipped_pbf(context, variant, out_name) as pbf_path:
+    with clipped_pbf(context, variant, out_name) as (pbf_path, _):
         with step('stream parse (pyosmium handler)'):
             handler = ObstacleHandler()
             handler.apply_file(pbf_path, locations=True)
-        # By-kind summary so the downstream decoration step has a known
-        # baseline to compare against after snap-to-node.
-        from collections import Counter
         kind_counts = Counter(f[0] for f in handler.features)
         logging.info(
             f"  → collected {len(handler.features):,} obstacles "

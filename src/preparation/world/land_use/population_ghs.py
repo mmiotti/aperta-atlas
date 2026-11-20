@@ -6,15 +6,14 @@ GeoTIFF.
 The native distribution is per-tile (10° × 10° tiles in Mollweide projection
 `ESRI:54009`). Switzerland fits inside tile `R4_C19`; different areas may need
 multiple tiles. The script always treats its input as a list of tile IDs and
-mosaics them via `rasterio.merge` before clipping — single-tile is just the n=1
-area.
+mosaics them via `rasterio.merge` before clipping (a single tile included).
 
 Output CRS is **kept as Mollweide** (the GHSL native, equal-area). Per-project
 reprojection to a metric CRS happens at project-stage attach.
 
 The raw 10° tiles are cached under `preparation/world/land_use/ghsl_tiles/`.
 
-Cases are defined in `preparation/world/areas.py`; this script registers one
+Areas are defined in `preparation/world/areas.py`; this script registers one
 variant per area (variant name = `<area_name>`). Tile list comes from each
 area's `ghsl_tiles` field; buffer is the widest per-mode buffer.
 
@@ -22,20 +21,19 @@ Inputs:
     (none — fetched from JRC's GHSL open data FTP)
 
 Outputs (PUBLIC, under preparation/world/land_use/):
-    population_<area_name>.tif                     # clipped + mosaicked,
-    Mollweide ghsl_tiles/GHS_POP_..._<R>_<C>.tif   # cached raw tiles
+    population_<area_name>.tif                     # clipped + mosaicked, Mollweide
+    ghsl_tiles/GHS_POP_..._<R>_<C>.tif             # cached raw tiles
 
 Run all variants sequentially (default):
     python -m preparation.world.land_use.population_ghs
 Single variant:
     python -m preparation.world.land_use.population_ghs --variant switzerland
-    python -m preparation.world.land_use.population_ghs --variant bern
+    python -m preparation.world.land_use.population_ghs --variant bern-metro
 """
 
 import logging
 import os
 import zipfile
-from pathlib import Path
 
 import requests
 
@@ -119,7 +117,7 @@ def _mosaic_and_clip(tile_paths: list[str], polygon_4326, out_path: str) -> None
     from rasterio.mask import mask as raster_mask
     from rasterio.merge import merge as raster_merge
 
-    # Mosaic stage — single-tile is just the n=1 area of merge.
+    # Mosaic stage (also for a single tile).
     srcs = [rasterio.open(p) for p in tile_paths]
     try:
         mosaic, mosaic_transform = raster_merge(srcs)
@@ -161,32 +159,18 @@ def _mosaic_and_clip(tile_paths: list[str], polygon_4326, out_path: str) -> None
                 tmp, [aoi_mollweide.__geo_interface__], crop=True,
             )
 
-    out_profile = profile.copy()
-    out_profile.update({
-        'height': clipped.shape[1],
-        'width':  clipped.shape[2],
-        'transform': clip_transform,
-        'compress': 'lzw',
-    })
+    out_profile = {**profile, 'height': clipped.shape[1], 'width': clipped.shape[2],
+                   'transform': clip_transform, 'compress': 'lzw'}
     with rasterio.open(out_path, 'w', **out_profile) as dst:
         dst.write(clipped)
 
 
 def main(variant) -> None:
     context = init_context(variant)
-    out_name = f'population_{variant.area_name}'
-
-    # Resolve the prepared output path. `_generic_relative_path` returns
-    # the relative path verbatim under `preparation/*` namespaces, so
-    # the on-disk layout is `<DATA_DIR_PUBLIC>/preparation/world/land_use/<out>.tif`.
-    out_relative = f'{out_name}.tif'
+    out_relative = f'population_{variant.area_name}.tif'
     out_path = context.path_for(Storage.PUBLIC, out_relative)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    # Tile cache shared across all country variants — adjacent
-    # countries reuse overlapping tiles automatically.
-    cache_dir = os.path.dirname(out_path)
-    tiles_dir = os.path.join(cache_dir, 'ghsl_tiles')
+    # Tile cache shared across area variants: overlapping areas reuse tiles.
+    tiles_dir = os.path.join(os.path.dirname(out_path), 'ghsl_tiles')
     os.makedirs(tiles_dir, exist_ok=True)
 
     if os.path.exists(out_path):

@@ -6,18 +6,21 @@ Prepare Swiss traffic counter measurements (NPVM zaehldaten).
 > as documentation of the method.
 
 Reads the NPVM zaehldaten gpkg (per-direction line geometries with annual
-average daily traffic), derives `traffic_cars` from the dwv_pw fallback,
-classifies each counter as highway / main / local by lane count + flow
-threshold, computes the line-midpoint bearing for later matching against
-directed routing-graph edges, and writes one point per counter midpoint.
+average weekday traffic), takes `traffic_cars` from `dwv_pw` (passenger cars;
+0.9 × `dwv_allefz` where cars are not counted separately), flags the motorway stations
+(`is_highway`: Federal Roads Office stations with two or more lanes; by the
+station alone, never by its count, so the validation is not selected on the
+observed value), computes the line-midpoint bearing for later matching
+against directed routing-graph edges, and writes one point per counter
+midpoint.
 
-Inputs (PRIVATE):
-    <DATA_DIR_PRIVATE>/raw/switzerland/traffic_counters/ch_npvm/npvm_zaehldaten_2023.gpkg
+Inputs (PRIVATE, under raw/switzerland/traffic_counters/ch_npvm/):
+    npvm_zaehldaten_2023.gpkg
 
-Outputs (PRIVATE):
+Outputs (PRIVATE, under preparation/switzerland/traffic_counters/):
     traffic_counters.gpkg          # point geometries (line midpoints)
                                    # cols: traffic_cars, bearing_deg,
-                                   #       is_highway, is_main, is_local
+                                   #       is_highway
 
 Run:
     python -m preparation.switzerland.private.traffic_counters.prepare_counters
@@ -33,22 +36,16 @@ def main() -> None:
     context = init_context()
     folder = context.raw_path(Storage.PRIVATE, 'switzerland/traffic_counters/ch_npvm')
     gdf = gpd.read_file(f'{folder}/npvm_zaehldaten_2023.gpkg')
+    # The file has only DWV (average weekday traffic), no average over all days. `dwv_pw` is 0
+    # where cars are not counted separately (over half the stations): 90 % of all vehicles.
     gdf['traffic_cars'] = gdf['dwv_pw']
-    gdf.loc[gdf['traffic_cars'] < 1, 'traffic_cars'] = gdf['dwv_allefz'] * 0.9
-    gdf['is_highway'] = (
-        ((gdf['NUMLANES'] >= 2) & (gdf['zw_quelle'] == 'ASTRA')) &
-        (gdf['traffic_cars'] > 3_000)
-    ).astype(int)
-    gdf['is_main'] = ((gdf['traffic_cars'] > 1_000) & (gdf['is_highway'] == 0)).astype(int)
-    gdf['is_local'] = ((gdf['is_highway'] == 0) & (gdf['is_main'] == 0)).astype(int)
-    road_types = ['is_highway', 'is_main', 'is_local']
-    # Compass bearing at each counter's midpoint, for matching to directed edges
-    # in the routing graph later. Counters are directional (each row reports
-    # one direction of travel), so the bearing is meaningful as-is — no
-    # modulo-180° reduction.
+    no_cars = gdf['traffic_cars'].isna() | (gdf['traffic_cars'] < 1)
+    gdf.loc[no_cars, 'traffic_cars'] = gdf['dwv_allefz'] * 0.9
+    gdf['is_highway'] = ((gdf['NUMLANES'] >= 2) & (gdf['zw_quelle'] == 'ASTRA')).astype(int)
+    # Midpoint compass bearing, for matching to directed edges; counters are directional.
     gdf['bearing_deg'] = geo_processing.line_bearings_deg(gdf.geometry)
     geom = [line.interpolate(0.5, normalized=True) for line in gdf.geometry]
-    points = gpd.GeoDataFrame(gdf[['traffic_cars', 'bearing_deg'] + road_types],
+    points = gpd.GeoDataFrame(gdf[['traffic_cars', 'bearing_deg', 'is_highway']],
                               geometry=geom, crs=gdf.crs)
     points = points[points.traffic_cars > 0]
     context.create_generic(points, 'traffic_counters.gpkg')

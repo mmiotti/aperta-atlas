@@ -9,7 +9,7 @@ to Swiss borders.
 Pipeline: load STATPOP CSV → uncap privacy-suppressed values (BBTOT ≤ cap
 is redrawn from a weighted distribution) → aggregate to
 `population_total` + 6 age bands → build 100 m hectare cell polygons →
-classify buildings by local pop density (1 km ring) → stratify OSM tag
+classify buildings by GHS-POP density (1 km ring) → stratify OSM tag
 values (`_SPLIT_TAGS` × rural/suburban/urban) → one NNLS fit per
 category (`population_total` + each age band) with per-cell rescaling
 to match STATPOP totals exactly.
@@ -19,11 +19,13 @@ to match STATPOP totals exactly.
 households most common, then pairs, then triples). Fixed RNG seed for
 reproducibility. Cap is auto-detected from the total column.
 
-**Density-based stratification** (see `_SPLIT_TAGS`,
-`STRATUM_THRESHOLDS`). Tag values in `_SPLIT_TAGS` get separate NNLS
-coefficients per stratum, because residential intensity (people/m²) for
-the same tag varies systematically with local density. Non-split tags
-share one intensity across strata.
+**Density-based stratification** (see `_SPLIT_TAGS` and
+`preparation.world.land_use.strata`). Tag values in `_SPLIT_TAGS` get
+separate NNLS coefficients per stratum, because residential intensity
+(people/m²) for the same tag varies systematically with local density.
+Non-split tags share one intensity across strata. The strata come from
+GHS-POP, not STATPOP, so they can be reproduced wherever the
+coefficients are applied.
 
 **Age bands.** STATPOP publishes finer age breakdowns (split further by
 gender). The 6 bands here are the standard aggregation:
@@ -40,6 +42,7 @@ Inputs (PUBLIC, under raw/switzerland/statpop/):
     statistik-bevoelkerung_haushalte_<year>_ha_2056.csv   # BFS release
 Cross-source (via `context.source(...)`):
     preparation/world/osm/shapes/buildings_<country>.gpkg
+    preparation/world/land_use/population_<country>.tif  # GHS-POP, density strata
 
 Outputs (PUBLIC, under preparation/switzerland/land_use/):
     properties/buildings_population_<year>.csv       # per-building
@@ -69,11 +72,11 @@ from aperta_atlas.utils import step
 from aperta_atlas.variant import Variants
 
 from preparation.switzerland.common import (
-    build_hectare_cells, classify_density_stratum, combine_learned_per_category,
-    compute_hectare_density, expand_relevant_tags, filter_to_inside_ch,
-    load_swiss_country, merge_per_category_outputs, replace_smaller_equal,
-    stratify_building_tags,
+    build_hectare_cells, combine_learned_per_category, expand_relevant_tags,
+    filter_to_inside_ch, load_swiss_country, merge_per_category_outputs,
+    detect_privacy_cap, replace_smaller_equal, stratify_building_tags,
 )
+from preparation.world.land_use.strata import building_strata
 
 # Max distance (in metres) for the nearest-building fallback for cells
 # with no building overlap (only for those cells). Set conservatively.
@@ -92,28 +95,10 @@ _SPLIT_TAGS: set[str] = {
     # 'terrace',
 }
 
-# Per-km² breakpoints for the 3-way rural / suburban / urban split.
-# Tuned to Swiss settlement patterns: 500 ≈ scattered village,
-# 5000 ≈ dense town / small-city outskirt.
-STRATUM_THRESHOLDS: tuple[float, float] = (500.0, 5_000.0)
-
 # STATPOP filename pattern (BFS public release; both .csv and .gpkg exist,
 # we read the .csv).
 _STATPOP_CSV_PATTERN = 'switzerland/statpop/statistik-bevoelkerung_haushalte_{year}_ha_2056.csv'
 
-
-def _detect_privacy_cap(values: np.ndarray) -> int:
-    """Return BFS's privacy-cap value inferred from `values`.
-
-    BFS caps true counts 1..n by replacing them with the literal cap
-    value n (any cell that would report 1, 2, …, n publishes n instead).
-    The smallest strictly-positive integer in the array IS the cap.
-    Assumes at least one capped cell exists — safe at national hectare
-    scale."""
-    positive = values[values > 0]
-    if positive.size == 0:
-        raise ValueError("No positive values in the array — cannot detect cap.")
-    return int(positive.min())
 
 # 6 age bands. Each entry maps to the STATPOP sub-band codes (2-digit
 # suffix) that compose it; M and W gender columns are summed within band.
@@ -156,7 +141,7 @@ def _load_and_aggregate_statpop(
             f"— verify BFS's schema.")
 
     total_arr = df[total_col].to_numpy(copy=True)
-    cap = _detect_privacy_cap(total_arr)
+    cap = detect_privacy_cap(total_arr)
     logging.info(f"  → detected STATPOP privacy cap = {cap}")
     logging.info(
         f"  → sum of raw BBTOT (with caps in place): {total_arr.sum():,.0f}")
@@ -205,11 +190,8 @@ def main(variant) -> None:
         cell_totals.index.name = 'cell_id'
 
     with step('persist STATPOP hectare cells + per-hectare values as generic artifacts'):
-        # Re-key cell_id from positional int to coordinate-stable string
-        # ('E_N' from LV95 lower-left corners) so downstream consumers
-        # (e.g. atlas 01, cell_source='hectares') can safely union
-        # STATPOP and STATENT hectares — both share the same BFS 100 m
-        # grid, so coordinates are the natural cross-source key.
+        # Coordinate-stable cell ids ('E_N', LV95 lower-left corners), so that atlas 01
+        # (cell_source='hectares') can union the STATPOP and STATENT hectares.
         coord_ids = [f'{int(e)}_{int(n)}' for e, n in zip(
             stat_df.index.get_level_values(0),
             stat_df.index.get_level_values(1))]
@@ -225,23 +207,17 @@ def main(variant) -> None:
             kws={'float_format': '%.4f'},
         )
 
-    with step('load OSM building shapes (buildings_download.py output)'):
+    with step('load OSM building shapes (buildings_from_pbf.py output)'):
         buildings_ctx = context.source('preparation/world/osm')
         buildings = buildings_ctx.get_shapes('buildings', data_name=variant.buildings_country)
-        # `build_hectare_cells` always sets crs=LV95 — assertion narrows
-        # the type checker's `CRS | None` to `CRS`.
         assert cells.crs is not None
         if buildings.crs != cells.crs:
             buildings = buildings.to_crs(cells.crs)
         logging.info(f"  → {len(buildings):,} buildings loaded; reprojected to {buildings.crs}")
 
     with step('filter buildings to inside CH borders (calibration area)'):
-        # `learn_coefficients`'s bias correction assumes `buildings` IS
-        # the calibration area's building set. The OSM input includes
-        # the country + buffer ring; we must trim to CH so the published
-        # β values reflect "average intensity across all CH buildings of
-        # this tag" — invariant to buffer presence and consistent under
-        # bottom-up application.
+        # `learn_coefficients`' bias correction assumes `buildings` is the calibration
+        # area's building set, so the OSM input (country + buffer ring) is trimmed to CH.
         n_before = len(buildings)
         country = load_swiss_country(context)
         buildings = filter_to_inside_ch(buildings, country)
@@ -249,16 +225,11 @@ def main(variant) -> None:
             f"  → {len(buildings):,} of {n_before:,} buildings inside CH "
             f"({len(buildings)/n_before*100:.1f} %)")
 
-    with step('classify buildings by local population density (1 km ring)'):
-        buildings['pop_density_1km'] = compute_hectare_density(
-            buildings, cells, cell_totals,
-            column='population_total', radius_m=1_000.0,
-        )
-        buildings['stratum'] = classify_density_stratum(
-            buildings['pop_density_1km'], STRATUM_THRESHOLDS)
+    with step('classify buildings by GHS-POP density (1 km ring)'):
+        buildings['stratum'] = building_strata(context, buildings, variant.buildings_country)
         counts = buildings['stratum'].value_counts()
         logging.info(
-            f"  → stratum counts: " +
+            "  → stratum counts: " +
             ", ".join(f"{s}={counts.get(s, 0):,}"
                       for s in ('rural', 'suburban', 'urban')))
 
@@ -316,10 +287,6 @@ def main(variant) -> None:
 
     with step('save per-building population + calibrated coefficients'):
         context.create_properties(props, data_name=data_name)
-        # Calibrated per-(OSM tag, age band) intensities — namespace-scoped
-        # coef. Symmetric with STATENT's `create_coefs` output; consumed
-        # via `get_coefs` if any downstream ever needs it. Lives at
-        # `preparation/switzerland/land_use/coefs/<data_name>.csv`.
         context.create_coefs(learned, data_name)
 
     context.close()

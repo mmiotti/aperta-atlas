@@ -25,7 +25,7 @@ venv/
 ENV/
 
 # Personal scratchspace (kept out of git)
-# src/research: experimental scripts, a separate private git repository
+# src/research: private experimental scripts, not published (not a git repo)
 src/research/
 # src/wctr_paper: figure scripts of the WCTR 2026 paper (papers/bike-times-wctr), not published
 src/wctr_paper/

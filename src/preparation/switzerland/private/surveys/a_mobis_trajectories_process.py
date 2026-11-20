@@ -11,12 +11,12 @@ Reads each `mobis_all/postgres_dump_<i>.gpkg`, drops non-LineString geometries
 a target vertex count, then concatenates all pages and writes a single trajectories
 table.
 
-Inputs (under <DATA_DIR_PRIVATE>/preparation/.../mobis_all/):
+Inputs (PRIVATE, under preparation/switzerland/surveys/mobis_all/):
     postgres_dump_<i>.gpkg              # produced by a_mobis_trajectories_fetch.py
 
-Outputs:
-    mobis_all/trajectories.npy          # PRIVATE — dict of {leg_id: route ndarray}
-    mobis_all/trajectories.csv          # PRIVATE — per-leg metadata (length, sizes)
+Outputs (PRIVATE, under preparation/switzerland/surveys/):
+    mobis_all/trajectories.npy          # dict of {leg_id: route ndarray}
+    mobis_all/trajectories.csv          # per-leg metadata (length, sizes)
 
 Run:
     python -m preparation.switzerland.private.surveys.a_mobis_trajectories_process
@@ -28,9 +28,8 @@ import numpy as np
 import pandas as pd
 import shapely
 
-from aperta import surveys
-from aperta_atlas.context import init_context, Context
-from aperta_atlas.context import Storage
+from aperta import geo_processing
+from aperta_atlas.context import Context, init_context
 
 from preparation.switzerland.private.surveys.common import (
     TARGET_GEOMETRY_SIZE,
@@ -45,7 +44,7 @@ N_PAGES = 12
 def _process_route(geometry: shapely.geometry.LineString, target_size: int,
                    max_size: int) -> dict:
     """Simplify one LineString and return the coordinates + size info."""
-    simplified, new_size, size_ratio = surveys.simplify_geometry(
+    simplified, new_size, size_ratio = geo_processing.simplify_geometry(
         geometry, target_size, max_size,
     )
     x, y = simplified.xy
@@ -57,7 +56,6 @@ def process_page(context: Context, page: int, target_size: int, max_size: int) -
     gdf = context.get_generic(f'mobis_all/postgres_dump_{page}.gpkg')
     gdf.index = gdf.index.astype(int)
     is_linestring = gdf.geometry.apply(lambda g: isinstance(g, shapely.geometry.LineString))
-    gdf['is_linestring'] = is_linestring.astype(int)
     gdf = gdf.rename(columns={'length': 'length_geodb'})
     df_routes = gdf.loc[is_linestring, 'geometry'].apply(
         lambda g: _process_route(g, target_size, max_size)

@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: >-
+  If you use aperta-atlas or the data it produces, please cite the data descriptor below.
+  To cite the code of a specific release, cite its archived Zenodo record.
+type: software
+title: "aperta-atlas: the Aperta Accessibility Atlas pipeline"
+authors:
+  - family-names: Miotti
+    given-names: Marco
+    affiliation: ETH Zurich
+    orcid: "https://orcid.org/0000-0003-4458-6253"
+doi: 10.5281/zenodo.21461294
+repository-code: "https://github.com/mmiotti/aperta-atlas"
+license: MIT
+keywords:
+  - accessibility
+  - transport networks
+  - travel times
+  - calibration
+  - Switzerland
+preferred-citation:
+  type: article
+  title: "Calibrated transport networks and accessibility indicators for Switzerland"
+  authors:
+    - family-names: Miotti
+      given-names: Marco
+      orcid: "https://orcid.org/0000-0003-4458-6253"
+    - family-names: Elvarsson
+      given-names: Arnór
+      orcid: "https://orcid.org/0000-0001-5161-4465"
+    - family-names: Räth
+      given-names: Yves M.
+    - family-names: Hellweg
+      given-names: Stefanie
+  journal: Scientific Data
+  status: submitted
+  year: 2026

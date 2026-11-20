@@ -3,13 +3,11 @@ Per-building population for any area, via dasymetric mapping of the
 GHS-POP 100 m gridded raster (from `population_ghs.py`) onto OSM
 building footprints.
 
-Public, reproducible path for population — complements the restricted-
-access Swiss STATPOP orchestrator (`preparation/switzerland/land_use/
+Complements the Swiss STATPOP orchestrator (`preparation/switzerland/public/land_use/
 population_statpop.py`). Lower fidelity than STATPOP (GHS is modelled,
-STATPOP is observed; GHS lacks age breakdowns) but global coverage and
-zero data-access restrictions. For Swiss-only analyses with STATPOP
-access, prefer STATPOP. For cross-border buffer regions or non-Swiss
-cases, this is the path that works.
+STATPOP is observed; GHS lacks age breakdowns) but global coverage. Within
+Switzerland, prefer STATPOP; for cross-border buffer regions or non-Swiss
+areas, this is the path that works.
 
 Method:
   1. Load the area's clipped GHS-POP raster (Mollweide, 100 m).
@@ -35,6 +33,8 @@ Outputs (PUBLIC, under preparation/world/land_use/):
     properties/buildings_population_<area_name>.csv
         # indexed by building_id (OSM way ID); single column
         # `population_total`. Join with shapes/buildings_<area_name>.gpkg.
+    coefs/population_ghs_intensities_<area_name>.csv
+        # learned per-OSM-tag intensities
 
 Run all variants sequentially (default):
     python -m preparation.world.land_use.population_per_building_from_ghs
@@ -84,16 +84,9 @@ def _raster_to_cells(raster_path: str) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
     from shapely.geometry import box
 
     with rasterio.open(raster_path) as src:
-        data = src.read(1)
-        transform = src.transform
-        crs = src.crs
-        nodata = src.nodata
-
-    # Mask: pixels with positive population (and not no-data).
-    if nodata is not None:
-        mask = (data != nodata) & (data > 0)
-    else:
-        mask = data > 0
+        data, transform, crs, nodata = src.read(1), src.transform, src.crs, src.nodata
+    # Pixels with positive population (and not no-data).
+    mask = data > 0 if nodata is None else (data != nodata) & (data > 0)
     rows, cols = np.where(mask)
     values = data[rows, cols].astype(float)
 
@@ -135,8 +128,6 @@ def main(variant) -> None:
         logging.info(f"  → {len(buildings):,} buildings loaded")
 
     with step('load GHS-POP raster + extract non-zero pixels'):
-        # `population_ghs.py` writes its output to
-        # `preparation/world/land_use/population_<area_name>.tif`.
         raster_path = context.path_for(Storage.PUBLIC, f'population_{variant.area_name}.tif')
         cells, cell_totals = _raster_to_cells(raster_path)
         logging.info(
@@ -175,9 +166,8 @@ def main(variant) -> None:
             f"residents across {len(out):,} buildings "
             f"({(out['population_total'] > 0).sum():,} with non-zero)")
 
-    data_name = f'population_{variant.area_name}'
-    props = out[['population_total']].copy()
-    context.create_properties(props, data_name=data_name)
+    context.create_properties(out[['population_total']].copy(),
+                              data_name=f'population_{variant.area_name}')
     context.create_coefs(learned, f'population_ghs_intensities_{variant.area_name}')
     context.close()
 

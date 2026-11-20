@@ -59,6 +59,11 @@ legs.csv — no row removals from these flags):
                                     artifacts + alpine trips in one flag
     is_land_based                — mode ∉ {plane, boat, aerialway}
                                     (both surveys)
+    is_daylight, is_late_night,  — conditions at departure, not quality
+    season                          flags: sun above civil twilight at
+                                    the origin; 00:00-04:59 (little
+                                    public transport); meteorological
+                                    season (`attach_daylight_and_season`)
     include_in_route_matching    — has usable route geometry
 
 A person-level cascade is INTENTIONALLY NOT pre-computed. Cascade rules
@@ -71,26 +76,15 @@ Row REMOVALS (before flagging) — separate concern, applied by the two
 `b_*_process.py` scripts:
 
     MOBIS: cohort filter (`--variant pre_covid` OR `--variant covid`)
-    MZMV:  age filter (drops `sd_ordinal_age == 'leq6'` respondents)
+    MZMV:  age filter (drops respondents aged 6 or younger)
 
 Downstream compositions are documented at the consumer, not enforced
-here. Typical shapes:
+here (canonical example: `_apply_survey_gates` in `main/04_edge_weights.py`).
+Person-level statistics, dropping persons with any invalid trip:
 
-    # Edge-weight calibration training:
-    is_valid_domestic_trip & is_within_speed_envelope
-                           & is_within_detour_envelope
-                           & mode ∈ {training modes}
-
-    # Mode-choice model training:
-    is_valid_domestic_trip & mode ∈ {mode-choice alternatives incl. transit}
-
-    # Person-level statistics (drop persons with any invalid trip):
     bad = person_has_any_bad_trip(legs, person_col='participant_id',
         exclude_masks={'invalid': legs['is_valid_dist_time'] == 0})
     person_stats = legs[~bad].groupby(...).agg(...)
-
-The 04-side `_apply_survey_gates` in `main/04_edge_weights.py` is the
-canonical example of composing trip-quality gates.
 """
 
 import logging
@@ -132,6 +126,64 @@ def attach_hour_flags(legs: pd.DataFrame) -> None:
     )
 
 
+def solar_altitude_deg(utc: pd.Series, lat: pd.Series, lon: pd.Series) -> np.ndarray:
+    """Altitude of the sun's centre above the horizon (degrees, without refraction) at the
+    UTC times `utc` (tz-aware) and WGS84 `lat` / `lon`. NOAA's approximation (Spencer's
+    series; error about 0.1°, i.e. well under a minute of time). NaN where an input is
+    missing."""
+    doy = utc.dt.dayofyear.to_numpy(dtype=float)
+    hours = (utc.dt.hour + utc.dt.minute / 60 + utc.dt.second / 3600).to_numpy(dtype=float)
+    g = 2 * np.pi / 365 * (doy - 1 + (hours - 12) / 24)            # fractional year (rad)
+    eq_time = 229.18 * (0.000075 + 0.001868 * np.cos(g) - 0.032077 * np.sin(g)
+                        - 0.014615 * np.cos(2 * g) - 0.040849 * np.sin(2 * g))   # minutes
+    decl = (0.006918 - 0.399912 * np.cos(g) + 0.070257 * np.sin(g)
+            - 0.006758 * np.cos(2 * g) + 0.000907 * np.sin(2 * g)
+            - 0.002697 * np.cos(3 * g) + 0.00148 * np.sin(3 * g))  # declination (rad)
+    solar_min = hours * 60 + eq_time + 4 * np.asarray(lon, dtype=float)   # true solar time
+    hour_angle = np.radians(solar_min / 4 - 180)
+    lat_r = np.radians(np.asarray(lat, dtype=float))
+    sin_alt = (np.sin(lat_r) * np.sin(decl)
+               + np.cos(lat_r) * np.cos(decl) * np.cos(hour_angle))
+    return np.degrees(np.arcsin(np.clip(sin_alt, -1.0, 1.0)))
+
+
+def attach_daylight_and_season(
+    legs: pd.DataFrame,
+    *,
+    timezone: str = 'Europe/Zurich',
+    twilight_deg: float = common.CIVIL_TWILIGHT_DEG,
+    late_night_hours: tuple[int, ...] = common.LATE_NIGHT_HOURS,
+) -> None:
+    """Set `is_daylight`, `is_late_night` and `season` in place, from each leg's departure:
+
+      - `is_daylight`: 1 if the sun is above `twilight_deg` (civil twilight) at the origin at
+        departure, 0 between civil dusk and civil dawn;
+      - `is_late_night`: 1 for departures in `late_night_hours` (00:00-04:59 local time), when
+        public transport mostly doesn't run;
+      - `season`: meteorological season of the departure date (`common.SEASON_BY_MONTH`).
+
+    Unknown departure time or origin → empty. Independent of the traffic profiles
+    (`attach_hour_flags`). Requires `datetime_departure` (local clock time, tz-naive) and
+    `orig_lat` / `orig_lon`.
+    """
+    dep = pd.to_datetime(legs['datetime_departure'])
+    # Local clock → UTC. In the hour repeated when DST ends, take the summer-time reading
+    # (it is dark either way); clock times skipped when DST starts move forward.
+    utc = dep.dt.tz_localize(timezone, ambiguous=np.ones(len(dep), dtype=bool),
+                             nonexistent='shift_forward').dt.tz_convert('UTC')
+    altitude = solar_altitude_deg(utc, legs['orig_lat'], legs['orig_lon'])
+    daylight = np.where(np.isfinite(altitude), (altitude > twilight_deg).astype(float), np.nan)
+    legs['is_daylight'] = pd.Series(daylight, index=legs.index).astype('Int64')
+    legs['is_late_night'] = (dep.dt.hour.isin(late_night_hours).astype(float)
+                             .where(dep.notna()).astype('Int64'))
+    legs['season'] = dep.dt.month.map(common.SEASON_BY_MONTH)
+    logging.info(
+        f"  Daylight (sun above {twilight_deg:g}°): {legs['is_daylight'].mean() * 100:.1f}% "
+        f"of legs with a departure time; 00:00-0{max(late_night_hours) + 1}:00: "
+        f"{legs['is_late_night'].mean() * 100:.1f}%; seasons: "
+        f"{legs['season'].value_counts(normalize=True).round(3).to_dict()}")
+
+
 def attach_lat_lon_and_dist_line(
     legs: pd.DataFrame,
     crs_main: str = CRS_CH,
@@ -142,8 +194,7 @@ def attach_lat_lon_and_dist_line(
     `orig_x/orig_y/dest_x/dest_y` in `crs_main`."""
     legs = common.add_lat_lon(legs, 'orig', crs_main, crs_latlon)
     legs = common.add_lat_lon(legs, 'dest', crs_main, crs_latlon)
-    legs = data_processing.add_straight_line_dist(legs)
-    return legs
+    return data_processing.add_straight_line_dist(legs)
 
 
 def attach_endpoint_elevation(
@@ -159,11 +210,6 @@ def attach_endpoint_elevation(
     (as produced by `attach_lat_lon_and_dist_line`). The DEM at
     `dem_path` must be a single-band raster in WGS84 (matches the
     convention set by `preparation/world/elevation/elevation_dem.py`).
-
-    Downstream can compose (e.g. `elev_net = elev_dest - elev_orig`
-    for net climb/descent). The `is_within_elevation_band` gate for
-    quality + alpine exclusion is written separately by
-    `attach_within_elevation_band_flag`.
     """
     for side in ('orig', 'dest'):
         points = gpd.GeoDataFrame(
@@ -200,16 +246,10 @@ def attach_within_elevation_band_flag(
         hikers (person-fitness confound) — leaving them out gives
         cleaner edge-weight, overhead, and utility coefficients.
 
-    Consumed by `main/04_edge_weights.py`, `main/07a_road_overhead_coefs.py`,
-    and `survey/02d_prepare_survey_legs.py` (which propagates the
-    filter to any downstream reading `survey_legs.csv`, e.g. 09a/09b).
-
     Requires `elev_orig` and `elev_dest` on `legs` (written by
     `attach_endpoint_elevation`). Defaults calibrated for Swiss data
     (max_m=1000 covers the mid-plateau + foothills but drops the Alps).
-
-    NaN handling: `skipna=False` on min/max so NaN endpoints propagate
-    to False (drop the trip). A single missing endpoint disqualifies.
+    A single missing endpoint disqualifies.
     """
     if not {'elev_orig', 'elev_dest'}.issubset(legs.columns):
         raise ValueError(
@@ -243,16 +283,7 @@ def attach_validity_flags(
         'is_plausible'         — (MOBIS only) `implausible` field False
 
     The composite `is_valid_domestic_trip` is the AND of every
-    per-reason flag. "Domestic" makes the scope explicit — the flag
-    fires only for trips within Switzerland with no data-quality
-    issues. Downstream analyses that want a broader scope (e.g.
-    including foreign trips for person-level counts) compose the
-    per-reason flags directly.
-
-    Mode filtering is INTENTIONALLY not part of any of these flags —
-    consumers filter `mode_simplified` inline against whatever mode set
-    they care about (edge-weight training, mode-choice training, person
-    stats).
+    per-reason flag (see the module docstring for scope and mode filtering).
 
     Log line per reason: rows this filter excludes on top of the earlier
     ones (order-dependent; the counts sum to the total excluded).
@@ -292,6 +323,35 @@ def filter_columns_by_prefix(
     return legs[cols]
 
 
+def speed_envelope_sides(
+    legs: pd.DataFrame,
+    *,
+    envelopes: dict[str, tuple[float, float]] = SPEED_ENVELOPES_KMH,
+    rounded_reports: bool = False,
+) -> tuple[pd.Series, pd.Series]:
+    """`(too_slow, too_fast)` per leg: even the fastest speed the leg can stand for is below
+    its mode's envelope, or even the slowest above it (`rounded_reports`: see
+    `attach_speed_envelope_flag`). False for modes not in `envelopes` and for missing
+    values."""
+    if rounded_reports:
+        exact_lo, exact_hi, rounded_lo, rounded_hi, on_step = report_intervals(
+            legs['time_measured'].to_numpy(dtype=float))
+        # On a 5-min step the rounded interval contains the exact one.
+        t_lo = np.where(on_step, rounded_lo, exact_lo)
+        t_hi = np.where(on_step, rounded_hi, exact_hi)
+        dist_km = legs['dist_measured'].to_numpy(dtype=float) / 1_000.0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            slowest = pd.Series(dist_km / (t_hi / 3_600.0), index=legs.index)
+            fastest = pd.Series(np.where(t_lo > 0, dist_km / (t_lo / 3_600.0), np.inf),
+                                index=legs.index)
+    else:
+        slowest = fastest = legs['speed_kmh']
+    mode = legs['mode_simplified']
+    lo = mode.map({m: bounds[0] for m, bounds in envelopes.items()})
+    hi = mode.map({m: bounds[1] for m, bounds in envelopes.items()})
+    return fastest < lo, slowest > hi
+
+
 def attach_speed_envelope_flag(
     legs: pd.DataFrame,
     *,
@@ -321,31 +381,12 @@ def attach_speed_envelope_flag(
     default: `speed_kmh` as is) for precise GPS-tracked surveys like
     MOBIS.
 
-    Absolute trip-length filtering is intentionally NOT part of this
-    flag — it's the CONSUMER's per-mode concern (e.g. the per-profile
-    `min_trip_distance` in `04_edge_weights.py`).
-
     Logs per-mode: pre-envelope n, min/max/mean/median observed
     speed, envelope bounds, and out-of-envelope count + rate.
-
-    Downstream: leaves `is_valid_domestic_trip` unchanged — consumers filter
-    on this flag independently (see `04_edge_weights.py`).
     """
     exclude = pd.Series(False, index=legs.index)
-
-    if rounded_reports:
-        exact_lo, exact_hi, rounded_lo, rounded_hi, on_step = report_intervals(
-            legs['time_measured'].to_numpy(dtype=float))
-        # On a 5-min step the rounded interval contains the exact one.
-        t_lo = np.where(on_step, rounded_lo, exact_lo)
-        t_hi = np.where(on_step, rounded_hi, exact_hi)
-        dist_km = legs['dist_measured'].to_numpy(dtype=float) / 1_000.0
-        with np.errstate(divide='ignore', invalid='ignore'):
-            slowest = pd.Series(dist_km / (t_hi / 3_600.0), index=legs.index)
-            fastest = pd.Series(np.where(t_lo > 0, dist_km / (t_lo / 3_600.0), np.inf),
-                                index=legs.index)
-    else:
-        slowest = fastest = legs['speed_kmh']
+    too_slow, too_fast = speed_envelope_sides(
+        legs, envelopes=envelopes, rounded_reports=rounded_reports)
     rounding_note = " (tolerant to rounded reports)" if rounded_reports else ""
     for mode, (lo, hi) in envelopes.items():
         in_mode = legs['mode_simplified'] == mode
@@ -356,8 +397,8 @@ def attach_speed_envelope_flag(
         s_min, s_max = float(speeds.min()), float(speeds.max())
         s_mean, s_med = float(speeds.mean()), float(speeds.median())
 
-        over_upper = in_mode & (slowest > hi)
-        under_lower = in_mode & (fastest < lo)
+        over_upper = in_mode & too_fast
+        under_lower = in_mode & too_slow
         bad_env = over_upper | under_lower
         n_over = int(over_upper.sum())
         n_under = int(under_lower.sum())
@@ -388,14 +429,8 @@ def attach_within_detour_envelope_flag(
 
     The flag captures "route length is within a plausible detour ratio
     of the OD straight-line". A leg passes iff
-    `dist_measured / dist_line <= max_ratios[mode_simplified]`.
-
-    Catches legs where the person made stops / errands along the way
-    (self-reported `dist_measured` reflects the full walked/biked/driven
-    path, not the OD-relevant distance) OR where the survey routed the
-    leg via an implausibly long detour. Both cases would poison
-    per-mode edge-weight calibration in `04_edge_weights.py` by
-    inflating the observed time-per-metre ratio.
+    `dist_measured / dist_line <= max_ratios[mode_simplified]`
+    (see `common.MAX_DETOUR_RATIO`).
 
     Requires `mode_simplified`, `dist_measured`, `dist_line` on `legs`.
     Modes not in `max_ratios` (transit, etc.) are treated as

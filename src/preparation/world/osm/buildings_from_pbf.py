@@ -1,16 +1,9 @@
 """
 Stream OSM building footprints from a locally clipped PBF.
 
-Independent of the network preparation chain; only depends on
-`clip_pbf.py`'s output. Mirrors `obstacles_from_pbf.py` and
-`pois_from_pbf.py` in structure (pyosmium streaming handler,
-per-area variants, GeoDataFrame output).
-
-Used as the building-side input for `preparation/switzerland/land_use/
-employment_dasymetric.py` (and future EU equivalents). The OSM `building`
-tag value is preserved verbatim so the dasymetric mapping can apply its
-per-tag × per-sector coefficient priors (`aperta_atlas.dasymetric.
-DEFAULT_COEFFS`).
+Input to the dasymetric population and employment mapping (`preparation/{switzerland,world}/
+.../land_use/`) and to `main/01_cells_zones.py`. The OSM `building` tag is kept verbatim
+for the per-tag intensities.
 
 What's emitted:
 
@@ -20,19 +13,12 @@ What's emitted:
     (`< _MIN_FOOTPRINT_M2`) are filtered out — these are typically
     tagging noise (1-2 m² roofs, sheds with no real employment role).
 
-  - **Relations are not handled** (multipolygon buildings with holes /
-    multiple outer rings). At Swiss scope these are <0.5 % of all
-    `building=*` features and don't materially affect the dasymetric
-    mapping. Revisit if a category looks short.
+  - **Multipolygon relations with `building=*`** (courtyard blocks,
+    campuses, hospitals: buildings with holes or several outer rings):
+    the assembled MultiPolygon (`area` callback), with the NEGATIVE
+    relation id as `building_id` so it cannot collide with a way id.
 
-The `area_m2` column is computed in a local UTM (auto-picked) so the
-downstream dasymetric mapping has a metric area per building without
-needing to reproject the whole GeoDataFrame again. Polygons are
-Douglas-Peucker-simplified at `_SIMPLIFY_TOLERANCE_M` (0.5 m) in the
-same metric CRS to shrink disk size + RAM without measurably changing
-area.
-
-Cases are defined in `preparation/world/areas.py`; this script registers
+Areas are defined in `preparation/world/areas.py`; this script registers
 one `<area_name>_buildings` variant per area.
 
 Inputs (PUBLIC, under raw/global/osm/):
@@ -40,36 +26,35 @@ Inputs (PUBLIC, under raw/global/osm/):
 
 Outputs (PUBLIC, under preparation/world/osm/):
     shapes/buildings_<area_name>.gpkg     # polygon features, WGS84
-        # index: building_id (OSM way ID values)
+        # index: building_id (OSM way ID; minus the relation ID for
+        # multipolygon relations)
         # columns: building (OSM tag), area_m2, geometry
         # downstream property files are written by orchestrators to
         # properties/buildings_<data_name>.csv and join on building_id.
-
-Requires `osmium-tool` (CLI) AND `pyosmium` (Python).
-
-Run after `clip_pbf.py`.
 
 Run all variants sequentially (default):
     python -m preparation.world.osm.buildings_from_pbf
 Single variant:
     python -m preparation.world.osm.buildings_from_pbf --variant switzerland_buildings
-    python -m preparation.world.osm.buildings_from_pbf --variant bern_buildings
+    python -m preparation.world.osm.buildings_from_pbf --variant bern-metro_buildings
 """
 
 import logging
+from collections import Counter
 
 import geopandas as gpd
 import osmium
 import osmnx as ox
 import pandas as pd
 from shapely.geometry import Polygon
+from shapely.geometry.base import BaseGeometry
 
 from aperta_atlas.context import init_context
 from aperta_atlas.utils import step
 from aperta_atlas.variant import Variants
 
 from preparation.world.areas import AREAS, widest_buffer
-from preparation.world.osm.common import clipped_pbf
+from preparation.world.osm.common import area_multipolygon, clipped_pbf
 
 
 # Buildings smaller than this (in m²) are filtered out — typically
@@ -88,7 +73,7 @@ _SIMPLIFY_TOLERANCE_M = 0.5
 
 # Buffer is the widest per-mode buffer for the area — covers any
 # network's accessibility radius without proliferating per-mode building
-# files. Output: `<area_name>_buildings.gpkg` per area.
+# files.
 variants = Variants([
     ('place', str), ('area_name', str), ('pbf_name', str), ('buffer', int),
 ])
@@ -104,10 +89,10 @@ for area in AREAS.values():
 class BuildingHandler(osmium.SimpleHandler):
     """Streaming pyosmium handler that collects OSM building footprints.
 
-    Only closed ways carrying the `building=*` tag are emitted (as
-    Polygons). Point-tagged buildings (uncommon, no footprint geometry)
-    and multipolygon relations (rare, would require relation handling)
-    are skipped.
+    Closed ways carrying the `building=*` tag are emitted as Polygons,
+    multipolygon relations with `building=*` as MultiPolygons (id: minus
+    the relation id). Point-tagged buildings (uncommon, no footprint
+    geometry) are skipped.
 
     `locations=True` (passed to `apply_file`) is required so way nodes
     have resolved coordinates for polygon construction.
@@ -115,9 +100,8 @@ class BuildingHandler(osmium.SimpleHandler):
 
     def __init__(self) -> None:
         super().__init__()
-        # (osm_id, building_tag, coords_list). Coords are (lon, lat)
-        # tuples in WGS84.
-        self.features: list[tuple[int, str, list[tuple[float, float]]]] = []
+        # (building_id, building_tag, geometry in WGS84 lon / lat).
+        self.features: list[tuple[int, str, BaseGeometry]] = []
 
     def way(self, w) -> None:
         building = w.tags.get('building')
@@ -129,14 +113,30 @@ class BuildingHandler(osmium.SimpleHandler):
         # form a valid polygon ring. Skip degenerate cases.
         if len(coords) < 4 or coords[0] != coords[-1]:
             return
-        self.features.append((w.id, building, coords))
+        self.features.append((w.id, building, Polygon(coords)))
+
+    def area(self, a) -> None:
+        # Multipolygon relations only: closed ways also arrive here, but `way` has
+        # them already.
+        if a.from_way():
+            return
+        building = a.tags.get('building')
+        if building is None:
+            return
+        geometry = area_multipolygon(a)
+        if geometry is not None:
+            self.features.append((-a.orig_id(), building, geometry))
 
 
-def features_to_gdf(features: list[tuple[int, str, list[tuple[float, float]]]]) -> gpd.GeoDataFrame:
+def _n_exterior_vertices(geoms) -> int:
+    return int(sum(len(g.exterior.coords) if hasattr(g, 'exterior') else 0 for g in geoms))
+
+
+def features_to_gdf(features: list[tuple[int, str, BaseGeometry]]) -> gpd.GeoDataFrame:
     """Build a WGS84 GeoDataFrame of building polygons + their tags.
 
-    Index is `building_id` (OSM way ID values — globally unique +
-    stable across PBF refreshes, so property files written by
+    Index is `building_id` (OSM way ID, or minus the relation ID for
+    multipolygon relations — unique + stable across PBF refreshes, so property files written by
     downstream orchestrators can be joined back without going stale on
     re-extraction).
 
@@ -146,7 +146,7 @@ def features_to_gdf(features: list[tuple[int, str, list[tuple[float, float]]]]) 
     `tolerance` is in meters; once-each round-trip projection
     amortises across all later steps.
     """
-    polygons = [Polygon(coords) for _, _, coords in features]
+    polygons = [geometry for _, _, geometry in features]
     osm_ids = [osm_id for osm_id, _, _ in features]
     tags = [tag for _, tag, _ in features]
     gdf = gpd.GeoDataFrame(
@@ -188,18 +188,13 @@ def features_to_gdf(features: list[tuple[int, str, list[tuple[float, float]]]]) 
     # Douglas-Peucker simplify in metric, project back to WGS84.
     simplified_metric = metric_gdf.geometry.simplify(
         tolerance=_SIMPLIFY_TOLERANCE_M, preserve_topology=True)
-    n_before_simplify = int(sum(
-        len(g.exterior.coords) if hasattr(g, 'exterior') else 0
-        for g in metric_gdf.geometry))
-    n_after_simplify = int(sum(
-        len(g.exterior.coords) if hasattr(g, 'exterior') else 0
-        for g in simplified_metric))
+    n_before_simplify = _n_exterior_vertices(metric_gdf.geometry)
+    n_after_simplify = _n_exterior_vertices(simplified_metric)
     logging.info(
         f"  → DP simplify (tol={_SIMPLIFY_TOLERANCE_M} m): "
         f"{n_before_simplify:,} → {n_after_simplify:,} exterior vertices "
         f"({(n_before_simplify-n_after_simplify)/n_before_simplify*100:.0f} % reduction)")
-    simplified_wgs84 = gpd.GeoSeries(simplified_metric, crs=metric_gdf.crs).to_crs('EPSG:4326')
-    gdf['geometry'] = simplified_wgs84.values
+    gdf['geometry'] = simplified_metric.to_crs('EPSG:4326').values
 
     return gdf[['building', 'area_m2', 'geometry']]
 
@@ -208,17 +203,14 @@ def main(variant) -> None:
     context = init_context(variant)
     out_name = f'{variant.area_name}_buildings'
 
-    with clipped_pbf(context, variant, out_name) as pbf_path:
+    with clipped_pbf(context, variant, out_name) as (pbf_path, _):
         with step('stream parse (pyosmium handler)'):
             handler = BuildingHandler()
             handler.apply_file(pbf_path, locations=True)
-        # Top-10 building tag summary so the downstream dasymetric step
-        # has a known baseline to compare against.
-        from collections import Counter
         tag_counts = Counter(b for _, b, _ in handler.features)
         n_features = len(handler.features)
         logging.info(
-            f"  → collected {n_features:,} closed-way buildings "
+            f"  → collected {n_features:,} buildings "
             f"across {len(tag_counts)} distinct `building=*` tags")
         for tag, count in tag_counts.most_common(10):
             logging.info(f"      {tag}: {count:,}")

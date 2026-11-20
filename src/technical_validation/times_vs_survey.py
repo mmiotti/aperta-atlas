@@ -1,12 +1,12 @@
 """
-Compare atlas-predicted per-leg travel TIMES and DISTANCES against
+Compare atlas-predicted travel TIMES and DISTANCES per leg or trip against
 measured values from a survey leg set.
 
 One variant per leg set (`main.common.SURVEY_LEG_SETS`, prepared by
 survey/02d → 05 → 08a):
-  - `mtmc` (default): MZMV 2015 + 2021 self-reported legs. In-sample for
-    walk + bike edge weights, road + transit overheads and utilities.
-    Times are 5-min-rounded.
+  - `mtmc` (default): MZMV 2015 + 2021 self-reported trips, door to door
+    (the trip set, `main.common.TRIP_SET`). In-sample for road + transit
+    overheads and utilities. Times are 5-min-rounded.
   - `mobis_precovid`: 100k-leg sample of MOBIS GPS-tracked legs, normal
     traffic regime. In-sample for car edge weights (car's training
     cohort); out-of-sample for walk and bike. GPS times aren't
@@ -24,6 +24,10 @@ the two.
 
 Car legs additionally get `car@peak` / `car@base` / `car@night` rows, split by
 `peak_str` — the same label that picks each leg's car profile in 05, 04 and 08a.
+MTMC car trips also get one `time` row per `_CAR_TRIP_SUBSETS` (trips without walking legs,
+drivers, trips with at most 1 min unexplained time) and one
+for trips in all of them: how much of the gap between trip- and leg-level agreement each
+accounts for.
 
 For each leg, `05_leg_times` + `08a_add_leg_overheads` produce a routed
 time + per-endpoint overheads for the leg's actual chosen mode. Sum →
@@ -43,14 +47,13 @@ model predicts EXPECTED time; individual leg residuals are noise around
 an unbiased signal, not signal error.
 
 Leg selection: each leg set is compared on the legs of the calibration step
-it checks, selected as that step selects them (04's survey gates, AOI, and
-the step's per-mode distance range and detour cap), so that the in-sample
+it checks, selected as that step selects them, so that the in-sample
 comparisons are one-to-one with the fits:
-  - `mtmc` → the road trip overheads (07a; door-to-door `time`), restricted
-    to single-leg trips, whose reported time is door to door (07a also fits
-    the legs of multi-leg trips, with an indicator).
-  - MOBIS leg sets → the edge weights (04; `net_time`), including 04's
-    snap-distance limit.
+  - `mtmc` → the road trip overheads (07a; door-to-door `time`), on the
+    trip set 07a fits on: the plausible trips (`TRIP_QUALITY_FLAGS`) in the
+    AOI, within each profile's distance range.
+  - MOBIS leg sets → the edge weights (04; `net_time`): 04's survey gates,
+    AOI, per-mode distance range, detour cap, and snap-distance limit.
 Out-of-sample rows (e-bikes, MOBIS walking, `anybike`) use the selection of
 the network they are routed on (bike for e-bikes).
 
@@ -65,32 +68,21 @@ WCTR paper report plus some context:
     set). Walking (~99 % of legs < 2 km) and the car time-of-day rows are
     `ALL` only.
 
-Columns:
-  - n             — legs contributing
-  - bias          — `mean(predicted − measured)`; ≈ 0 if unbiased.
-                    Positive = model OVER-predicts; negative = UNDER-predicts.
-                    In seconds for `time`, metres for `dist`.
-  - bias%         — bias as a percentage of the mean measured value
-  - med_resid     — `median(predicted − measured)`: where the typical leg lies
-                    relative to the prediction (the fits target the mean, so
-                    a right-skewed tail of long legs puts it above 0)
-  - med_resid%    — med_resid as a percentage of the median measured value
-  - R²_1to1       — R² relative to the 1:1 line, `1 − SS_res / SS_tot` (same
-                    as 04's calibration log): do the values agree? Penalises
-                    bias and wrong scale; < 0 = worse than the mean measured value
-  - R²_fit        — R² relative to the best-fit line (= squared Pearson):
-                    agreement up to offset and scale
-  - MAE%          — 100 · MAE / mean(|measured|); WMAPE-style relative
-                    error, robust to per-leg zeros
+Columns (definitions: `technical_validation.common.agreement_stats`; seconds for
+times, metres for `dist`; positive = model over-predicts):
+  - n_legs; bias / bias% (mean residual, % of the mean measured value);
+    med_resid / med_resid% (median residual, % of the median measured value);
+    R²_1to1 (vs the 1:1 line); R²_fit (squared Pearson); MAE% (MAE / mean |measured|)
 
-Inputs (PRIVATE, under `<scenario>/`; `_<leg_set>` suffix for MOBIS):
+Inputs (PRIVATE, under `<scenario>/`; `_<leg_set>` suffix for MOBIS; MTMC:
+the trip set, `survey_trips.csv` / `survey_trip_times.csv` /
+`survey_trip_overheads.csv`):
     generic/survey_legs[_<leg_set>].csv            # from survey/02d
     generic/survey_leg_times[_<leg_set>].csv       # from survey/05
     generic/survey_leg_overheads[_<leg_set>].csv   # from survey/08a
 
-Outputs:
-    RESULTS/times_vs_survey[_<leg_set>].csv        # summary table (mode + strata rows)
-    Logs                                           # summary tables
+Outputs (RESULTS, under `<scenario>/`):
+    technical_validation/times_vs_survey[_<leg_set>].csv   # summary table; also logged
 
 Run (default variant `mtmc`):
     python -m technical_validation.times_vs_survey --scenario <name>
@@ -112,13 +104,17 @@ from aperta_atlas.variant import Variants
 
 from aoi_filter import filter_legs_by_aoi, load_aoi_polygon
 from main.common import (
-    SURVEY_LEG_SETS,
+    MOBIS_LEG_SETS,
+    TRIP_QUALITY_FLAGS,
+    TRIP_SET,
     car_overhead_by_peak,
     car_routed_bias_by_peak,
     survey_file,
 )
 from scenarios import get_scenario
-from technical_validation.common import agreement_stats
+from technical_validation.common import (
+    DIST_BANDS, STATS_FORMATTERS, STATS_RENAME, agreement_stats,
+)
 
 _m04 = importlib.import_module('main.04_edge_weights')
 _m07a = importlib.import_module('main.07a_road_overhead_coefs')
@@ -129,6 +125,14 @@ _m07a = importlib.import_module('main.07a_road_overhead_coefs')
 _FIT_07A = {cfg.sub_modes[0]: cfg for cfg in _m07a._ROAD_CONFIGS}
 _MAX_DETOUR_04 = inspect.signature(
     calibration.calibrate_edge_weights).parameters['max_dist_to_line_ratio'].default
+
+# MTMC car trips without one of the ways a door-to-door trip differs from its car leg (one row
+# each, plus one without any): which of them lowers the trip-level agreement?
+_CAR_TRIP_SUBSETS = {
+    'no walk legs': lambda t: t['n_walk_legs'] == 0,
+    'driver': lambda t: t['mode_is_passenger'] == 0,
+    'unexplained <= 1 min': lambda t: t['time_unexplained'] <= 60,
+}
 
 # Survey mode → (network mode of 04, overhead mode of 07a) whose fit selection its legs follow.
 _FIT_MODES: dict[str, tuple[str, str]] = {
@@ -148,13 +152,9 @@ _PROFILE_NETWORK: dict[str, str] = {
 }
 
 
-# Mode → (routed_profile, overhead_profile) suffixes in survey_leg_times /
-# survey_leg_overheads columns. Car handled separately below: uses
-# peak-aggregated `t_routed_car` + `car_overhead_by_peak(...)`.
-#
-# `anybike` / `anyebike` are MOBIS bike legs of unknown sub-type (before its
-# 2020-07 bike/e-bike split). `anybike` mixes regular and e-bikes (MZMV 2021:
-# ebike25 ≈ 15 % of rbike + ebike25), so a positive bias vs rbike is expected.
+# Mode → (routed, overhead) profile suffixes of the survey_leg_times / survey_leg_overheads
+# columns; car handled separately. `anybike` / `anyebike`: MOBIS legs from before its
+# 2020-07 bike/e-bike split.
 _MODE_TO_PROFILE: dict[str, tuple[str, str]] = {
     'walk':     ('rwalk',       'rwalk'),
     'rbike':    ('rbike',       'rbike'),
@@ -165,29 +165,12 @@ _MODE_TO_PROFILE: dict[str, tuple[str, str]] = {
 }
 
 # Extra (mode, profile) comparisons, reported as mode `<mode>@<profile>`.
-# `anybike` vs the ebike25 prediction brackets the mixture from the fast
-# side: measured times should fall between the rbike and ebike25 rows.
 _BRACKET_ROWS: list[tuple[str, str]] = [('anybike', 'ebike25')]
 
-# Car legs are also reported per time of day (`peak_str`, the label that picks
-# each leg's car profile), as modes `car@peak` / `car@base` / `car@night`.
+# Car rows per time of day (`peak_str`), as modes `car@<time of day>`.
 _CAR_TIMES_OF_DAY: tuple[str, ...] = ('peak', 'base', 'night')
 
-# Distance-line bands (meters) for the mode × band strata. Coarse on
-# purpose: MTMC self-report is 5-min-rounded, so finer bands mostly add
-# rounding noise; shared across leg sets so MTMC and MOBIS rows compare.
-# <2 km and 2-5 km split the short legs, where per-trip overheads weigh most.
-_DIST_BANDS: list[tuple[str, float, float]] = [
-    ('   <2km',       0.0,    2_000.0),
-    ('   2-5km',  2_000.0,    5_000.0),
-    ('  5-25km',  5_000.0,   25_000.0),
-    ('   >25km', 25_000.0,  np.inf),
-]
-
-
-# Modes that get per-band rows in addition to `ALL`. Walk is ALL-only
-# because ~99 % of walk legs are <2 km — long-distance walk strata
-# would be empty or dominated by noise.
+# Modes with distance-band rows (`DIST_BANDS`); walk legs are ~99 % below 2 km.
 _STRATIFIED_MODES: set[str] = {
     'rbike', 'ebike25', 'ebike45', 'anybike', 'anyebike', 'car'}
 
@@ -321,11 +304,7 @@ def _predicted_length(legs: pd.DataFrame, routed: pd.DataFrame,
     mask = legs['mode_simplified'] == 'car'
     if mask.any():
         peak_str = legs.loc[mask, 'peak_str']
-        col_map = {
-            'peak':  'length_car_peak',
-            'base':  'length_car_base',
-            'night': 'length_car_night',
-        }
+        col_map = {t: f'length_car_{t}' for t in _CAR_TIMES_OF_DAY}
         missing = [c for c in col_map.values() if c not in routed.columns]
         if missing:
             logging.warning(f"  ⚠ car length column(s) missing {missing}; "
@@ -349,9 +328,6 @@ def _comparison_rows(legs: pd.DataFrame, routed: pd.DataFrame, overhead: pd.Data
     quantity × band) for `quantities`. `mode_suffix` is appended to the
     reported mode (e.g. `@ebike25` for a bracketing comparison); `banded=False`
     reports `ALL` rows only."""
-    def label_of(mode: str) -> str:
-        return f'{mode}{mode_suffix}'
-
     rows: list[dict] = []
     with step('assemble predicted gross times + routed lengths per leg'):
         pred_time = _predicted_gross(legs, routed, overhead, profiles)
@@ -368,9 +344,6 @@ def _comparison_rows(legs: pd.DataFrame, routed: pd.DataFrame, overhead: pd.Data
                      f"{n_dist:,} with finite predicted+measured distance")
 
     with step('compute per-mode stats (ALL + coarse distance bands)'):
-        # Naive-baseline times (05's t_baseline_<profile>, no overheads) vs
-        # measured: gap between 'time' and 'baseline_time' rows quantifies
-        # the payoff of the calibrated model over speed-limit-only routing.
         dist_line_m = legs['dist_line'].astype(float)
         for quantity, meas, pred in (
             ('time',          meas_time, pred_time),
@@ -382,53 +355,45 @@ def _comparison_rows(legs: pd.DataFrame, routed: pd.DataFrame, overhead: pd.Data
                 continue
             both = pred.notna() & meas.notna() & (meas > 0)
             for mode in sorted(legs.loc[both, 'mode_simplified'].unique()):
-                mmask_all = both & (legs['mode_simplified'] == mode)
-                rows.append({
-                    'mode': label_of(mode), 'quantity': quantity, 'band': 'ALL',
-                    **agreement_stats(meas.loc[mmask_all].to_numpy(dtype=float),
-                             pred.loc[mmask_all].to_numpy(dtype=float))})
-                if not banded or quantity == 'dist' or mode not in _STRATIFIED_MODES:
-                    continue
-                for label, lo, hi in _DIST_BANDS:
-                    bmask = (dist_line_m >= lo) & (dist_line_m < hi)
-                    mmask = mmask_all & bmask
-                    if not mmask.any():
-                        continue
-                    rows.append({
-                        'mode': label_of(mode), 'quantity': quantity, 'band': label,
-                        **agreement_stats(meas.loc[mmask].to_numpy(dtype=float),
-                                 pred.loc[mmask].to_numpy(dtype=float))})
+                in_mode = both & (legs['mode_simplified'] == mode)
+                bands = [('ALL', in_mode)]
+                if banded and quantity != 'dist' and mode in _STRATIFIED_MODES:
+                    bands += [(label, in_mode & (dist_line_m >= lo) & (dist_line_m < hi))
+                              for label, lo, hi in DIST_BANDS]
+                for band, m in bands:
+                    if m.any():
+                        rows.append({
+                            'mode': f'{mode}{mode_suffix}', 'quantity': quantity, 'band': band,
+                            **agreement_stats(meas.loc[m].to_numpy(dtype=float),
+                                              pred.loc[m].to_numpy(dtype=float))})
 
     return rows
 
 
 def _fit_legs(context, legs: pd.DataFrame, leg_set: str) -> pd.Series:
-    """Legs of the calibration step `leg_set` checks, selected as that step
-    selects them: 07a's overhead fit for `mtmc` (single-leg trips only), 04's
-    edge-weight fit for the MOBIS leg sets (see the module docstring)."""
+    """Legs (MTMC: trips) of the calibration step `leg_set` checks, selected as
+    that step selects them: 07a's overhead fit for `mtmc`, 04's edge-weight fit
+    for the MOBIS leg sets (see the module docstring)."""
     scenario = get_scenario(context.scenario)
-    gated = legs.index.isin(_m04._apply_survey_gates(legs).index)
     in_aoi = legs.index.isin(filter_legs_by_aoi(
         legs, load_aoi_polygon(context), crs=scenario.crs_main, label='validation legs').index)
-    detour = legs['dist_measured'] / legs['dist_line']
     keep = pd.Series(False, index=legs.index)
-    for smode, (nmode, ov_mode) in _FIT_MODES.items():
-        sel = legs['mode_simplified'] == smode
-        if leg_set == 'mtmc':
-            cfg = _FIT_07A[ov_mode]
-            sel &= ((legs['dist_line'] >= cfg.min_trip_distance)
-                    & (legs['dist_line'] <= cfg.max_trip_distance)
-                    & (detour < cfg.max_dist_measured_ratio))
-        else:
-            cfg = _m04._profile_config(nmode, scenario)
-            sel &= ((legs['dist_line'] > cfg.min_trip_distance)
-                    & (legs['dist_line'] <= cfg.max_trip_distance)
-                    & (detour < _MAX_DETOUR_04)
-                    & (legs[f'orig_snap_dist_{nmode}'] <= cfg.max_snap_distance)
-                    & (legs[f'dest_snap_dist_{nmode}'] <= cfg.max_snap_distance))
-        keep |= sel
     if leg_set == 'mtmc':
-        keep &= legs['n_legs_in_trip'] == 1
+        # As 07a: the plausible trips (`_load_survey_data`) within the profile's range.
+        for smode, (_, ov_mode) in _FIT_MODES.items():
+            keep |= ((legs['mode_simplified'] == smode)
+                     & (legs['dist_line'] <= _FIT_07A[ov_mode].max_trip_distance))
+        return keep & legs[list(TRIP_QUALITY_FLAGS)].eq(1).all(axis=1) & in_aoi
+    gated = legs.index.isin(_m04._apply_survey_gates(legs).index)
+    detour = legs['dist_measured'] / legs['dist_line']
+    for smode, (nmode, _) in _FIT_MODES.items():
+        cfg = _m04._profile_config(nmode, scenario)
+        keep |= ((legs['mode_simplified'] == smode)
+                 & (legs['dist_line'] > cfg.min_trip_distance)
+                 & (legs['dist_line'] <= cfg.max_trip_distance)
+                 & (detour < _MAX_DETOUR_04)
+                 & (legs[f'orig_snap_dist_{nmode}'] <= cfg.max_snap_distance)
+                 & (legs[f'dest_snap_dist_{nmode}'] <= cfg.max_snap_distance))
     return keep & gated & in_aoi
 
 
@@ -436,23 +401,23 @@ def main(variant):
     context = init_context(variant)
     leg_set = variant.leg_set
 
-    with step(f'load survey_legs + survey_leg_times + survey_leg_overheads ({leg_set})'):
+    # MTMC is compared on the door-to-door trips that 07a fits on.
+    file_set = TRIP_SET if leg_set == 'mtmc' else leg_set
+    with step(f'load survey legs / trips + times + overheads ({file_set})'):
         legs = context.get_generic(
-            survey_file('survey_legs.csv', leg_set), storage=Storage.PRIVATE)
+            survey_file('survey_legs.csv', file_set), storage=Storage.PRIVATE)
         routed = context.get_generic(
-            survey_file('survey_leg_times.csv', leg_set), storage=Storage.PRIVATE)
+            survey_file('survey_leg_times.csv', file_set), storage=Storage.PRIVATE)
         overhead = context.get_generic(
-            survey_file('survey_leg_overheads.csv', leg_set), storage=Storage.PRIVATE)
+            survey_file('survey_leg_overheads.csv', file_set), storage=Storage.PRIVATE)
         logging.info(f"  → {len(legs):,} legs; "
                      f"routed {len(routed):,}, overhead {len(overhead):,}")
-        # Defense-in-depth: after our recent leg_id-index refactor, all
-        # three share leg_id as the index. Assert alignment.
+        # All three are indexed by leg_id; restrict to the common legs if they disagree.
         if not (legs.index.equals(routed.index) and legs.index.equals(overhead.index)):
-            n_shared = int(legs.index.intersection(routed.index).intersection(overhead.index).size)
+            common = legs.index.intersection(routed.index).intersection(overhead.index)
             logging.warning(
                 f"  ⚠ indices don't fully agree — restricting to the "
-                f"{n_shared:,} legs present in all three.")
-            common = legs.index.intersection(routed.index).intersection(overhead.index)
+                f"{len(common):,} legs present in all three.")
             legs, routed, overhead = legs.loc[common], routed.loc[common], overhead.loc[common]
 
     with step(f'select the legs of the calibration step {leg_set!r} checks'):
@@ -484,6 +449,16 @@ def main(variant):
                 legs.loc[sub], routed.loc[sub], overhead.loc[sub],
                 _MODE_TO_PROFILE, edge_coefs, quantities[:2],
                 mode_suffix=f'@{tod}', banded=False)
+    if leg_set == 'mtmc':
+        car = legs['mode_simplified'] == 'car'
+        subsets = {name: car & keep(legs) for name, keep in _CAR_TRIP_SUBSETS.items()}
+        subsets['all above'] = pd.concat(subsets, axis=1).all(axis=1)
+        for name, sub in subsets.items():
+            with step(f'car trips: {name}'):
+                rows += _comparison_rows(
+                    legs.loc[sub], routed.loc[sub], overhead.loc[sub],
+                    _MODE_TO_PROFILE, edge_coefs, ('time',),
+                    mode_suffix=f' ({name})', banded=False)
 
     with step('summary'):
         _log_and_save(context, rows, leg_set)
@@ -498,7 +473,7 @@ def _log_and_save(context, rows: list[dict], leg_set: str) -> None:
     # Order: mode grouped; within each mode, time / net_time → baseline_time →
     # dist; within each quantity, ALL first, then the distance bands.
     quantity_order = {'time': 0, 'net_time': 1, 'baseline_time': 2, 'dist': 3}
-    band_order = {'ALL': 0, **{label: i + 1 for i, (label, _, _) in enumerate(_DIST_BANDS)}}
+    band_order = {'ALL': 0, **{label: i + 1 for i, (label, _, _) in enumerate(DIST_BANDS)}}
     df['_qorder'] = df['quantity'].map(quantity_order).fillna(99)
     df['_border'] = df['band'].map(band_order).fillna(99)
     df = df.sort_values(['mode', '_qorder', '_border']).drop(
@@ -506,11 +481,7 @@ def _log_and_save(context, rows: list[dict], leg_set: str) -> None:
 
     # Rename for readable table headers (unit-generic; unit inferred from
     # `quantity` column: 'time' → seconds, 'dist' → metres).
-    df = df.rename(columns={
-        'n': 'n_legs',
-        'bias_pct': 'bias%', 'med_resid_pct': 'med_resid%',
-        'r2': 'R²_1to1', 'r2_fit': 'R²_fit', 'mae_pct': 'MAE%',
-    })
+    df = df.rename(columns={'n': 'n_legs', **STATS_RENAME})
     display_cols = ['mode', 'quantity', 'band', 'n_legs',
                     'bias', 'bias%', 'med_resid', 'med_resid%',
                     'R²_1to1', 'R²_fit', 'MAE%']
@@ -521,16 +492,7 @@ def _log_and_save(context, rows: list[dict], leg_set: str) -> None:
         kws={'index': False, 'float_format': '%.4f'},
     )
 
-    formatters = {
-        'n_legs':     '{:>7,}'.format,
-        'bias':       '{:+8.1f}'.format,
-        'bias%':      '{:+.1f}%'.format,
-        'med_resid':  '{:+8.1f}'.format,
-        'med_resid%': '{:+.1f}%'.format,
-        'R²_1to1':    '{:.4f}'.format,
-        'R²_fit':     '{:.4f}'.format,
-        'MAE%':       '{:.1f}%'.format,
-    }
+    formatters = {'n_legs': '{:>7,}'.format, **STATS_FORMATTERS}
     table = df[display_cols].to_string(index=False, formatters=formatters,
                                        justify='right')
     logging.info(
@@ -550,7 +512,7 @@ def _log_and_save(context, rows: list[dict], leg_set: str) -> None:
 
 
 variants = Variants([('leg_set', str)])
-for _leg_set in SURVEY_LEG_SETS:
+for _leg_set in ('mtmc', *MOBIS_LEG_SETS):
     variants.add(name=_leg_set, leg_set=_leg_set)
 
 

@@ -13,7 +13,7 @@ OSM street network, departing at the reported time of day. Variants:
     zone's cells). What a GTFS-based zone-to-zone table would give, to
     compare with NPVM.
   - `k<K>` (composed, e.g. `k3`): the access-point model planned for
-    aperta (`planning/aperta_refactor_plan.md`, D7). The K nearest stop
+    aperta (`home/planning/refactor-v0.5/aperta_refactor_plan.md`, D7). The K nearest stop
     places at each trip end, the calibrated walk-network time (`rwalk`)
     from the trip's cell to each, and R5 between the stop places; then
     (a) the minimum over origin stops with the nearest egress stop, and
@@ -32,8 +32,8 @@ Transit only: R5 cannot exclude walk-only trips (its "direct" mode must equal
 the access mode), so results for endpoint pairs closer than
 `_WALK_ONLY_REACH_M` (the most walking R5 allows) are dropped — beyond that,
 every result is a transit trip. Park-and-ride / bike-and-ride trips are
-routed with walk access only, as in the atlas's transit model. Trips are
-restricted to those passing `TRIP_QUALITY_FLAGS`.
+routed with walk access only, as in the atlas's transit model. The trips are
+main/07b's (survey/08b predicts the trips 07b fits on).
 
 R5 gotchas handled here: ids get an `o_` / `d_` prefix (r5py zeroes the
 travel time when an origin and a destination share an id); the GTFS zip's
@@ -46,7 +46,7 @@ Prerequisites (not in the base env): `conda install -c conda-forge
 national network (cached by r5py under ~/.cache/r5py; ~20 GB JVM heap).
 
 Inputs (PRIVATE, under `<scenario>/`):
-    generic/survey_trip_transit.csv        # survey/08b (needs `datetime_departure`)
+    generic/survey_trip_transit.csv        # survey/08b
     shapes/cells.gpkg + properties/cells_{population,snap}.csv
     nw/walk.graphml + properties/edges_walk_calibrated.csv   # k<K> access
 Inputs (PUBLIC):
@@ -81,7 +81,6 @@ from aperta.network_processing import attach_edge_properties
 from aperta_atlas.context import Storage, init_context
 from aperta_atlas.utils import step
 
-from main.common import TRIP_QUALITY_FLAGS
 from mode_configs import MODE_CONFIGS
 from scenarios import get_scenario
 
@@ -148,7 +147,7 @@ def _kstop_access(context, trips: pd.DataFrame, areas: pd.DataFrame, k: int,
     tree = cKDTree(areas[['x', 'y']].to_numpy())
     cand = {}
     for side in ('orig', 'dest'):
-        _, idx = tree.query(trips[[f'trip_{side}_x', f'trip_{side}_y']].to_numpy(), k=k)
+        _, idx = tree.query(trips[[f'{side}_x', f'{side}_y']].to_numpy(), k=k)
         cand[side] = areas.index.to_numpy()[idx.reshape(len(trips), k)]
 
     src = MODE_CONFIGS['walk'].source_for('rwalk')
@@ -171,7 +170,7 @@ def _kstop_access(context, trips: pd.DataFrame, areas: pd.DataFrame, k: int,
 
     out = {}
     for side in ('orig', 'dest'):
-        src_seq = trips[f'trip_{side}_cell'].map(cell_node).map(nx_to_seq).to_numpy()
+        src_seq = trips[f'{side}_cell_id'].map(cell_node).map(nx_to_seq).to_numpy()
         tgt_seq = area_seq.reindex(cand[side].ravel()).to_numpy().reshape(len(trips), k)
         walk = np.full((len(trips), k), np.nan)
         # Per-origin target lists must be duplicate-free: route each row's
@@ -313,15 +312,9 @@ def main():
     scenario = get_scenario(context.scenario)
     crs = scenario.crs_main
 
-    with step('load trips (plausibility-filtered) + assign departure slots'):
+    with step('load trips + assign departure slots'):
         trips = context.get_generic('survey_trip_transit.csv', storage=Storage.PRIVATE)
         trips.index = trips.index.astype(str)
-        if 'datetime_departure' not in trips.columns:
-            raise KeyError("`datetime_departure` missing from survey_trip_transit.csv — "
-                           "rerun survey/02d and survey/08b.")
-        for flag in TRIP_QUALITY_FLAGS:
-            if flag in trips.columns:
-                trips = trips[trips[flag] == 1]
         trips = trips[pd.to_datetime(trips['datetime_departure'], errors='coerce').notna()]
         existing = None
         if args.same_trips:
@@ -329,7 +322,7 @@ def main():
             existing.index = existing.index.astype(str)
             trips = trips[trips.index.isin(existing.index)]
             logging.info(f"  → --same-trips: {len(trips):,} of {len(existing):,} earlier "
-                         f"trips still pass the plausibility flags")
+                         f"trips are still in survey/08b's trips")
         elif args.n_trips is not None and args.n_trips < len(trips):
             trips = trips.sample(n=args.n_trips, random_state=_SEED)
         trips = trips.copy()
@@ -344,13 +337,13 @@ def main():
     if 'd2d' in point_variants:
         endpoints['d2d'] = (
             trips.index.to_series(), trips.index.to_series(),
-            {'o': trips[['trip_orig_x', 'trip_orig_y']].set_axis(['x', 'y'], axis=1),
-             'd': trips[['trip_dest_x', 'trip_dest_y']].set_axis(['x', 'y'], axis=1)})
+            {'o': trips[['orig_x', 'orig_y']].set_axis(['x', 'y'], axis=1),
+             'd': trips[['dest_x', 'dest_y']].set_axis(['x', 'y'], axis=1)})
     if 'z2z' in point_variants:
         with step('z2z: zone points (residents + jobs-weighted centroids)'):
             zones = _zone_points(context)
-            endpoints['z2z'] = (trips['trip_orig_zone'].astype(str),
-                                trips['trip_dest_zone'].astype(str), {'o': zones, 'd': zones})
+            endpoints['z2z'] = (trips['orig_zone_id'].astype(str),
+                                trips['dest_zone_id'].astype(str), {'o': zones, 'd': zones})
     if k_variants:
         areas = _stop_areas(context, crs)
         logging.info(f"  → {len(areas):,} GTFS stop places")

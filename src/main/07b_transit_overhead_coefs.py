@@ -1,20 +1,24 @@
 """
 Calibrate `overheads_transit` at TRIP level.
 
-Trip set: survey trips containing ≥ 1 transit leg (aggregated via
-`main.common.aggregate_transit_trips`, shared with survey/08b),
-plausibility-filtered on `TRIP_QUALITY_FLAGS`. Trip level because NPVM z2z
-is door to door, while a transit leg's `time_measured` is only the
-stop-to-stop ride: `trip_time_measured` (last arrival − first departure)
-includes waiting between legs, as NPVM z2z does. The fit uses raw NPVM z2z
+Trip set: the transit trips of survey/02d's trip set (`main.common.
+survey_trips`, shared with 07a and 09a: transit legs with walking between
+them, and walking plus at most one cycling or car leg before the first and
+after the last), plausibility-filtered on
+`TRIP_QUALITY_FLAGS` (incl. no leg besides the transit legs over 30 min,
+`TRIP_MAX_TRANSIT_OTHER_LEG_S`). Trip level because NPVM z2z is door to door, while a
+transit leg's `time_measured` is only the stop-to-stop ride: the trip's
+`time_measured` (last arrival − first departure) includes waiting between
+legs, as NPVM z2z does. Besides walking to stops, the access terms cover cycling
+to railway stations and driving to park-and-ride car parks (06). The fit uses raw NPVM z2z
 at the trip endpoints, so it is independent of the current
 `overheads_transit` and of survey/08b's per-trip predictions.
 
 Model per spec in `_TRANSIT_SPECS`::
 
-    trip_time_measured = const + α · raw_z2z(trip_orig_zone, trip_dest_zone)
-                              + Σ β_i · (feature_i(trip_orig_cell)
-                                       + feature_i(trip_dest_cell))
+    time_measured = const + α · raw_z2z(orig_zone_id, dest_zone_id)
+                          + Σ β_i · (feature_i(orig_cell_id)
+                                   + feature_i(dest_cell_id))
 
 One β per feature, applied to the sum of orig + dest cell values (as 07a's
 `share_endpoint_coefs`): the marginal cost of a walk-to-transit deviation
@@ -22,14 +26,14 @@ doesn't depend on which end you're on. Features are 06's `*_zone_dev`
 access deviations and the cell's density.
 
 Every spec is fit twice: α=1 constrained (`<spec>`, regressing
-`trip_time_measured − raw_z2z`) and unconstrained (`<spec>__uncon`, α
+`time_measured − raw_z2z`) and unconstrained (`<spec>__uncon`, α
 fitted). Both fits are median regressions (`_MEDIAN_FIT`), as the road
 overheads in 07a: they target the median trip time, robust to the long tail
 of reported trips. Reported trip times are mostly on 5-min steps, so the
 median is fitted by 07a's interval EM (`_INTERVAL_FIT`), which reads each
 report as the interval of true times it can stand for; the fit on the
 reports is logged alongside. `_PRODUCTION_SPEC` picks the column applied downstream
-(aliased as `transit`): currently `both_density__uncon`, so 08a and
+(aliased as `transit`): currently `all_density__uncon`, so 08a and
 survey/08a, 08b scale z2z by its α (`main.common.route_time_alpha`) and add
 the per-cell overheads (`main.common.per_cell_transit_overhead`).
 
@@ -41,7 +45,7 @@ Output `overheads_transit.csv` has:
     other columns are for inspection / to swap the production choice.
 
 Inputs (PRIVATE, under <scenario>/):
-    generic/survey_legs.csv               # from survey/02d (needs trip_id)
+    generic/survey_trips.csv              # from survey/02d (--variant mtmc_trips)
 
 Inputs (scenario storage, under <scenario>/):
     properties/cells_transit_access.csv   # 06 — *_zone_dev + density columns
@@ -71,7 +75,7 @@ from aperta_atlas import coefs
 from aperta_atlas.context import Storage, init_context
 from aperta_atlas.utils import step
 from aoi_filter import filter_legs_by_aoi, load_aoi_polygon
-from main.common import TRIP_QUALITY_FLAGS, aggregate_transit_trips, npvm_transit_z2z_lookup
+from main.common import TRIP_QUALITY_FLAGS, TRIP_SET, npvm_transit_z2z_lookup, survey_file
 from scenarios import get_scenario, scenario_needs_survey_prep
 
 
@@ -92,8 +96,13 @@ _TRANSIT_SPECS: dict[str, tuple[str, ...]] = {
     'both_density': ('t_walk_to_transit_nearest_zone_dev',
                      't_bike_to_train_nearest_zone_dev',
                      'density_r500_norm'),
+    # + driving to the nearest park-and-ride car park (06).
+    'all_density': ('t_walk_to_transit_nearest_zone_dev',
+                    't_bike_to_train_nearest_zone_dev',
+                    't_car_to_park_ride_nearest_zone_dev',
+                    'density_r500_norm'),
 }
-_PRODUCTION_SPEC: str = 'both_density__uncon'
+_PRODUCTION_SPEC: str = 'all_density__uncon'
 
 # Symmetric clipping bound (seconds) applied to each cell's overhead
 # (± cap_s; ± 2 × cap_s per trip). Chosen to accommodate typical fitted
@@ -127,68 +136,42 @@ def _fit(y: pd.Series, X: pd.DataFrame):
     return result, result.rsquared
 
 
-def _fit_constrained(
-    df: pd.DataFrame, feature_cols: tuple[str, ...], spec_name: str,
+def _fit_spec(
+    df: pd.DataFrame, feature_cols: tuple[str, ...], spec_name: str, constrained: bool,
 ) -> pd.Series:
-    """α=1 constrained fit: regress (measured − raw_z2z) on shared endpoint
-    features + intercept. Returns coef Series (const + one β per feature)."""
-    df = df.dropna(subset=['target', 'z2z', *feature_cols])
+    """Fit one spec: α=1 constrained (regress measured − raw_z2z on the shared endpoint
+    features + intercept) or unconstrained (regress measured trip time on raw z2z + the
+    features + intercept; `t_routed` is α, the z2z slope). Returns the coef Series."""
+    kind = 'α=1 constrained' if constrained else 'unconstrained'
+    y_col = 'target' if constrained else 'y'
+    df = df.dropna(subset=[y_col, 'z2z', *feature_cols])
     if len(df) < 100:
         raise RuntimeError(
-            f"spec={spec_name!r} (constrained): only {len(df):,} rows after "
+            f"spec={spec_name!r} ({kind}): only {len(df):,} rows after "
             f"dropna — insufficient for calibration.")
-    X = sm.add_constant(df[list(feature_cols)], has_constant='add')
-    y = df['target']
+    cols = list(feature_cols) if constrained else ['z2z', *feature_cols]
+    X = sm.add_constant(df[cols].rename(columns={'z2z': 't_routed'}), has_constant='add')
+    y = df[y_col]
     result, r2 = _fit(y, X)
+    means = (f"mean(y−z2z) = {y.mean():.1f} s" if constrained
+             else f"mean y = {y.mean():.1f} s, mean z2z = {df['z2z'].mean():.1f} s")
     logging.info(
-        f"  → spec={spec_name!r} (α=1 constrained): "
+        f"  → spec={spec_name!r} ({kind}): "
         f"R² = {r2:.3f}, n = {int(result.nobs):,}, "
-        f"resid std = {result.resid.std():.1f} s; "
-        f"mean(y−z2z) = {y.mean():.1f} s")
+        f"resid std = {result.resid.std():.1f} s; {means}")
     for name, coef in result.params.items():
         logging.info(f"     {str(name):>34s}: {coef:+.4f}")
-    return _interval_params(df['y'], X, result.params, offset=df['z2z'])
-
-
-def _fit_unconstrained(
-    df: pd.DataFrame, feature_cols: tuple[str, ...], spec_name: str,
-) -> pd.Series:
-    """Unconstrained fit: regress measured trip time on raw z2z + shared
-    endpoint features + intercept. Returns coef Series (const + t_routed +
-    one β per feature); `t_routed` is α, the z2z slope."""
-    df = df.dropna(subset=['y', 'z2z', *feature_cols])
-    if len(df) < 100:
-        raise RuntimeError(
-            f"spec={spec_name!r} (unconstrained): only {len(df):,} rows after "
-            f"dropna — insufficient for calibration.")
-    X = df[['z2z', *feature_cols]].rename(columns={'z2z': 't_routed'})
-    X = sm.add_constant(X, has_constant='add')
-    y = df['y']
-    result, r2 = _fit(y, X)
-    logging.info(
-        f"  → spec={spec_name!r} (unconstrained): "
-        f"R² = {r2:.3f}, n = {int(result.nobs):,}, "
-        f"resid std = {result.resid.std():.1f} s; "
-        f"mean y = {y.mean():.1f} s, mean z2z = {df['z2z'].mean():.1f} s")
-    for name, coef in result.params.items():
-        logging.info(f"     {str(name):>34s}: {coef:+.4f}")
-    return _interval_params(y, X, result.params)
+    return _interval_params(df['y'], X, result.params,
+                            offset=df['z2z'] if constrained else None)
 
 
 def _fit_calibrated_transit_overhead(
     trips: pd.DataFrame, cells_transit: pd.DataFrame,
 ) -> pd.DataFrame:
     """Fit every spec in `_TRANSIT_SPECS` in both the α=1 constrained and
-    the unconstrained form, and pack all coefs into one DataFrame:
-
-        rows    : cap_s, const_s, t_routed (α), and one row per endpoint
-                  feature. NaN where a coef doesn't apply to that column.
-        columns : `<spec>` (α=1 constrained) and `<spec>__uncon` (α fitted)
-                  for each spec in `_TRANSIT_SPECS`, plus `transit` —
-                  the production column, aliased from `_PRODUCTION_SPEC`.
-
-    Consumers read only the `transit` column: `route_time_alpha` its
-    `t_routed` row, `per_cell_transit_overhead` the others.
+    the unconstrained form, and pack all coefs into one DataFrame (layout in the
+    module docstring). Consumers read only the `transit` column: `route_time_alpha`
+    its `t_routed` row, `per_cell_transit_overhead` the others.
     """
     all_feature_cols = sorted({c for cols in _TRANSIT_SPECS.values() for c in cols})
     for col in all_feature_cols:
@@ -199,15 +182,15 @@ def _fit_calibrated_transit_overhead(
                 f"{sorted(cells_transit.columns)})")
 
     df = pd.DataFrame({
-        'y':      trips['trip_time_measured'].astype(float),
+        'y':      trips['time_measured'].astype(float),
         'z2z':    trips['raw_z2z'].astype(float),
-        'target': (trips['trip_time_measured'].astype(float)
+        'target': (trips['time_measured'].astype(float)
                    - trips['raw_z2z'].astype(float)),
     }, index=trips.index)
     for col in all_feature_cols:
         col_map = cells_transit[col]
-        orig = trips['trip_orig_cell'].map(col_map).astype(float).fillna(0.0)
-        dest = trips['trip_dest_cell'].map(col_map).astype(float).fillna(0.0)
+        orig = trips['orig_cell_id'].map(col_map).astype(float).fillna(0.0)
+        dest = trips['dest_cell_id'].map(col_map).astype(float).fillna(0.0)
         df[col] = (orig + dest).to_numpy()
 
     row_index = ['cap_s', 'const_s', 't_routed', *all_feature_cols]
@@ -216,22 +199,13 @@ def _fit_calibrated_transit_overhead(
     out.index.name = 'param'
 
     for spec_name, feature_cols in _TRANSIT_SPECS.items():
-        # α=1 constrained fit.
-        params_c = _fit_constrained(df, feature_cols, spec_name)
-        out.loc['cap_s', spec_name] = _TRANSIT_OVERHEAD_CAP_S
-        out.loc['const_s', spec_name] = float(params_c['const'])
-        # t_routed row stays NaN for constrained columns (α = 1 by construction).
-        for c in feature_cols:
-            out.loc[c, spec_name] = float(params_c[c])
-
-        # Unconstrained fit (α fitted).
-        uncon_name = f'{spec_name}__uncon'
-        params_u = _fit_unconstrained(df, feature_cols, spec_name)
-        out.loc['cap_s', uncon_name] = _TRANSIT_OVERHEAD_CAP_S
-        out.loc['const_s', uncon_name] = float(params_u['const'])
-        out.loc['t_routed', uncon_name] = float(params_u['t_routed'])
-        for c in feature_cols:
-            out.loc[c, uncon_name] = float(params_u[c])
+        for col, constrained in ((spec_name, True), (f'{spec_name}__uncon', False)):
+            params = _fit_spec(df, feature_cols, spec_name, constrained)
+            out.loc['cap_s', col] = _TRANSIT_OVERHEAD_CAP_S
+            out.loc['const_s', col] = float(params['const'])
+            # t_routed stays NaN in constrained columns (α = 1 by construction).
+            for c in ([] if constrained else ['t_routed']) + list(feature_cols):
+                out.loc[c, col] = float(params[c])
 
     # `transit` is the column consumers read; alias it from the production spec.
     if _PRODUCTION_SPEC not in out.columns:
@@ -249,9 +223,9 @@ def _scatter_z2z_vs_measured(
     Overlays the 1:1 line, the production fit `y = const_s + α · z2z`
     (endpoint terms vary per trip and can't be drawn as a single line), and
     the mean and median measured time per 5-min z2z bin."""
-    sub = trips[['trip_time_measured', 'raw_z2z']].dropna()
+    sub = trips[['time_measured', 'raw_z2z']].dropna()
     x = sub['raw_z2z'].to_numpy() / 60.0
-    y = sub['trip_time_measured'].to_numpy() / 60.0
+    y = sub['time_measured'].to_numpy() / 60.0
     upper = float(np.percentile(np.concatenate([x, y]), 99))
 
     fig, ax = plt.subplots(figsize=(7.5, 7))
@@ -291,50 +265,40 @@ def _scatter_z2z_vs_measured(
     plt.close(fig)
 
 
-def _prep_trip_data(context, scenario) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load legs, aggregate to transit-containing trips, quality/AOI filter,
-    attach raw NPVM z2z per trip. Returns `(trips, cells_transit)` ready
-    for the fits."""
-    with step('load survey_legs.csv'):
-        legs = context.get_generic('survey_legs.csv', storage=Storage.PRIVATE)
-        if 'trip_id' not in legs.columns:
-            raise KeyError(
-                "Column 'trip_id' not in survey_legs.csv. "
-                "Verify it's in survey/02d's `_KEEP_COLS` and rerun 02d.")
-        logging.info(f"  → {len(legs):,} legs")
+def fit_trips(context, scenario) -> pd.DataFrame:
+    """The trips the fit uses, which survey/08b also predicts for the validation: the
+    trip set's transit trips, plausibility-filtered (`TRIP_QUALITY_FLAGS`), within the
+    straight-line distance range and with both ends in the AOI, with the raw NPVM z2z time
+    between their zones (`raw_z2z`; NaN without an entry, left out of the fit)."""
+    with step(f'load {survey_file("survey_legs.csv", TRIP_SET)} (transit trips)'):
+        trips = context.get_generic(survey_file('survey_legs.csv', TRIP_SET),
+                                    storage=Storage.PRIVATE)
+        trips = trips[trips['mode_simplified'] == 'transit']
+        logging.info(f"  → {len(trips):,} transit trips; feeders: "
+                     f"{trips['transit_feeder'].value_counts().to_dict()}")
 
-    with step('aggregate legs → transit-containing trips'):
-        trips = aggregate_transit_trips(legs)
-        n_by_pattern = trips['access_pattern'].value_counts().to_dict()
-        logging.info(
-            f"  → {len(trips):,} transit trips; access patterns: {n_by_pattern}")
-
-    with step('quality filter (trip-level envelope flags == 1)'):
+    with step('plausibility filter (TRIP_QUALITY_FLAGS == 1)'):
         n_before = len(trips)
         for flag in TRIP_QUALITY_FLAGS:
-            if flag in trips.columns:
-                trips = trips[trips[flag] == 1]
+            trips = trips[trips[flag] == 1]
         logging.info(f"  → {len(trips):,} / {n_before:,} trips kept")
 
-    with step(f'trip_dist_line ∈ [{_TRIP_DIST_LINE_MIN:.0f}, '
+    with step(f'dist_line ∈ [{_TRIP_DIST_LINE_MIN:.0f}, '
               f'{_TRIP_DIST_LINE_MAX:.0f}] m'):
         n_before = len(trips)
         trips = trips[
-            (trips['trip_dist_line'] >= _TRIP_DIST_LINE_MIN)
-            & (trips['trip_dist_line'] <= _TRIP_DIST_LINE_MAX)]
+            (trips['dist_line'] >= _TRIP_DIST_LINE_MIN)
+            & (trips['dist_line'] <= _TRIP_DIST_LINE_MAX)]
         logging.info(f"  → {len(trips):,} / {n_before:,} trips kept")
 
     with step('AOI filter (both trip endpoints inside scenario AOI)'):
         aoi_polygon = load_aoi_polygon(context)
         trips = filter_legs_by_aoi(
-            trips, aoi_polygon, crs=scenario.crs_main,
-            orig_x='trip_orig_x', orig_y='trip_orig_y',
-            dest_x='trip_dest_x', dest_y='trip_dest_y',
-            label='transit trips')
+            trips, aoi_polygon, crs=scenario.crs_main, label='transit trips')
 
     with step('NPVM z2z lookup at trip endpoints (raw, no overhead)'):
         lookup = npvm_transit_z2z_lookup(context)
-        keys = list(zip(trips['trip_orig_zone'], trips['trip_dest_zone']))
+        keys = list(zip(trips['orig_zone_id'], trips['dest_zone_id']))
         trips['raw_z2z'] = pd.Series(
             [lookup.get(k, float('nan')) for k in keys],
             index=trips.index, dtype=float)
@@ -343,12 +307,7 @@ def _prep_trip_data(context, scenario) -> tuple[pd.DataFrame, pd.DataFrame]:
             f"  → {n_hit:,}/{len(trips):,} trips with NPVM z2z entry "
             f"({100*n_hit/max(len(trips),1):.1f} %); "
             f"median raw_z2z = {trips['raw_z2z'].median():.0f} s")
-
-    with step('load cells_transit_access (endpoint zone-dev columns)'):
-        cells_transit = context.get_properties('cells', 'transit_access')
-        logging.info(f"  → {len(cells_transit):,} cells")
-
-    return trips, cells_transit
+    return trips
 
 
 def main():
@@ -364,7 +323,11 @@ def main():
     # verifies without calling the calibrate_fn.
     trips_state: tuple[pd.DataFrame, pd.DataFrame] | None = None
     if scenario_needs_survey_prep(scenario):
-        trips_state = _prep_trip_data(context, scenario)
+        trips = fit_trips(context, scenario)
+        with step('load cells_transit_access (endpoint zone-dev columns)'):
+            cells_transit = context.get_properties('cells', 'transit_access')
+            logging.info(f"  → {len(cells_transit):,} cells")
+        trips_state = (trips, cells_transit)
 
     def _calibrate() -> pd.DataFrame:
         if trips_state is None:

@@ -3,18 +3,17 @@ Per-municipality vehicle counts by type and fuel, plus per-capita and share colu
 from BFS open-data PX-Cube `px-x-1103020100_111.px`.
 
 Pivots the (vehicle_type, fuel_type) → count table for one reference year, joins it
-to the `municipalities` properties via `bfs_number`, and derives:
-    * `<vehicle_type>_all`   — sum over all fuel types
-    * `<vehicle_type>_main`  — sum over `MAIN_FUEL_TYPES` only
-    * `veh_per_capita_<vehicle_type>` — divided by population
+to the `municipalities` properties via `bfs_number`, and writes (from the sums over all
+fuel types and over `MAIN_FUEL_TYPES` only):
+    * `veh_per_capita_<vehicle_type>` — all fuel types, divided by population
     * `share_all_<vehicle_type>_<fuel_type>`  — share of total
     * `share_main_<vehicle_type>_<fuel_type>` — share of `MAIN_FUEL_TYPES` sum (only
       for fuel types in `MAIN_FUEL_TYPES`)
 
-Inputs (under <DATA_DIR_PUBLIC>/raw/switzerland/vehicle_ownership/):
+Inputs (PUBLIC, under raw/switzerland/vehicle_ownership/):
     px-x-1103020100_111.px
-Inputs (same-namespace; prior stage):
-    municipalities.csv  (from political_boundaries.py)
+Inputs (PUBLIC, under preparation/switzerland/general/):
+    municipalities.csv                  # from political_boundaries.py
 
 Outputs (PUBLIC, under preparation/switzerland/general/):
     municipalities_car_ownership.csv
@@ -28,8 +27,7 @@ import re
 import pandas as pd
 from pyaxis import pyaxis
 
-from aperta_atlas.context import init_context
-from aperta_atlas.context import Storage
+from aperta_atlas.context import Storage, init_context
 
 
 # Reference year for the snapshot. Update when a new vintage is preferred.

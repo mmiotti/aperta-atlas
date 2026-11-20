@@ -18,7 +18,7 @@ Output CRS is WGS84 (`EPSG:4326`), uniform across the
 `preparation/world/` namespace. Per-project reprojection to a metric
 CRS (e.g. LV95 for Swiss work) happens at project-stage attach.
 
-Cases are defined in `preparation/world/areas.py`; this script registers
+Areas are defined in `preparation/world/areas.py`; this script registers
 one `<area_name>_dem` variant per area. Buffer is the widest per-mode
 buffer for the area (covers wherever any per-mode network goes).
 
@@ -36,7 +36,7 @@ Run all variants sequentially (default):
     python -m preparation.world.elevation.elevation_dem
 Single variant:
     python -m preparation.world.elevation.elevation_dem --variant switzerland_dem
-    python -m preparation.world.elevation.elevation_dem --variant bern_dem
+    python -m preparation.world.elevation.elevation_dem --variant bern-metro_dem
 """
 
 import logging
@@ -64,17 +64,11 @@ for area in AREAS.values():
 
 def main(variant) -> None:
     context = init_context(variant)
-    out_name = f'dem_{variant.area_name}'
-
-    out_relative = f'{out_name}.tif'
+    out_relative = f'dem_{variant.area_name}.tif'
     out_path = context.path_for(Storage.PUBLIC, out_relative)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    # Tile cache lives next to the output so re-runs (and any future
-    # country variant whose buffered polygon overlaps Switzerland's)
-    # reuse already-downloaded 1° tiles. `cleanup_tiles=False` keeps
-    # them for reuse — the cache is ~few MB per tile and pays for
-    # itself on the first re-run.
+    # Tile cache next to the output, kept for re-runs (`cleanup_tiles=False`).
     cache_tile_dir = os.path.join(os.path.dirname(out_path), 'tiles')
 
     with step('buffered_place_polygon'):
@@ -82,7 +76,7 @@ def main(variant) -> None:
         polygon = polygon_gdf.geometry.iloc[0]
 
     # `fetch_copernicus_dem` is a no-op when out_path already exists —
-    # log that area explicitly so the run output is informative.
+    # log it explicitly so the run output is informative.
     if os.path.exists(out_path):
         size_mb = os.path.getsize(out_path) / (1024 * 1024)
         logging.info(
@@ -103,8 +97,7 @@ def main(variant) -> None:
             logging.info(f"  → wrote DEM: {size_mb:,.1f} MB")
 
     # Register with the dependency tracker so downstream attach steps
-    # see this as a real prepared dataset (size unknown for rasters —
-    # the n field is None, matching `create_generic`'s .graphml area).
+    # see this as a real prepared dataset (n = None: no row count for a raster).
     context.register_created_data(out_relative, Storage.PUBLIC, None)
     context.close()
 

@@ -6,11 +6,22 @@ so the metric loop is symmetric across walk / bike / car / transit.
 Per (grid × mode × profile):
   1. Load the cell-baked cost ODM (gross time from 08a, disutility from
      09b, or straight-line distance from 08b) and its geo pair index.
-  2. Apply per-mode floor (`min_route_time_s` / `min_route_disutility`).
+  2. Apply the per-mode time floor (`min_route_time_s`; disutilities are built
+     from floored times in 09b).
   3. Run three metric families (bin counts, nearest_k, gravity) per
      destination column; batches destinations to cap weight memory.
   4. Save `access_<grid>_<metric>_<profile>.csv`. Profile alone is
      unique across modes; mode-agnostic dist_line grids have no suffix.
+Util grids with `crossmodal_car_profiles` add one profile
+`crossmodal_<car profile>` each, over the four modes of the mode-choice
+model and in the order consistent with utility maximization: for β ≤ 1,
+the disutilities are combined per OD pair (logsum), then gravity runs
+over the destinations (see `_crossmodal_odm`); for β > 1, the per-mode
+logsums are combined (`_logsum_across_modes`). Both agree at β = 1.
+Cycling and transit have one profile (base hours); in the night and peak
+cross-modal profiles, their utilities shift by 09a's hour constants
+(`crossmodal_hour_shift`), on top of the floored disutilities, so that
+both orders shift alike.
 
 Inputs (scenario storage, under `<scenario>/`):
     odm/<mode>_time_gross_<profile>.npz     # 08a — road gross-time
@@ -25,6 +36,7 @@ Inputs (scenario storage, under `<scenario>/`):
 
 Output (scenario storage, under `<scenario>/`):
     properties/cells_access_<grid>_<metric>[_<profile>].csv
+    properties/cells_access_util_gravity_crossmodal_<car profile>.csv   # cross-modal
 
 Run all grids (default):
     python -m main.10_accessibilities --scenario <name>
@@ -39,7 +51,7 @@ import numpy as np
 import pandas as pd
 
 from aperta import accessibility, od_pairs, routing
-from aperta.accessibility import exp_decay
+from aperta.errors import DataError
 from aperta.od_pairs import TieredODGeoPairs, TieredODPairs
 from aperta_atlas.context import init_context
 from aperta_atlas.utils import step
@@ -48,12 +60,15 @@ from main.common import (
     DEST_BATCH_SIZE,
     bins_from_edges_m,
     bins_from_edges_min,
+    crossmodal_hour_shift,
     flatten_bin_dest_columns,
     flatten_decay_dest_columns,
     flatten_k_dest_columns,
     gravity_decays_from_half_decay_m,
     gravity_decays_from_half_decay_min,
+    gravity_decays_util,
     scaled_weights_for_nearest_k,
+    util_logsums,
 )
 from mode_configs import TRANSIT_MODE_CONFIG, ModeConfig
 from scenarios import get_scenario
@@ -70,6 +85,85 @@ def _iter_plan(scenario) -> list[tuple[str, str, ModeConfig]]:
     if scenario.transit_source is not None:
         plan.append(('transit', 'transit', TRANSIT_MODE_CONFIG))
     return plan
+
+
+_TIERS = ('cells_to_cells', 'cells_to_zones', 'zones_to_zones')
+
+
+def _crossmodal_profiles(car_profile: str) -> tuple[str, ...]:
+    """The four modes of the mode-choice model, as profile labels. E-bike and
+    reduced-mobility walking are not in the model."""
+    return ('rwalk', 'rbike', f'car_{car_profile}', 'transit')
+
+
+def _util_beta(column: str) -> float:
+    """β of a util gravity column `<destination>_exp<β>`."""
+    return float(column.rsplit('_exp', 1)[1])
+
+
+def _logsum_across_modes(parts: list[pd.DataFrame]) -> pd.DataFrame:
+    """`ln Σ_m exp(a_m)` over per-mode logsums (frames with the same cells and
+    columns): the cross-modal logsum with modes above destinations, consistent
+    with utility maximization for β ≥ 1. A mode without a value contributes
+    nothing; NaN where no mode has one."""
+    assert all(p.columns.equals(parts[0].columns) and p.index.equals(parts[0].index)
+               for p in parts)
+    stacked = np.exp(np.stack([p.to_numpy(dtype=float) for p in parts]))
+    with np.errstate(divide='ignore'):
+        out = np.log(np.nansum(stacked, axis=0))
+    out[np.isnan(stacked).all(axis=0)] = np.nan
+    return pd.DataFrame(out, index=parts[0].index, columns=parts[0].columns)
+
+
+def _shift_costs(costs: TieredODGeoPairs, shift: float) -> TieredODGeoPairs:
+    """`costs − shift` on every pair: a disutility at another hour (non-finite entries stay)."""
+    def tier(t):
+        return None if t is None else {o: a - shift for o, a in t.items()}
+    return TieredODGeoPairs(**{t: tier(getattr(costs, t)) for t in _TIERS})
+
+
+def _crossmodal_inputs(context, scenario, grid, car_profile: str
+                       ) -> dict[str, tuple[TieredODGeoPairs, TieredODGeoPairs]]:
+    """`{profile: (pairs, disutility)}` of the four modes of the mode-choice model,
+    each shifted to the car's hour (`crossmodal_hour_shift`; also used by 11)."""
+    wanted = set(_crossmodal_profiles(car_profile))
+    coefs = context.get_coefs(f'utility_{grid.utility}')
+    odms: dict[str, tuple[TieredODGeoPairs, TieredODGeoPairs]] = {}
+    for mode, label, case in _iter_plan(scenario):
+        if label not in wanted:
+            continue
+        source = 'npvm' if mode == 'transit' else label
+        with step(f'crossmodal_{car_profile}: load {label}'):
+            costs = cast(TieredODGeoPairs, context.get_tiered_odm(
+                network_name=mode, data_name=f'util_{source}_{grid.utility}'))
+            shift = crossmodal_hour_shift(coefs, label, car_profile)
+            if shift:
+                costs = _shift_costs(costs, shift)
+                logging.info(f"  → {label}: utility shift {shift:+.3f} at {car_profile} hours")
+            pairs = context.get_tiered_odm(network_name=mode, data_name='geo_pairs')
+        # The loader returns node-pair objects; these ODMs are cell/zone-keyed. Dest IDs stay
+        # the loader's (cached) lists: converting them to arrays would copy every ID.
+        odms[label] = cast(tuple[TieredODGeoPairs, TieredODGeoPairs], tuple(
+            TieredODGeoPairs(**{t: getattr(x, t) for t in _TIERS}) for x in (pairs, costs)))
+    if set(odms) != wanted:
+        raise DataError(f"crossmodal_{car_profile}: profiles {sorted(wanted - set(odms))} "
+                        f"missing from the scenario's mode plan.")
+    return odms
+
+
+def _crossmodal_odm(context, scenario, grid, car_profile: str
+                    ) -> tuple[TieredODGeoPairs, TieredODGeoPairs]:
+    """`(pairs, disutility)` per OD pair across the four modes of the mode-choice
+    model: `-ln Σ_m exp(-D_m)` over walking (`rwalk`), cycling (`rbike`), car
+    (`car_<car_profile>`) and transit; a mode that lacks a pair contributes
+    nothing.
+
+    Combining the modes per pair keeps mode choice as estimated (09a, given the
+    destination); gravity with β ≤ 1 on the result is the logsum of a nested
+    choice with destinations above modes."""
+    odms = _crossmodal_inputs(context, scenario, grid, car_profile)
+    with step(f'crossmodal_{car_profile}: combine modes per OD pair'):
+        return od_pairs.aggregate_across_modes(odms, aggregator='logsum')
 
 
 def _compute_metrics(
@@ -109,31 +203,23 @@ def _compute_metrics(
                     d, pairs_geo, cells_m, zones=zones_m)
                 for d in batch
             }
-            batch_weights_nk = (
-                scaled_weights_for_nearest_k(batch_weights, scaled_dests)
-                if compute_nk else None
-            )
             if compute_cum:
                 parts_cum.append(accessibility.cumulative_opportunities(
                     costs_final, batch_weights, cell_to_zone, bins))
             if compute_nk:
-                assert batch_weights_nk is not None
                 # Default aggregator = cost_mean (weight-weighted mean cost
                 # over the first k weight-units).
                 parts_nk.append(accessibility.nearest_k(
-                    costs_final, batch_weights_nk, cell_to_zone, ks=ks))
+                    costs_final, scaled_weights_for_nearest_k(batch_weights, scaled_dests),
+                    cell_to_zone, ks=ks))
             if compute_grav:
                 # Time / distance: raw Hansen gravity `Σ w·exp(-β·cost)`
                 # (0 = no reachable destinations, a valid value).
-                # Utility: `log(Σ w·exp(-β·D))` — at β=1 this is the
-                # weighted logsum in native utility units; 0 → NaN
-                # since log is undefined for unreachable cells.
+                # Utility: logsum `(1/β)·ln Σ w·exp(-β·D)` in utility
+                # units for every β; NaN for unreachable cells.
                 raw = accessibility.gravity(
                     costs_final, batch_weights, cell_to_zone, decays)
-                if is_util:
-                    parts_grav.append(np.log(raw.where(raw > 0)))
-                else:
-                    parts_grav.append(raw)
+                parts_grav.append(util_logsums(raw) if is_util else raw)
 
     metrics: dict[str, pd.DataFrame] = {}
     if compute_cum:
@@ -148,14 +234,31 @@ def _compute_metrics(
     return metrics
 
 
+def _round_significant(df: pd.DataFrame, digits: int) -> pd.DataFrame:
+    """`df` rounded to `digits` significant digits (NaN and 0 kept)."""
+    x = df.to_numpy(dtype=np.float64)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        exponent = np.floor(np.log10(np.abs(x)))
+        scale = np.where(np.isfinite(exponent), 10.0 ** (digits - 1 - exponent), 1.0)
+        rounded = np.round(x * scale) / scale
+    return pd.DataFrame(np.where(np.isfinite(exponent), rounded, x),
+                        index=df.index, columns=df.columns)
+
+
 def _save_metrics(context, metrics: dict[str, pd.DataFrame], grid_key: str, is_util: bool,
                   profile_label: str) -> None:
     """One `cells_access_<grid>_<family>[_<profile>]` CSV per metric family.
-    Empty `profile_label` (dist_line, mode-agnostic) drops the suffix."""
-    formats = {'counts': '%.0f', 'nearest_k': '%.2f' if is_util else '%.1f',
-               'gravity': '%.3g'}
+    Empty `profile_label` (dist_line, mode-agnostic) drops the suffix.
+
+    Precision: counts whole; nearest-k in whole seconds / metres (utility: 2 decimals);
+    gravity 3 significant digits, written out rather than in exponent notation from 1,000 up
+    (logsums: 2 decimals, as they are read as differences)."""
+    formats = {'counts': '%.0f', 'nearest_k': '%.2f' if is_util else '%.0f',
+               'gravity': '%.2f' if is_util else '%.10g'}
     suffix = f'_{profile_label}' if profile_label else ''
     for family, df in metrics.items():
+        if family == 'gravity' and not is_util:
+            df = _round_significant(df, 3)
         context.create_properties(df, f'access_{grid_key}_{family}{suffix}',
                                   float_format=formats[family])
 
@@ -225,8 +328,7 @@ def main():
         ks = list(grid.nearest_k)
         if is_util:
             bins = bins_from_edges_min(grid.bin_edges_min)  # empty for util
-            decays = [exp_decay(f'exp{b}', beta=b)
-                      for b in grid.gravity_util_betas]
+            decays = gravity_decays_util(grid.gravity_util_betas)
         elif is_dist_line:
             bins = bins_from_edges_m(grid.bin_edges_m)
             decays = gravity_decays_from_half_decay_m(grid.gravity_half_decay_m)
@@ -243,10 +345,11 @@ def main():
         # distance ODM (`dist_line_geo_pairs.npz` / `dist_line_dist_line.npz`),
         # so a single iteration with `network_name='dist_line'` covers it.
         # Empty label drops the profile suffix from output filenames.
-        if is_dist_line:
-            iter_targets = [('dist_line', '', None)]
-        else:
-            iter_targets = _iter_plan(scenario)
+        iter_targets = [('dist_line', '', None)] if is_dist_line else _iter_plan(scenario)
+        # Per-mode util gravity for β > 1, kept for the cross-modal profiles.
+        crossmodal_inputs = {p for c in grid.crossmodal_car_profiles
+                             for p in _crossmodal_profiles(c)}
+        above_one: dict[str, pd.DataFrame] = {}
 
         for mode, label, case in iter_targets:
             source = 'npvm' if mode == 'transit' else label
@@ -272,20 +375,46 @@ def main():
                 network_name=mode, data_name='geo_pairs'))
 
             with step(f'grid={grid_key} mode={mode} profile={label}: floor'):
-                if is_dist_line:
-                    min_val = None  # straight-line distance has no natural floor
-                else:
-                    assert case is not None  # only dist_line passes case=None
-                    min_val = (case.min_route_disutility if is_util
-                               else case.min_route_time_s)
+                # Distance has no natural floor; disutilities are built from floored
+                # times (09b).
                 costs_floored = (
-                    routing.floor_intrazonal_costs(costs, min_cost=min_val)
-                    if min_val is not None else costs)
+                    costs if is_dist_line or is_util
+                    else routing.floor_intrazonal_costs(
+                        costs, min_cost=cast(ModeConfig, case).min_route_time_s))
 
             metrics = _compute_metrics(
                 costs_floored, pairs_geo, cells, cells_m, zones_m, cell_to_zone,
                 grid_key, is_util, mode, label, dest_cols, scaled_dests, bins, ks, decays)
             with step(f'grid={grid_key} mode={mode} profile={label}: save'):
+                _save_metrics(context, metrics, grid_key, is_util, label)
+            if label in crossmodal_inputs and 'gravity' in metrics:
+                g = metrics['gravity']
+                above_one[label] = g[[c for c in g.columns if _util_beta(c) > 1]]
+
+        # Cross-modal (util grids, gravity only), in the order consistent with utility
+        # maximization: the less sensitive choice sits higher in the nesting. For β ≤ 1
+        # (destinations chosen no more sensitively than modes), combine the modes per OD
+        # pair, then the destinations; for β > 1, combine the per-mode logsums.
+        betas_per_pair = tuple(b for b in grid.gravity_util_betas if b <= 1)
+        for car_profile in grid.crossmodal_car_profiles:
+            label = f'crossmodal_{car_profile}'
+            pairs_xm, costs_xm = _crossmodal_odm(context, scenario, grid, car_profile)
+            metrics = _compute_metrics(
+                costs_xm, pairs_xm, cells, cells_m, zones_m, cell_to_zone,
+                grid_key, is_util, 'crossmodal', label, dest_cols, scaled_dests, [], [],
+                gravity_decays_util(betas_per_pair))
+            del pairs_xm, costs_xm
+            # A per-mode logsum shifts by exactly the mode's hour shift (as in
+            # `_crossmodal_inputs`, applied after the floor).
+            util_coefs = context.get_coefs(f'utility_{grid.utility}')
+            parts = [above_one[p] + crossmodal_hour_shift(util_coefs, p, car_profile)
+                     for p in _crossmodal_profiles(car_profile)]
+            if len(parts[0].columns):
+                metrics['gravity'] = pd.concat(
+                    [metrics.get('gravity'), _logsum_across_modes(parts)], axis=1)
+            metrics['gravity'] = metrics['gravity'][
+                [f'{d}_exp{b}' for d in dest_cols for b in grid.gravity_util_betas]]
+            with step(f'grid={grid_key} profile={label}: save'):
                 _save_metrics(context, metrics, grid_key, is_util, label)
 
     context.close()

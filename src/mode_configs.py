@@ -1,4 +1,4 @@
-"""Per-mode pipeline configuration for the Accessibility Atlas.
+"""Per-mode pipeline configuration for the Aperta Accessibility Atlas.
 
 A `ModeConfig` bundles one mode's network, per-profile cost variants,
 OD-tier radii, cost cutoff, and min-route floors. `MODE_CONFIGS` provides
@@ -45,10 +45,11 @@ class ModeConfig:
     `mode`: graph + snap-column root. `profiles`: profile labels (`[None]`
     for single-profile modes). `radii`: OD-tier radii. `time_cutoff_s`:
     max routing horizon. `calibrated_sources`: per-profile source overrides
-    (default = one file per mode, profile-suffixed column). `min_route_time_s`
-    / `min_route_disutility`: physical floors on trip cost, applied via
-    `routing.floor_intrazonal_costs` — prevents degenerate `exp(-β·0)`
-    and log-blowups on self/very-close pairs.
+    (default = one file per mode, profile-suffixed column). `min_route_time_s`:
+    physical floor on door-to-door time, applied via
+    `routing.floor_intrazonal_costs` (also to the times the utilities are fitted on
+    and built from, 09a / 09b) — prevents degenerate `exp(-β·0)` on self/very-close
+    pairs.
     """
     mode: str
     profiles: list[str | None]
@@ -56,7 +57,6 @@ class ModeConfig:
     time_cutoff_s: float
     calibrated_sources: dict[str | None, CalibratedSource] | None = None
     min_route_time_s: float = 60.0
-    min_route_disutility: float | None = None
 
     def source_for(self, profile: str | None) -> CalibratedSource:
         """Resolve the `CalibratedSource` for `profile`. Uses
@@ -136,7 +136,6 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
         radii=_UNIFIED_RADII,
         time_cutoff_s=3_600.0,
         calibrated_sources=_WALK_SOURCES,
-        min_route_disutility=3.0,
     ),
     'bike': ModeConfig(
         mode='bike',
@@ -146,7 +145,6 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
         calibrated_sources=_BIKE_SOURCES,
         # 2 min floor: unlock + mount + park.
         min_route_time_s=120.0,
-        min_route_disutility=3.0,
     ),
     'car': ModeConfig(
         mode='car',
@@ -155,7 +153,6 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
         time_cutoff_s=3_600.0,
         # 3 min floor: walk to car + park at dest.
         min_route_time_s=180.0,
-        min_route_disutility=3.0,
     ),
 }
 
@@ -170,5 +167,4 @@ TRANSIT_MODE_CONFIG: ModeConfig = ModeConfig(
     # 5 min floor: walk to stop + wait + board + ride + walk. (NPVM has no
     # same-zone times: same-zone pairs stay NaN, i.e. unreachable by transit.)
     min_route_time_s=300.0,
-    min_route_disutility=3.0,
 )

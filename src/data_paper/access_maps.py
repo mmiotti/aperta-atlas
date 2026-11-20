@@ -1,7 +1,7 @@
 """
 Accessibility maps for the atlas data descriptor (Data Overview section).
 
-Figure 1 (`access_maps_cost_types.png`), cost types: groceries by walking in the
+`access_maps_cost_types.png`, cost types: groceries by walking in the
 city of Bern, drawn as H3 cells. Columns: straight-line distance, walking time,
 walking utility; rows: nearest-k (mean cost to the `_K` nearest), cumulative
 count (within `_COUNT_DIST_M` / `_COUNT_TIME_MIN`, sums of the first released
@@ -10,7 +10,7 @@ bins) and gravity (half-decays `_GRAVITY_DIST_M` / `_GRAVITY_TIME_MIN`, utility
 about 0.2-0.35 km for groceries in the city. The utility count cell stays empty: counts are not computed for
 utility. Own colour scale per panel.
 
-Figure 2 (`access_maps_modes.png`), modes: tertiary-sector jobs, gravity, per
+`access_maps_modes.png`, modes: tertiary-sector jobs, gravity, per
 mode (walking, bicycle, public transport, car peak). Rows: Switzerland by time
 (cells binned to `_NATIONAL_PIXEL_M` pixels, no frame: the whole country is
 shown; the box marks the zoom), Bern by time and Bern by utility (H3 cells).
@@ -22,7 +22,7 @@ Colour scales span the 1st-99th percentile of the plotted values; log for
 time / distance gravity spanning a factor of 10 or more, square root for counts
 (skewed, with zeros), else linear;
 brighter = better access throughout (scales of cost-based panels reversed).
-Utility gravity is a logsum (10 stores the log of the sum), hence linear.
+Utility gravity is a logsum (10 stores (1/β)·log of the sum), hence linear.
 Scale bars, bold lowercase panel labels, viridis and a white background, as
 Scientific Data asks for figures. Cells are drawn from their H3 ids, so no
 geometry file is read.
@@ -59,18 +59,17 @@ from aperta_atlas.context import init_context
 from aperta_atlas.utils import step
 
 # Grid keys of the release scenario's `accessibility_grids` (scenarios.py).
-_GRIDS = {'time': 'time', 'util': 'util', 'dist': 'dist'}
 _JOBS = 'employment_tertiary'
 _GROCERIES = 'poi_errands_groceries'
 _K = 3
-# Figure 1 (groceries, walking): settings that reach about equally far, rather than
+# Cost-types map (groceries, walking): settings that reach about equally far, rather than
 # equal numbers (a 300-m half-decay reaches much further than a 300-m bin).
 _COUNT_DIST_M = 300
 _COUNT_TIME_MIN = 10
 _COUNT_TIME_BINS = ((0, 5), (5, 10))     # released bins summed to 0-10 min
 _GRAVITY_DIST_M = 100
 _GRAVITY_TIME_MIN = 2
-# Figure 2 (jobs): time half-decay reaching about as far as the logsum (β = 1) for
+# Modes map (jobs): time half-decay reaching about as far as the logsum (β = 1) for
 # cycling, car and public transport (walking utility decays faster).
 _JOBS_HALF_DECAY_MIN = 5
 _UTIL_DECAY = 'exp1.0'
@@ -78,8 +77,9 @@ _WALK = 'rwalk'
 _MODES = [('Walking', 'rwalk'), ('Bicycle', 'rbike'),
           ('Public transport', 'transit'), ('Car (peak)', 'car_peak')]
 
-# (xmin, ymin, xmax, ymax), LV95. Figure 2's zoom frames Bern and its
-# agglomeration (inside Bern-Mittelland, the TV scenarios' area); Figure 1 the city.
+# (xmin, ymin, xmax, ymax), LV95. The modes map's zoom frames Bern and its
+# agglomeration (inside Bern-Mittelland, the TV scenarios' area); the cost-types map
+# the city.
 _EXTENT_BERN = (2_588_000, 1_189_500, 2_613_000, 1_209_500)
 _EXTENT_BERN_CITY = (2_594_000, 1_194_500, 2_607_000, 1_204_500)
 _NATIONAL_PIXEL_M = 500
@@ -104,7 +104,7 @@ def _load(context, grid: str, metric: str, profile: str | None,
     bins), indexed by H3 cell id; non-finite dropped."""
     cols = (cols,) if isinstance(cols, str) else cols
     suffix = f'_{profile}' if profile else ''
-    rel = f'properties/cells_access_{_GRIDS[grid]}_{metric}{suffix}.csv'
+    rel = f'properties/cells_access_{grid}_{metric}{suffix}.csv'
     path = context.path_for(context.default_storage, rel)
     s = pd.read_csv(path, usecols=['cell_id', *cols], index_col='cell_id')[list(cols)].sum(
         axis=1, min_count=len(cols))
@@ -132,6 +132,18 @@ def _in_extent(xy: pd.DataFrame, extent, margin: float = 500.0) -> pd.Series:
             & xy['y'].between(y0 - margin, y1 + margin))
 
 
+def _frame(ax, extent, visible: bool = True) -> None:
+    """Limits, equal aspect, no ticks; a thin black frame unless `visible=False`."""
+    x0, y0, x1, y1 = extent
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
+    ax.set_aspect('equal')
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set(visible=visible, color='black', linewidth=0.6)
+
+
 def _draw(ax, values: pd.Series, xy: pd.DataFrame, extent, norm, cmap,
           pixel_m: float | None = None, frame: bool = True) -> None:
     """Cells in `extent`: H3 hexagons, or (with `pixel_m`) the mean per pixel;
@@ -157,13 +169,7 @@ def _draw(ax, values: pd.Series, xy: pd.DataFrame, extent, norm, cmap,
         colours = cmap(norm(values.to_numpy()))
         ax.add_collection(PolyCollection(_hexagons(values.index), facecolors=colours,
                                          edgecolors=colours, linewidths=0.25, rasterized=True))
-    ax.set_xlim(x0, x1)
-    ax.set_ylim(y0, y1)
-    ax.set_aspect('equal')
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set(visible=frame, color='black', linewidth=0.6)
+    _frame(ax, extent, frame)
 
 
 def _scale_bar(ax, length_m: float) -> None:
@@ -285,14 +291,7 @@ def _figure_cost_types(context) -> plt.Figure:
 
 def _empty_panel(fig, ax, text: str) -> None:
     """Framed panel with a note; an invisible colour bar keeps it aligned with its row."""
-    x0, y0, x1, y1 = _EXTENT_BERN_CITY
-    ax.set_xlim(x0, x1)
-    ax.set_ylim(y0, y1)
-    ax.set_aspect('equal')
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set(color='black', linewidth=0.6)
+    _frame(ax, _EXTENT_BERN_CITY)
     ax.text(0.5, 0.5, text, transform=ax.transAxes, ha='center', va='center',
             color='0.45', fontsize=_FONT_SIZE)
     cb = fig.colorbar(ScalarMappable(norm=Normalize(0, 1), cmap=_cmap()), ax=ax,
@@ -355,12 +354,12 @@ def main():
     context = init_context()
     plt.rcParams.update({'font.size': _FONT_SIZE, 'font.family': 'sans-serif'})
 
-    with step('figure 1: cost types (groceries, walking, city of Bern)'):
+    with step('access_maps_cost_types.png (groceries, walking, city of Bern)'):
         fig = _figure_cost_types(context)
         context.create_results(fig, 'access_maps_cost_types.png', kws={'dpi': 300})
         plt.close(fig)
 
-    with step('figure 2: modes (tertiary jobs; Switzerland, Bern by time and utility)'):
+    with step('access_maps_modes.png (tertiary jobs; Switzerland, Bern by time and utility)'):
         fig = _figure_modes(context)
         context.create_results(fig, 'access_maps_modes.png', kws={'dpi': 300})
         plt.close(fig)

@@ -6,9 +6,10 @@ calibrated per-edge durations, then routes every survey leg (orig node
 → dest node) for every profile under that mode. Per-mode `dist_line`
 masks drop trips beyond what's plausible for that mode.
 
-One variant per leg set (see survey/02d). The `mtmc` set is routed on
-every mode (09a needs every alternative); the validation-only MOBIS sets
-are routed only on each leg's chosen mode.
+One variant per leg set (see survey/02d). The `mtmc` legs and the
+`mtmc_trips` trips (routed between the trip's ends) are routed on every mode
+(09a needs every alternative); the validation-only MOBIS sets are routed only
+on each leg's chosen mode.
 
 Uses `aperta_atlas.routing_mp.shortest_path_metrics_one_to_one_mp` —
 fork-multiprocessing wrapper around networkx bidirectional Dijkstra
@@ -17,23 +18,27 @@ script in the pipeline; the lean graph is shared across workers via
 fork-COW.
 
 Inputs (PRIVATE, under `<scenario>/`):
-    generic/survey_legs[_<leg_set>].csv                  # from survey/02d
+    generic/survey_legs[_<leg_set>].csv                  # from survey/02d (trip set:
+                                                         #   survey_trips.csv)
 
 Inputs (scenario storage, under `<scenario>/`):
     nw/<mode>.graphml
     properties/edges_<mode>_calibrated.csv               # from 04
     properties/edges_<mode>_extended.csv                 # from 02b — elevation_{gain,loss}
-    properties/edges_<mode>_from_nodes.csv               # from 02b — density, bike_infra_score, etc.
+    properties/edges_<mode>_from_nodes.csv               # from 02b — density, bike stress shares, etc.
     properties/edges_car_flows.csv                       # from 03b — vc_beta_2.0 (car only)
+    properties/nodes_car_flows_avg.csv                   # from 03b — traffic_flow_avg_r250 (car
+                                                         #   only; projected onto the edges)
     preparation/switzerland/npvm/odm/npvm_2023_transit_{idx,travel_time}.npz  # transit only
 
 Output (PRIVATE, under `<scenario>/`):
-    generic/survey_leg_times[_<leg_set>].csv
+    generic/survey_leg_times[_<leg_set>].csv     # trip set: survey_trip_times.csv
                                  # per road profile <p>: t_routed_<p>, length_<p>,
                                  # elev_gain_<p>, elev_loss_<p>, density_r500_norm_<p>,
                                  # mean_abs_slope_r250_<p>, n_traffic_signals_<p>;
-                                 # bike-mode extras: bike_infra_score_avg_r250_<p>;
-                                 # car-mode extras: speed_limit_avg_r250_<p>, vc_beta_2.0_<p>;
+                                 # bike-mode extras: bike_stress_share_{01,45}_r250_<p>;
+                                 # car-mode extras: speed_limit_avg_r250_<p>, vc_beta_2.0_<p>,
+                                 # traffic_flow_avg_r250_<p>;
                                  # t_routed_car: car profiles picked by peak_str;
                                  # naive-baseline routing (04's
                                  # `duration_baseline_<p>` weights):
@@ -45,7 +50,8 @@ Output (PRIVATE, under `<scenario>/`):
 
 Run (default variant `mtmc`):
     python -m survey.05_leg_times --scenario <name>
-MOBIS validation leg set:
+Trip set, or a MOBIS validation leg set:
+    python -m survey.05_leg_times --scenario <name> --variant mtmc_trips
     python -m survey.05_leg_times --scenario <name> --variant mobis_precovid
 """
 
@@ -54,13 +60,13 @@ import logging
 import numpy as np
 import pandas as pd
 
-from aperta.network_processing import attach_edge_properties
+from aperta.network_processing import aggregate_nodes_to_edges, attach_edge_properties
 from aperta_atlas import routing_mp
-from aperta_atlas.context import Storage, init_context
+from aperta_atlas.context import Storage, _edge_id, init_context
 from aperta_atlas.utils import step
 from aperta_atlas.variant import Variants
 
-from main.common import SURVEY_LEG_SETS, npvm_transit_z2z_lookup, survey_file
+from main.common import MOBIS_LEG_SETS, SURVEY_LEG_SETS, npvm_transit_z2z_lookup, survey_file
 from scenarios import get_scenario, scenario_needs_survey_prep
 
 
@@ -81,7 +87,7 @@ _LIMIT_TRIPS: int | None = None
 # Per-mode `dist_line` (Euclidean OD distance) cap in meters. Trips beyond
 # the cap for a mode are NOT routed for any of that mode's profiles —
 # downstream code reads NaN in the corresponding output columns.
-_DIST_LINE_MAX: dict[str, float | None] = {
+_DIST_LINE_MAX: dict[str, float] = {
     'walk':  5_000.0,
     'bike': 30_000.0,
     'car': 150_000.0,
@@ -101,16 +107,18 @@ _PATH_EDGE_FEATURES_UNIVERSAL: dict[str, str] = {
     'is_traffic_signal':   'sum',              # count of signals traversed
 }
 # Per-mode extras — only aggregated on the graph where the feature is
-# natural (bike_infra_score on bike, speed_limit + traffic pressure on
+# natural (bike stress shares on bike, speed_limit + traffic pressure on
 # car).
 _PATH_EDGE_FEATURES_MODE: dict[str, dict[str, str]] = {
     'walk': {},
     'bike': {
-        'bike_infra_score_avg_r250': 'length_weighted',
+        'bike_stress_share_01_r250': 'length_weighted',
+        'bike_stress_share_45_r250': 'length_weighted',
     },
     'car': {
         'speed_limit_avg_r250':      'length_weighted',
         'vc_beta_2.0':               'length_weighted',   # BPR-style traffic pressure (03b)
+        'traffic_flow_avg_r250':     'length_weighted',   # flow around the route (03b)
     },
 }
 
@@ -122,21 +130,40 @@ _PATH_EDGE_FEATURES_MODE: dict[str, dict[str, str]] = {
 _EXTRA_EDGE_PROPERTIES: dict[str, tuple[str, ...]] = {
     'car': ('car_flows',),   # vc + vc_beta_* + flow_estimate (from 03b)
 }
+# Per-mode node-property files projected onto the edges (mean of the two end nodes), like
+# 02b's `<mode>_from_nodes`: features that 03b computes after 02b.
+_EXTRA_NODE_PROPERTIES: dict[str, tuple[str, ...]] = {
+    'car': ('car_flows_avg',),   # traffic_flow_avg_r* + vc_beta_*_avg_r* (from 03b)
+}
 
 
-def _path_edge_features_for(mode: str) -> dict[str, str]:
-    return {**_PATH_EDGE_FEATURES_UNIVERSAL,
-            **_PATH_EDGE_FEATURES_MODE.get(mode, {})}
+def _node_properties_on_edges(context, data_name: str, graph) -> pd.DataFrame:
+    """`nodes_<data_name>.csv` projected onto `graph`'s edges (mean of the two end nodes),
+    indexed by edge id."""
+    nodes = context.get_properties('nodes', data_name, allow_cache=False)
+    edges = aggregate_nodes_to_edges(nodes, list(nodes.columns), graph, aggregator='mean')
+    if edges.empty:
+        raise KeyError(f"nodes_{data_name}.csv: no node id matches the graph's nodes")
+    logging.info(f"  → nodes_{data_name} projected onto {len(edges):,} / "
+                 f"{graph.number_of_edges():,} edges")
+    edges.index = pd.Index([_edge_id(u, v, k) for u, v, k in edges.index], name='edge_id')
+    return edges
 
 
 def _routable_mask(legs: pd.DataFrame, mode: str) -> pd.Series:
     """True where the trip's `dist_line` is within the mode's cap. 02d's
     completeness filter guarantees every leg has snapped to every mode,
     so no snap-presence check is needed here."""
-    cap = _DIST_LINE_MAX[mode]
-    if cap is None:
-        return pd.Series(True, index=legs.index)
-    return legs['dist_line'] < cap
+    return legs['dist_line'] < _DIST_LINE_MAX[mode]
+
+
+_PEAKS = ('peak', 'base', 'night')
+
+
+def _by_peak_str(out: pd.DataFrame, peak_str: pd.Series, prefix: str) -> np.ndarray:
+    """`<prefix>_car_<peak_str>` per leg; NaN where `peak_str` is unknown."""
+    return np.select([peak_str == p for p in _PEAKS],
+                     [out[f'{prefix}_car_{p}'] for p in _PEAKS], default=np.nan)
 
 
 def main(variant):
@@ -149,7 +176,7 @@ def main(variant):
         context.close()
         return
     leg_set = variant.leg_set
-    chosen_mode_only = leg_set != 'mtmc'
+    chosen_mode_only = leg_set in MOBIS_LEG_SETS
 
     with step(f'load survey legs ({leg_set})'):
         legs = context.get_generic(
@@ -197,15 +224,13 @@ def main(variant):
             # `_EXTRA_EDGE_PROPERTIES`. `_pick()` finds each feature in
             # the first frame that has it.
             feature_sources = [
-                context.get_properties(
-                    'edges', f'{mode_config.mode}_from_nodes',
-                    allow_cache=False)
-            ]
-            for extra_name in _EXTRA_EDGE_PROPERTIES.get(mode_config.mode, ()):
-                feature_sources.append(
-                    context.get_properties(
-                        'edges', extra_name, allow_cache=False))
-            path_features = _path_edge_features_for(mode_config.mode)
+                context.get_properties('edges', name, allow_cache=False)
+                for name in (f'{mode_config.mode}_from_nodes',
+                             *_EXTRA_EDGE_PROPERTIES.get(mode_config.mode, ()))]
+            feature_sources += [_node_properties_on_edges(context, name, graph)
+                                for name in _EXTRA_NODE_PROPERTIES.get(mode_config.mode, ())]
+            path_features = {**_PATH_EDGE_FEATURES_UNIVERSAL,
+                             **_PATH_EDGE_FEATURES_MODE.get(mode_config.mode, {})}
             # `length` is native; `elev_gain` / `elev_loss` attached above.
             _ALREADY_ATTACHED = ('length', 'elev_gain', 'elev_loss')
             path_feat_cols = [c for c in path_features
@@ -255,11 +280,9 @@ def main(variant):
             mask &= legs['mode_simplified'].isin(_CHOSEN_MODE_VALUES[mode_config.mode])
         orig_col = f'orig_node_id_{mode_config.mode}'
         dest_col = f'dest_node_id_{mode_config.mode}'
-        routable = legs.loc[mask, [orig_col, dest_col]].copy()
         # Snap columns round-trip through CSV as float; cast back to the
         # graph's int node ids (02d dropped legs with NaN snaps).
-        routable[orig_col] = routable[orig_col].astype(int)
-        routable[dest_col] = routable[dest_col].astype(int)
+        routable = legs.loc[mask, [orig_col, dest_col]].astype(int)
         logging.info(
             f"  → {len(routable):,}/{len(legs):,} legs routable for mode={mode_config.mode} "
             f"(dist_line cap = {_DIST_LINE_MAX[mode_config.mode]})")
@@ -335,47 +358,22 @@ def main(variant):
         # accumulating. Prevents brief double-holding at the mode boundary.
         del lean, routable
 
-    # Aggregate car profiles → `t_routed_car` picked by each leg's
-    # `peak_str`. Only fires if all 3 car profiles were routed. Mirrors
-    # the same aggregation for the naive baseline (`t_baseline_car`)
-    # when the three baseline columns are present.
-    car_cols = {'t_routed_car_peak', 't_routed_car_base', 't_routed_car_night'}
-    if car_cols.issubset(out.columns):
+    # Car profiles → `t_routed_car` (and the baseline's `t_baseline_car` and
+    # `length_baseline_car`) by each leg's `peak_str`, where all 3 profiles were routed.
+    if {f't_routed_car_{p}' for p in _PEAKS} <= set(out.columns):
         with step('aggregate car profiles → t_routed_car by peak_str'):
             peak_str = legs['peak_str']
-            out['t_routed_car'] = np.select(
-                [peak_str == 'peak', peak_str == 'base', peak_str == 'night'],
-                [out['t_routed_car_peak'],
-                 out['t_routed_car_base'],
-                 out['t_routed_car_night']],
-                default=np.nan,
-            )
+            out['t_routed_car'] = _by_peak_str(out, peak_str, 't_routed')
             n_aggregated = int(out['t_routed_car'].notna().sum())
-            n_unknown_peak = int((~peak_str.isin(['peak', 'base', 'night'])).sum())
+            n_unknown_peak = int((~peak_str.isin(_PEAKS)).sum())
             logging.info(
                 f"  → {n_aggregated:,}/{len(out):,} aggregated "
                 f"({n_unknown_peak:,} legs with unknown peak_str → NaN)")
-    car_baseline_cols = {'t_baseline_car_peak', 't_baseline_car_base', 't_baseline_car_night'}
-    if car_baseline_cols.issubset(out.columns):
+    if {f't_baseline_car_{p}' for p in _PEAKS} <= set(out.columns):
         with step('aggregate car baseline profiles → t_baseline_car by peak_str'):
             peak_str = legs['peak_str']
-            out['t_baseline_car'] = np.select(
-                [peak_str == 'peak', peak_str == 'base', peak_str == 'night'],
-                [out['t_baseline_car_peak'],
-                 out['t_baseline_car_base'],
-                 out['t_baseline_car_night']],
-                default=np.nan,
-            )
-            # `length_baseline_car` — same aggregation on the routed
-            # baseline length (naive-path length can differ from calibrated-
-            # path length when baseline speeds vary per edge).
-            out['length_baseline_car'] = np.select(
-                [peak_str == 'peak', peak_str == 'base', peak_str == 'night'],
-                [out['length_baseline_car_peak'],
-                 out['length_baseline_car_base'],
-                 out['length_baseline_car_night']],
-                default=np.nan,
-            )
+            out['t_baseline_car'] = _by_peak_str(out, peak_str, 't_baseline')
+            out['length_baseline_car'] = _by_peak_str(out, peak_str, 'length_baseline')
 
     if scenario.transit_source is None:
         logging.info('no transit in this scenario; skipping the NPVM lookup')

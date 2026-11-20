@@ -24,11 +24,12 @@ Lake removal only applies to domestic zones — no equivalent water-body
 dataset is available abroad, so foreign rows pass through unchanged into
 `traffic_zones_without_lakes.gpkg`.
 
-Inputs:
+Inputs (PUBLIC, under raw/switzerland/npvm/2023/traffic_zones/):
     Verkehrszonen_Ausland_NPVM_2023.gpkg            # ALL zones (mis-named)
     1_Verkehrszonen_Schweiz_Zentroide_NPVM_2023.gpkg # Swiss-only custom centroids
-Inputs (same-namespace; prior stage):
-    water_bodies.gpkg  (from tlm_regio.py)
+    Verkehrszonen_Schweiz_NPVM_2023.gpkg            # Swiss zones: metro, municipality
+Inputs (PUBLIC, under preparation/switzerland/general/):
+    water_bodies.gpkg                               # from tlm_regio.py
 
 Outputs (PUBLIC, under preparation/switzerland/general/):
     traffic_zones.gpkg
@@ -40,14 +41,11 @@ Run:
     python -m preparation.switzerland.public.general.traffic_zones
 """
 
-import logging
-
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 from pyproj import Transformer
 
-from aperta import data_processing
 from aperta.errors import DataError
 from aperta_atlas.context import Context, Storage, init_context
 
@@ -64,15 +62,9 @@ def load_zones(context: Context) -> gpd.GeoDataFrame:
     """Load all NPVM zones from the (mis-named) 'Ausland' file and attach
     custom Swiss centroids. Returns a GeoDataFrame indexed by `zone_id`
     (`ZD<n>` for domestic / `ZF<n>` for foreign) in LV95.
-
-    `is_domestic` is derived from the centroid merge: True iff a custom
-    centroid is shipped for the zone.
     """
-
-    # Despite its name, the Ausland file contains BOTH Swiss-domestic and
-    # foreign zones — there's no need to also load the separate
-    # `Verkehrszonen_Schweiz_NPVM_2023.gpkg` (which would duplicate the
-    # Swiss zones).
+    # Despite its name, the Ausland file holds both the Swiss and the foreign zones; the
+    # Schweiz file (below) only adds `metro` and `municipality`.
     input_dir = context.raw_path(Storage.PUBLIC, 'switzerland/npvm/2023/traffic_zones')
     zones = gpd.read_file(f'{input_dir}/Verkehrszonen_Ausland_NPVM_2023.gpkg').to_crs(CRS_CH)
     zones['ID_Zone'] = zones['ID_Zone'].astype(int)
@@ -85,10 +77,7 @@ def load_zones(context: Context) -> gpd.GeoDataFrame:
     centroids['centroid_x'] = centroids.geometry.x
     centroids['centroid_y'] = centroids.geometry.y
 
-    # Attach custom centroids (Swiss only — foreign rows get NaN here,
-    # filled with geometric centroid below). The merge key is the
-    # zone number column: `ID_Zone` in the combined file vs `No` in the
-    # centroids file (BFS keeps these consistent for Swiss zones).
+    # Swiss only: foreign rows get NaN here, filled with the geometric centroid below.
     zones = zones.join(centroids[['centroid_x', 'centroid_y']])
 
     # Domestic ⇔ a custom centroid was joined.

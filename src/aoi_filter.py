@@ -1,18 +1,15 @@
 """
-AOI-scoped filters for training and validation data.
+AOI-scoped filter for survey legs.
 
-Purpose: restrict survey legs and traffic counters used for calibration
-(04, 07, 09a, 03a) and counter-based validation (flows_vs_counters) to
-the scenario's AOI. Region-agnostic — the AOI polygon is the scenario
-area's place polygon buffered by `aoi_buffer_m`, the geometry 01 uses to
-set `is_aoi`, so any scenario works without a scenario-name check.
+Restricts the survey legs used for calibration (03a, 04, 07a, 07b, 09a) and
+travel-time validation (times_vs_survey) to the scenario's AOI. Region-agnostic —
+the AOI polygon is the scenario area's place polygon buffered by `aoi_buffer_m`,
+the geometry 01 uses to set `is_aoi`, so any scenario works without a
+scenario-name check.
 
-For switzerland-h10 (AOI = Switzerland), the filter is effectively
-a pass-through: nearly all Swiss survey legs and counters fall inside
-the country polygon. For cross-validation scenarios (cv-de-train,
-cv-fr-test, etc.) the filter scopes training / validation to the
-scenario's language region, so calibration and validation are both
-performed on the same spatial subset.
+For switzerland-h10 (AOI = Switzerland), the filter is effectively a
+pass-through. For cross-validation scenarios (cv-de-train, cv-fr-test, etc.)
+it scopes calibration and validation to the scenario's language region.
 
 Leg filter is symmetric: BOTH origin AND destination must fall inside
 the AOI. Requiring both endpoints excludes cross-region legs, which
@@ -68,24 +65,6 @@ def filter_legs_by_aoi(
         crs=crs, index=legs.index)
     mask = orig.within(aoi_polygon) & dest.within(aoi_polygon)
     kept = legs.loc[mask]
-    dropped = before - len(kept)
-    logging.info(
-        f"  → AOI filter ({label}): kept {len(kept):,}/{before:,} "
-        f"({dropped:,} dropped; {100*dropped/max(before,1):.1f} %)")
-    return kept
-
-
-def filter_points_by_aoi(
-    gdf: gpd.GeoDataFrame, aoi_polygon: BaseGeometry,
-    *, label: str = 'points',
-) -> gpd.GeoDataFrame:
-    """Return only rows whose `geometry` falls inside `aoi_polygon`.
-
-    `gdf` must be in the same CRS as `aoi_polygon`. Logs the count
-    reduction under `label` (e.g. 'traffic counters').
-    """
-    before = len(gdf)
-    kept = gdf.loc[gdf.geometry.within(aoi_polygon)].copy()
     dropped = before - len(kept)
     logging.info(
         f"  → AOI filter ({label}): kept {len(kept):,}/{before:,} "

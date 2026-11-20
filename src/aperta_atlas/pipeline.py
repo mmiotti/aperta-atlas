@@ -132,15 +132,9 @@ def _resolve_variants(stage: Stage, area: str | None) -> list[str]:
 
 def _stage_invocations(stage: Stage, python: str, scenario: str | None,
                        area: str | None) -> list[list[str]]:
-    """Build the subprocess argv list for a stage (one per variant, or one if none).
-
-    `scenario`, if provided, is appended as `--scenario <scenario>` to every
-    invocation. Preparation-namespace scripts will reject it at `init_context`;
-    the runner does not detect the namespace itself.
-
-    `area`, if provided, substitutes `${area}` placeholders in this stage's
-    `variants` list — see `_resolve_variants`.
-    """
+    """Build the subprocess argv list for a stage (one per variant, or one if none),
+    with `--scenario <scenario>` appended if given and `${area}` substituted in the
+    variants (`_resolve_variants`)."""
     base = [python]
     if stage.script:
         base.append(stage.script)
@@ -201,8 +195,7 @@ def run_pipeline(
 ) -> None:
     stages = select_stages(pipeline, start_from=start_from, only=only, skip=skip)
     if area is not None:
-        unused = not any(_AREA_PLACEHOLDER in v for s in stages for v in s.variants)
-        if unused:
+        if not any(_AREA_PLACEHOLDER in v for s in stages for v in s.variants):
             raise ProcessingError(
                 f"--area {area!r} passed but no selected stage uses "
                 f"{_AREA_PLACEHOLDER} in `variants`. Drop --area or pick a "
@@ -232,15 +225,10 @@ def list_stages(pipeline: Pipeline) -> None:
         print(f"  - {s.name}: {target}{var_str}{cwd_str}")
 
 
-def _setup_logging():
-    logging.basicConfig(level=logging.INFO,
-                        format='%(levelname)-9s %(message)s',
-                        stream=sys.stdout)
-
-
 def main():
-    _setup_logging()
-    p = argparse.ArgumentParser(prog='python -m aperta.pipeline')
+    logging.basicConfig(level=logging.INFO, format='%(levelname)-9s %(message)s',
+                        stream=sys.stdout)
+    p = argparse.ArgumentParser(prog='python -m aperta_atlas.pipeline')
     sub = p.add_subparsers(dest='command', required=True)
 
     p_run = sub.add_parser('run', help='Execute pipeline stages')

@@ -1,10 +1,7 @@
 """
 Consolidate intersections in a per-mode OSM network graph using OSMnx's
 `consolidate_intersections` + `aperta_atlas.osm.clean_consolidated_edges`.
-
-Step 3 of the network preparation pipeline (after `clip_pbf.py` and
-`networks_from_pbf.py`). Topology-changing: produces a new graphml
-with consolidated intersection nodes.
+Topology-changing: produces a new graphml with consolidated intersection nodes.
 
 Deliberately compact. Decoration steps (street count, OSM classification
 flags, obstacle snap) are SEPARATE in `networks_decorate.py`. Decorations
@@ -12,16 +9,17 @@ are pure attribute additions — they save as companion
 `properties/edges_*.csv` / `properties/nodes_*.csv` without rewriting
 the large consolidated `.graphml`.
 
-`tolerance_m` defaults to 10 m across all modes — matches OSMnx's
-convention and standard usage in the literature. Per-mode tuning is
-available via `_TOLERANCE_M` below; revisit if empirical results show
-one mode wants different aggregation.
+`tolerance_m` is the buffer radius OSMnx draws around each node: nodes up
+to 2 × tolerance apart merge (and merges chain), but only if they are
+connected within the cluster. Car keeps OSMnx's 10 m (dual carriageways);
+walk and bike use 8 m (`_TOLERANCE_M`), which merges less greedily at large
+squares and junctions (Bern-metro bike network: 6 % more nodes than at 10 m).
 
 Output CRS is WGS84 (`EPSG:4326`), uniform across the
 `preparation/world/` namespace. Country-specific reprojection (e.g. to
 LV95 for Swiss work) happens at project-stage init, not here.
 
-Cases are defined in `preparation/world/areas.py`; this script registers
+Areas are defined in `preparation/world/areas.py`; this script registers
 one `<area_name>_<mode>` variant per (area, mode) combination.
 
 Inputs (PUBLIC, under preparation/world/osm/):
@@ -33,13 +31,11 @@ Outputs (PUBLIC, under preparation/world/osm/):
     properties/edges_<area_name>_<mode>_consolidated.csv
     properties/nodes_<area_name>_<mode>_consolidated.csv
 
-Run after `networks_from_pbf.py`.
-
 Run all variants sequentially (default):
     python -m preparation.world.osm.networks_consolidate
 Single variant:
     python -m preparation.world.osm.networks_consolidate --variant switzerland_car
-    python -m preparation.world.osm.networks_consolidate --variant bern_walk
+    python -m preparation.world.osm.networks_consolidate --variant bern-metro_walk
 """
 
 import logging
@@ -69,18 +65,22 @@ _KEEP_EDGE_ATTRS = [
     'maxspeed',     # speed → time cost
     'bridge',       # float ∈ [0, 1] — length-weighted bridge fraction
     'tunnel',       # float ∈ [0, 1] — length-weighted tunnel fraction
+    'steps',        # float ∈ [0, 1] — length-weighted stairs fraction (walk_prm)
     'access',       # access restrictions
+    'motor_vehicle', 'motorcar',   # roads closed to cars (bike traffic stress)
     'service',      # service-road sub-classification
-    # Bike-friendliness tags — used to calculate "bike score" later
-    # (and for any future bike-routing logic).
+    # Bike tags (bike traffic stress, main/02b).
     'bicycle', 'cyclestreet', 'cycleway',
     'cycleway:left', 'cycleway:right', 'cycleway:both',
+    'cycleway_dir', 'lanes_dir',   # bike infra / car lanes in the edge's direction (bike stress)
+    'oneway_motor',                # one-way motor traffic (bike stress)
+    'surface', 'tracktype', 'smoothness',   # surface (main/02b `surface_type`)
+    'mtb:scale',                            # hard mountain-bike trails (main/02b `bike_push`)
 ]
 
 
-# Per-mode script-level tuning. Currently uniform across modes but
-# kept as a dict so per-mode overrides are a one-line change.
-_TOLERANCE_M = {'walk': 10, 'bike': 10, 'car': 10}
+# Consolidation buffer radius per mode (m); see the module docstring.
+_TOLERANCE_M = {'walk': 8, 'bike': 8, 'car': 10}
 
 
 variants = Variants([
@@ -142,13 +142,10 @@ def main(variant) -> None:
 
     # Post-consolidation edge cleanup: drop noise attrs, collapse list-
     # valued lanes/maxspeed, recompute length from the (now-simplified)
-    # geometry. Derived per-edge attributes like `lanes_per_direction`
-    # are written by `networks_decorate.py`, not here.
+    # geometry.
     with step('clean_consolidated_edges'):
         clean_consolidated_edges(g, drop_edge_attrs=['name', 'osmid'])
 
-    # Project back to WGS84 — uniform across the preparation/world/
-    # namespace. Country-specific reprojection happens at project init.
     with step('project back to WGS84'):
         g = ox.project_graph(g, to_crs='EPSG:4326')
 

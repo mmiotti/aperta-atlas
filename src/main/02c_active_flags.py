@@ -42,7 +42,7 @@ from scenarios import get_scenario
 def _build_merged_snap(
     context, geo_type: str, modes: tuple[str, ...], is_aoi: pd.Series,
 ) -> pd.DataFrame:
-    """Stitch per-mode `<geo_type>_<mode>_snap.csv` files into one
+    """Stitch per-mode `<geo_type>_snap_<mode>.csv` files into one
     merged frame with `node_id_<mode>` column, then AND `is_aoi` with
     all-modes-snap-success to derive `is_active`."""
     merged: pd.DataFrame | None = None
@@ -61,9 +61,7 @@ def _build_merged_snap(
     assert merged is not None
 
     # `is_active` = in AOI AND snapped to every mode the scenario uses.
-    all_modes_snapped = pd.Series(True, index=merged.index)
-    for mode in modes:
-        all_modes_snapped &= merged[f'node_id_{mode}'].notna()
+    all_modes_snapped = merged[[f'node_id_{m}' for m in modes]].notna().all(axis=1)
     in_aoi = is_aoi.reindex(merged.index).fillna(False).astype(bool)
     merged['is_active'] = (in_aoi & all_modes_snapped).astype(int)
     n_active = int(merged['is_active'].sum())

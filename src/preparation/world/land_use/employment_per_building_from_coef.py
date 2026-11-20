@@ -13,15 +13,11 @@ STATENT script), this script:
 
   1. Detects the stratification from the coefs' tag names (via
      `derive_stratification_from_tags`).
-  2. Loads STATENT hectare artifacts for the emp-density source.
-  3. Classifies each building into a stratum by local emp density
-     (1 km ring), matching how the calibration did.
-  4. Rewrites building tags to `<tag>__<stratum>` for split tags.
-  5. Applies coefs; warns loudly if any tag remains unmatched.
-
-For non-Swiss areas the density source doesn't exist yet — raises
-NotImplementedError if the coefs are stratified. Options going forward:
-GHS-POP-derived density fallback, or re-calibrate without stratification.
+  2. Classifies each building into a stratum by GHS-POP residents
+     within 1 km (`preparation.world.land_use.strata`), as the
+     calibration did; works for any area with a GHS-POP raster.
+  3. Rewrites building tags to `<tag>__<stratum>` for split tags.
+  4. Applies coefs; warns loudly if any tag remains unmatched.
 
 Uses `dasymetric.per_building_from_coefficients`:
   - Per (OSM tag, sector), reads `intensity_<sector>` from the calibrated table
@@ -34,8 +30,8 @@ Inputs (PUBLIC, cross-source):
         # from preparation/world/osm/buildings_from_pbf.py
     preparation/switzerland/land_use/coefs/employment_statent_<year>.csv
         # from preparation/switzerland/public/land_use/employment_statent.py
-    preparation/switzerland/land_use/hectares_statent_<year>.{gpkg,csv}
-        # (Swiss areas only, when coefs are stratified)
+    preparation/world/land_use/population_<area_name>.tif
+        # GHS-POP (population_ghs.py), for the density strata
 
 Outputs (PUBLIC, under preparation/world/land_use/):
     properties/buildings_employment_<area_name>.csv
@@ -52,21 +48,16 @@ Single variant:
 
 import logging
 
-import pandas as pd
-
 from aperta_atlas import dasymetric
 from aperta_atlas.context import init_context
 from aperta_atlas.utils import step
 from aperta_atlas.variant import Variants
 
 from preparation.switzerland.common import (
-    classify_density_stratum, compute_hectare_density,
     derive_stratification_from_tags, stratify_building_tags,
 )
-from preparation.switzerland.public.land_use.employment_statent import (
-    STRATUM_THRESHOLDS as _STATENT_STRATUM_THRESHOLDS,
-)
 from preparation.world.areas import AREAS
+from preparation.world.land_use.strata import building_strata, warn_on_unmatched_tags
 
 
 _SECTORS: tuple[str, ...] = ('primary', 'secondary', 'tertiary')
@@ -84,37 +75,6 @@ for area in AREAS.values():
         area_name=area.name,
         calibration_year='2024',
     )
-
-
-def _load_hectare_density_source(context, calibration_year: str):
-    """Load STATENT hectare cells + values for use as an emp-density
-    source. Swiss-only for now."""
-    lu_ch = context.source('preparation/switzerland/land_use')
-    cells = lu_ch.get_generic(f'hectares_statent_{calibration_year}.gpkg')
-    totals = lu_ch.get_generic(
-        f'hectares_statent_{calibration_year}.csv',
-        kws={'index_col': 'cell_id'},
-    )
-    return cells, totals
-
-
-def _warn_on_unmatched_tags(buildings, coef_tags: set[str]) -> None:
-    """Log a WARNING listing OSM tag values present in `buildings` but
-    absent from the calibrated coefs — those buildings will be silently
-    filtered out by `per_building_from_coefficients`. Post-stratification,
-    a healthy run should show zero missing."""
-    building_tags = set(buildings['building'].dropna().astype(str).unique())
-    missing = building_tags - coef_tags
-    if not missing:
-        return
-    n_affected = int(buildings['building'].isin(missing).sum())
-    frac = 100.0 * n_affected / max(len(buildings), 1)
-    preview = sorted(missing)[:20]
-    more = f' (+{len(missing) - 20} more)' if len(missing) > 20 else ''
-    logging.warning(
-        f"  ⚠ {n_affected:,} buildings ({frac:.1f}%) have tags not in "
-        f"calibrated coefs — will be dropped from allocation. "
-        f"Missing tags: {preview!r}{more}")
 
 
 def main(variant) -> None:
@@ -139,40 +99,18 @@ def main(variant) -> None:
         logging.info(
             f"  → coefs are stratified: split_tags={sorted(split_tags)!r}, "
             f"strata={strata!r}")
-        if not AREAS[variant.area_name].is_swiss:
-            raise NotImplementedError(
-                f"Calibrated coefs are stratum-expanded but area "
-                f"{variant.area_name!r} is not Swiss; STATENT hectare "
-                f"density is only available for Swiss areas. Either add "
-                f"a GHS-POP-based density fallback for non-Swiss areas, "
-                f"or re-calibrate STATENT with `_SPLIT_TAGS = set()` for "
-                f"stratification-free coefs.")
-
-        with step('classify buildings by local emp density (1 km ring)'):
-            hex_cells, hex_totals = _load_hectare_density_source(
-                context, variant.calibration_year)
-            # OSM buildings ship in EPSG:4326 (degrees); hectares are LV95
-            # (metres). Reproject so centroid + radius are metric.
-            assert hex_cells.crs is not None
-            if buildings.crs != hex_cells.crs:
-                buildings = buildings.to_crs(hex_cells.crs)
-                logging.info(f"  → reprojected buildings to {buildings.crs}")
-            buildings['emp_density_1km'] = compute_hectare_density(
-                buildings, hex_cells, hex_totals,
-                column='employment_total', radius_m=1_000.0,
-            )
-            buildings['stratum'] = classify_density_stratum(
-                buildings['emp_density_1km'], _STATENT_STRATUM_THRESHOLDS)
+        with step('classify buildings by GHS-POP density (1 km ring)'):
+            buildings['stratum'] = building_strata(context, buildings, variant.area_name)
             counts = buildings['stratum'].value_counts()
             logging.info(
-                f"  → stratum counts: " +
+                "  → stratum counts: " +
                 ", ".join(f"{s}={counts.get(s, 0):,}"
                           for s in ('rural', 'suburban', 'urban')))
 
         with step(f'stratify building tags (split_tags={sorted(split_tags)!r})'):
             stratify_building_tags(buildings, split_tags)
 
-    _warn_on_unmatched_tags(buildings, set(str(t) for t in calibrated.index))
+    warn_on_unmatched_tags(buildings, {str(t) for t in calibrated.index})
 
     with step('apply calibrated intensities × area'):
         out = dasymetric.per_building_from_coefficients(
@@ -182,18 +120,14 @@ def main(variant) -> None:
         )
         sector_sum = sum(out[f'employment_{s}'].sum() for s in _SECTORS)
         logging.info(
-            f"  → assigned {out['employment_total'].sum():,.0f} total FTE "
+            f"  → assigned {out['employment_total'].sum():,.0f} total employees "
             f"across {len(out):,} buildings | " +
             ", ".join(f"{s}={out[f'employment_{s}'].sum():,.0f}"
                       for s in _SECTORS) +
             f" | Σsectors={sector_sum:,.0f}")
 
-    # Save: per-building employment columns as a property file (no
-    # geometry — `buildings_from_pbf.py`'s shapes file is the geometry
-    # source of truth, joined back via the `building_id` index).
-    data_name = f'employment_{variant.area_name}'
-    props = out[list(_OUTPUT_COLUMNS)].copy()
-    context.create_properties(props, data_name=data_name)
+    context.create_properties(out[list(_OUTPUT_COLUMNS)].copy(),
+                              data_name=f'employment_{variant.area_name}')
     context.close()
 
 

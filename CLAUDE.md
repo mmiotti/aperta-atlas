@@ -4,24 +4,13 @@ Current-state guidance for Claude Code working in this repo.
 
 ## Project nature
 
-Three interlinked but distinct names:
-
-- **`aperta`** — the reusable Python library, in the sibling
-  [`../aperta/`](../aperta/) directory (also at `git@github.com:mmiotti/aperta.git`).
-  Pure algorithms — routing, accessibility, OD pairs, calibration. On PyPI
-  alongside the toolkit paper. Brought into this repo as a pinned
-  dependency declared in [pyproject.toml](pyproject.toml).
-- **`aperta-atlas`** — this repository (formerly `aperta-lab`). Holds
-  (a) the `aperta_atlas` Python package — opinionated project
-  scaffolding on top of `aperta`: context / typed I/O / coefs /
-  pipeline / variants — and (b) the canonical project built on it,
-  the Swiss "Urban Mobility Atlas" pipeline under `src/`.
-- **"Urban Mobility Atlas"** — the human-facing publication name for
-  the deliverable produced from this repo's `atlas/`.
-- **`aperta-lumos`** (sibling repo, **private**) — historic per-year
-  Swiss accessibility, uses proprietary BFS data. Imports the
-  `aperta_atlas` scaffolding from this repo; not reproducible by
-  third parties. See `../aperta-lumos/`.
+This repo (formerly `aperta-lab`) holds (a) `aperta_atlas`, opinionated
+project scaffolding on `aperta` (context / typed I/O / coefs / pipeline /
+variants), and (b) the project built on it, the Swiss Aperta Accessibility
+Atlas pipeline, flat in `src/`. The `aperta` library is the sibling repo
+[`../aperta/`](../aperta/) (pinned in [pyproject.toml](pyproject.toml)). The
+workspace guide `../home/CLAUDE.md` covers the other repos and the shared
+working norms.
 
 Research codebase. Combines transport networks + land-use data to compute
 accessibility metrics at high spatial resolution. Designed Swiss-first, the
@@ -30,17 +19,20 @@ library is region-agnostic. Data inputs/outputs live outside the repo
 
 ## The aperta workflow
 
-aperta is organized around a six-phase workflow. Every library module slots
-into one of these phases.
+aperta 0.4 is organized around a six-phase workflow. Every library module
+slots into one of these phases.
 
 1. **Load and prepare data** — networks (per mode); land use; topography.
 2. **Map data to units** — `cells → zones` aggregation hierarchy
    via `geo_mapping` + `network_snap.snap_to_network_nodes`.
 3. **Build sparse OD pairs** — `od_pairs.get_pairs` returns a
-   `TieredODNodePairs` (three distance tiers: cells_to_cells,
-   cells_to_zones, zones_to_zones — node-keyed). Lift to
-   `TieredODGeoPairs` (cell/zone-keyed) via
-   `od_pairs.reindex_by_geo_unit` for cross-modal alignment.
+   `TieredODNodePairs` (node-keyed). Lift to `TieredODGeoPairs`
+   (cell/zone-keyed) via `od_pairs.reindex_by_geo_unit` for cross-modal
+   alignment. Three distance tiers, each a dict-of-arrays at its own
+   resolution: `cells_to_cells` (close), `cells_to_zones` (medium —
+   cell-resolution origin, zone-resolution dest), `zones_to_zones` (far).
+   Consumed by `routing.tiered_path_costs`, `accessibility.*`,
+   `traffic_flows.nested_node_sample`.
 4. **Estimate traffic flows** — `traffic_flows.nested_node_sample` +
    betweenness via `network_processing.get_nested_edge_betweenness`.
 5. **Estimate travel costs** — `routing.tiered_path_costs` /
@@ -54,41 +46,20 @@ into one of these phases.
    `od_pairs.aggregate_across_modes` on per-mode `TieredODGeoPairs`,
    then any accessibility primitive on the combined ODM.
 
-For the `aperta` library itself see [`../aperta/README.md`](../aperta/README.md).
-The library's `tests/test_workflow.py` is the runnable ~150-line minimal
-example showing the full workflow on a toy world; it doubles as the
-integration test. Real-world examples live in [`../aperta/examples/`](../aperta/examples/):
-`minimal/` is the simplest walking-only example (Cambridge MA, ~10 s),
-`walkthrough/` covers every primitive including multi-modal walk + bike
-and cross-modal logsum (Central Paris, ~40 s), `calibration/` is the
-traffic-flow + edge-weight calibration showcase (Canton of Zurich), and
-`benchmarks/` compares routing performance.
-
-## Reference structures
-
-- **Scaffolding package** (in this repo): [src/aperta_atlas/](src/aperta_atlas/).
-- **Reference project**: [src/](src/) (the multi-modal accessibility atlas).
-- **Reference preparation**: [src/preparation/world/](src/preparation/world/)
-  (public-data chain, driven by `preparation/world/pipeline.yml --area <name>`).
-- **Example notebooks**: live in the sibling
-  [`../aperta/examples/`](../aperta/examples/) — lightweight notebooks using
-  `aperta` directly (no scaffolding).
-
-`src/_archive/` and `src/misc/` are gitignored, local-only folders
-(pre-refactor legacy code, one-off diagnostics). Do not import from them
-in new code.
+`../aperta/tests/test_workflow.py` is the runnable toy-world example (and
+integration test); real-world examples:
+[`../aperta/examples/README.md`](../aperta/examples/README.md). The 0.5
+refactor (`../home/planning/refactor-v0.5/aperta_refactor_plan.md`) will
+replace much of this API; it is planned, not started, so the 0.4 names above
+are current.
 
 ## Source layout
 
 ```
 src/
-    aperta_atlas/                  # the scaffolding package (installed as `aperta_atlas`)
-        context.py                 # Context + init_context (filesystem + paths + typed I/O methods)
-        tracking.py                # opt-in dependency tracking (status.json); Context delegates here
-        coefs.py                   # CoefSource (Calibrate/ImportFrom/HandWritten) + resolve dispatcher
-        pipeline.py                # YAML-driven pipeline runner (optional)
-        variant.py                 # `Variants` class for per-script run-variants (optional)
-        utils.py                   # generic helpers (step ctx manager, named-tuple tracking)
+    aperta_atlas/                  # scaffolding package; module map in its __init__.py
+        context.py tracking.py coefs.py pipeline.py variant.py utils.py   # framework
+        osm.py graph_simplification.py dasymetric.py stats_helpers.py routing_mp.py  # helpers
     preparation/                   # scenario-free prep (raw → reusable prepared assets)
         switzerland/
             common.py              # Swiss-wide constants (CRS_CH, CRS_LATLON) + helpers
@@ -111,12 +82,18 @@ src/
     mode_configs.py                # `ModeConfig` per road mode + `TRANSIT_MODE_CONFIG`
     aoi_filter.py                  # restrict calibration / validation data to the scenario AOI
     main/                          # accessibility pipeline (build outputs); main/pipeline.yml runs all stages
-    survey/                        # survey legs → routed times → overheads → stats (02d, 05, 08a, 08b, 08c);
-                                   #   variants per leg set: mtmc (default), mobis_precovid, mobis_covid
+    survey/                        # legs → routed times → overheads → stats (02d, 05, 08a-c;
+                                   #   stages of main/pipeline.yml) + 08d (R5 timetable reference
+                                   #   for transit trips; standalone; needs r5py + Java, not in
+                                   #   pyproject); variants per leg set: mtmc (default),
+                                   #   mobis_precovid, mobis_covid
     technical_validation/          # checks of a scenario: vs surveys, transit trips, counters; exact vs tiered OD;
                                    #   scenario vs reference (plan: scenarios_technical_validation.py)
     data_paper/                    # figures + LaTeX table bodies of the Scientific Data descriptor
+                                   #   (papers/atlas-pipeline)
     research/                      # gitignored: private experimental scripts (`python -m research.<script>`)
+    wctr_paper/                    # gitignored: figure scripts of papers/bike-times-wctr
+    _archive/, misc/               # gitignored local-only: legacy code, diagnostics; never import
 tests/                             # scaffolding unit tests
 status/status.json                 # dependency tracker output (when tracking enabled)
 results/<project>/<scenario>/      # figure outputs
@@ -136,10 +113,6 @@ sets `STORAGE = Storage.PRIVATE` because the survey data is proprietary).
 The only YAML files are the `pipeline.yml` files (per-pipeline
 definitions; consumed by the optional pipeline runner).
 
-The `aperta` library itself is **not** in this repo — it lives in the
-sibling `../aperta/` directory (or installed from PyPI). See [pyproject.toml](pyproject.toml)
-for the version pin.
-
 ## Conventions
 
 **Library / preparation boundary.** If the code could run 1:1 on a different
@@ -152,7 +125,10 @@ a US user with their road network?
 land under `<DATA_DIR_*>/preparation/<region>/<sub>/<rel>` and are
 project-agnostic (any project repo can read them). Project code is
 *scenario-bound* — typed I/O writes under
-`<DATA_DIR_*>/<PROJECT_NAME>/<scenario>/<rel>`.
+`<DATA_DIR_*>/<PROJECT_NAME>/<scenario>/<rel>`. The `public/` / `private/`
+folders only set the storage class and are dropped from the namespace: a
+script in `preparation/switzerland/private/surveys/` is read via
+`context.source('preparation/switzerland/surveys', storage=Storage.PRIVATE)`.
 
 **Project subfolders are organisational.** `main/`, `technical_validation/`,
 `data_paper/` etc. don't become scenarios and don't
@@ -187,12 +163,6 @@ of per-OD-pair values aligned to that origin's dest list. Dict-of-arrays is
 deliberate — ~100× faster row access than scipy sparse, string keys are
 readable. Do not silently convert to sparse / 2D arrays.
 
-**TieredODPairs.** Three distance tiers: `cells_to_cells` (close),
-`cells_to_zones` (medium — cell-resolution origin, zone-resolution dest),
-`zones_to_zones` (far). Each tier is a dict-of-arrays at its own resolution.
-Built by `od_pairs.get_pairs`; consumed by `routing.tiered_path_costs`,
-`accessibility.cumulative_opportunities`, `traffic_flows.nested_node_sample`.
-
 **Coordinate systems (Switzerland).** `EPSG:2056` (LV95, meters) is the
 canonical CRS for internal processing. `EPSG:4326` only at lat/lon
 boundaries (external APIs).
@@ -213,12 +183,8 @@ conceptual inventory + new-scenario recipe.
 
 ## Context layer (opt-in opinionated)
 
-The aperta algorithm modules (`routing`, `accessibility`, `od_pairs`,
-`traffic_flows`, the `geo_*` and `network_processing` modules) work on plain
-numpy / pandas / networkx — **no Context required**. Use them directly when
-you just want algorithms.
-
-The `aperta_atlas` scaffolding layer adds:
+aperta's algorithm modules need no Context; the `aperta_atlas` scaffolding
+layer adds:
 
 - **Resolved filesystem paths** derived from `.env` + project/scenario.
 - **Typed I/O**: `context.create_*` / `get_*` for shapes, properties, ODMs,
@@ -228,11 +194,9 @@ The `aperta_atlas` scaffolding layer adds:
   preparation namespace declares a `STORAGE` constant in its `__init__.py`.
   Both are read by `Context.default_storage` so scripts don't need to pass
   `storage=Storage.X` on every call.
-- **Optional dependency tracking**: opt in via `APERTA_TRACK_DEPENDENCIES=1`
-  in `.env`. When on, `status/status.json` records script hashes and
-  created/consumed data per run; subsequent runs warn about stale upstream
-  data. Off by default — newbie scripts run as one-shot with no
-  `status.json` clutter.
+- **Opt-in dependency tracking** (`APERTA_TRACK_DEPENDENCIES=1` in `.env`):
+  `status/status.json` records script hashes and data I/O and warns about
+  stale upstream data.
 
 Script template:
 
@@ -265,24 +229,15 @@ hand (mixed-storage preparation namespace) or unreachable cross-repo:
 
 ## Setup
 
-- Python **3.12** (3.13 not yet supported — `pyosmium` and a few other
-  geo / scientific deps don't have 3.13 wheels on conda-forge yet).
-  `pyproject.toml` declares ≥ 3.12 and `aperta>=0.4.3a0,<0.5`.
-- Dependencies declared in [pyproject.toml](pyproject.toml) (this repo, for
-  `aperta_atlas` + project deps) and in the sibling [../aperta/pyproject.toml](../aperta/pyproject.toml)
-  (for the `aperta` library).
-- **Conda-forge** for the PBF tooling — `osmium-tool` (CLI used by
-  `preparation/world/osm/clip_pbf.py`) and `pyosmium` (Python bindings
-  used by the `*_from_pbf.py` scripts) are not on PyPI. Install both via
-  `conda install -c conda-forge osmium-tool pyosmium`.
-- Development install (both packages from local checkouts):
-  ```bash
-  conda create -n aperta python=3.12
-  conda activate aperta
-  conda install -c conda-forge osmium-tool pyosmium    # PBF tooling, not on PyPI
-  pip install -e ../aperta              # the algorithm library
-  pip install -e '.[projects]'          # this repo: scaffolding + heavy project deps
-  ```
+- Python **3.12**, the tested version (`pyproject.toml`: `>=3.12`,
+  `aperta>=0.4.4a0,<0.5`). Stage 09a needs the `[estimation]` extra
+  (biogeme 3.2, which only installs on 3.12). aperta's CI also covers 3.13.
+- **Conda-forge** for `osmium-tool` (the `osmium` CLI used by
+  `preparation/world/osm/clip_pbf.py`; not on PyPI):
+  `conda install -c conda-forge osmium-tool`. `pyosmium` (imported as `osmium`
+  by the `*_from_pbf.py` scripts) comes from PyPI via the `[projects]` extra.
+- Install: `../home/CLAUDE.md` (all repos) or [README "Setup"](README.md#setup)
+  (this repo alone).
 - Mark `src/` as the IDE's Sources Root.
 - **Run from terminal, not VSCode Cmd+R**, for any script that calls
   `osmium` or other conda-only binaries. VSCode launches don't activate
@@ -297,69 +252,30 @@ hand (mixed-storage preparation namespace) or unreachable cross-repo:
 ## Running scripts
 
 ```bash
-cd src && python -m main.03b_traffic_flows --scenario switzerland-h10
+cd src
+python -m main.03b_traffic_flows --scenario switzerland-h10          # one script
+python -m aperta_atlas.pipeline run main/pipeline.yml --scenario switzerland-h10
+python -m aperta_atlas.pipeline run preparation/world/pipeline.yml --area <name>
 ```
 
-Scenarios: pass `--scenario <name>` or set `DEFAULT_SCENARIO = '<name>'`
+The pipeline runner takes `--from` / `--only` / `--skip <stage>` for partial
+runs. Scenarios: pass `--scenario <name>` or set `DEFAULT_SCENARIO = '<name>'`
 in `src/scenarios.py`. Variants: pass `--variant <name>`
 for scripts that declare a `Variants(...)` registry. Preparation scripts
 reject `--scenario` (they're scenario-free).
 
 ## Tests
 
-Tests live with each package.
-
-- **aperta** (in sibling repo): ~450 tests under `aperta/tests/`. Run from
-  the aperta clone: `python -m unittest discover -s tests -t .`. Also runs
-  in GitHub Actions on every push to `mmiotti/aperta`, alongside Ruff
-  lint/format and mypy type-checking jobs.
-- **aperta_atlas** (this repo): 99 tests under [tests/](tests/). Run from
-  the repo root:
-  ```bash
-  python -m unittest discover -s tests -t .
-  ```
-  Covers `Context.create_/get_tiered_odm` round-trips, `coefs` resolution, the
-  pipeline runner, dasymetric mapping, and OSM helpers. Other `Context`
-  methods and `variant` remain untested (exercised indirectly by project
-  scripts).
+`python -m unittest discover -s tests -t .` from the repo root (~100 tests):
+tiered-ODM round-trips, coefs resolution, pipeline runner, dasymetric mapping,
+OSM helpers. Other `Context` methods and `variant` are exercised only by
+project scripts.
 
 ## Docstring convention for scripts
 
-Every script in `src/preparation/` and `src/` has a
-top-of-file docstring with this shape:
-
-```python
-"""
-<One-line summary in present tense.>
-
-<1-2 paragraphs explaining what the script does and why.>
-
-Inputs[ (under <DATA_DIR_*>/<storage_root>/<path>/)]:
-    [<typed-subfolder/>]<filename pattern>      # optional comment
-    ...
-
-Outputs:
-    <filename pattern>      # <Storage class> — one-line description
-    ...
-
-Run all variants sequentially (default):
-    python -m <namespace>.<filename>
-Single variant:
-    python -m <namespace>.<filename> --variant <name>
-[Project scripts only — pick a scenario:]
-    python -m <namespace>.<filename> --scenario <name>
-```
-
-Canonical example: [preparation/world/osm/clip_pbf.py](src/preparation/world/osm/clip_pbf.py).
-
-## Working norms
-
-- **Step-by-step refactor.** Don't propose sweeping rewrites in a single change.
-- **Suggestions are wanted.** Surface trim/consolidate opportunities you
-  notice along the way; the user wants suggestions in addition to execution.
-- **Ask when unclear** — especially about destination layout and naming for
-  ongoing reorganization. A quick clarifying question beats guessing wrong.
-- **Docs may lie.** When code disagrees with a docstring or this CLAUDE.md,
-  trust the code and offer to fix the doc.
-- **KISS / DRY / YAGNI.** Library complexity is at the upper limit the
-  maintainer wants to carry; new abstractions need a clear, concrete payoff.
+Every script under `src/` opens with a docstring: one-line present-tense
+summary; 1–2 paragraphs on what and why; `Inputs (<STORAGE>, under <path>/):`
+and `Outputs (...)` blocks of filename patterns, each with a one-line comment
+(outputs name their `Storage` class); then the `python -m` run lines (all
+variants, `--variant <name>`, `--scenario <name>` for project scripts).
+Canonical example: [clip_pbf.py](src/preparation/world/osm/clip_pbf.py).

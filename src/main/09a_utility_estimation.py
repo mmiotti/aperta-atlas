@@ -1,21 +1,30 @@
 """
-Estimate mode-choice utility coefficients on the survey legs via biogeme.
+Estimate mode-choice utility coefficients on the door-to-door survey trips via
+biogeme.
+
+One observation per trip of survey/02d's trip set (`main.common.survey_trips`,
+the trips 07a and 07b fit the overheads on): the chosen mode is the trip's main
+mode, and every alternative's time runs door to door between the trip's ends
+(survey/05, overheads from survey/08a), as the atlas computes it between cells.
 
 Per-mode utility functions with:
   - mode-specific ASC (walk is the base, ASC_walk fixed at 0)
-  - travel time as `β_t · (t − T) + β_ln · log(t / T)` (t in MINUTES), centered
-    at T = `UTILITY_T_REF_MIN` (main.common), so each ASC is the utility of a
-    T-minute trip; T is stored in the coef file as `t_ref_min`
-  - location features driven by the `location_features` variant axis
-    (endpoints_combined / endpoints_separate / route — see below)
+  - travel time in MINUTES (`time_form` axis below; piecewise coefs
+    `b_time_pw_<mode>_<lo>_<hi>`), centered at T = `UTILITY_T_REF_MIN` (main.common),
+    so each ASC is the utility of a T-minute trip; T is stored as `t_ref_min`
+  - location features (`location_features` axis below)
   - sociodemographic covariates (weather, sex, age bins, income bins),
     with per-mode applicability declared in `_SD_COL_MODES`
   - per-feature "base mode" logic: location + SD terms are added ONLY
     to modes listed in the feature's free-modes tuple; the omitted mode
     is the feature's base (β = 0 implicit)
-  - optional car peak/night interactions (ASC / time / feature — see
-    `_parse_car_peak_night`)
+  - peak/night shifts (`car_peak_night`, `peak_night_asc_modes` axes below)
   - `weight_person` for weighted MLE
+
+Variants: `default`, and `default_route` (route aggregates instead of endpoint
+features; a spec comparison, declared in switzerland-h10 only and run by hand).
+`default_linlog` (linear + log time terms, the form before 2026-11-15) is declared in no
+scenario, so `main` skips it; misc/utility_time_shape fits it next to `default`.
 
 Variant axes:
   - `time`:              `net` | `gross` (adds survey/08a overheads)
@@ -23,22 +32,33 @@ Variant axes:
                          `exogenous` (AND vehicle ownership from sd cols)
   - `ebikes`:            `exclude` | `separate` (5th mode) | `nested`
                          (bike/ebike nest with shared MU)
-  - `single_leg_only`:   drop multi-leg-trip legs (transit exempt)
   - `subset_fraction`:   uniform random sample of the filtered rows
   - `location_features`: `endpoints_combined` (orig+dest summed, one
                          coef per feature) | `endpoints_separate` (two
-                         coefs per feature) | `route` (per-leg route
+                         coefs per feature) | `route` (per-trip route
                          aggregates from survey/05)
+  - `time_form`:         `piecewise` (one slope per time band, knots per mode
+                         in `_PIECEWISE_KNOTS_MIN`) | `linlog` (linear + log
+                         time, centered at T; fitted only, 09b reads piecewise)
   - `car_peak_night`:    comma-separated tokens combining additively;
                          `asc`, `time`, or a biogeme variable name.
                          Empty = no peak/night effect. See
                          `_parse_car_peak_night` for the full grammar.
+  - `peak_night_asc_modes`: comma-separated non-car modes (`rbike`,
+                         `transit`, `ebike25`) that also get peak and
+                         night ASC shifts, relative to walking (the base,
+                         whose ASC is 0). Their ODMs (09b) are at base
+                         hours; 10 applies the shifts in the cross-modal
+                         profiles. Empty = car only.
+  - `darkness`:          departure in darkness, for bike, transit and car
+                         vs walk (`_DARK_SD_COL_MODES`). Off in all variants.
+  - `seasons`:           season terms on the same modes
+                         (`_SEASON_SD_COL_MODES`). Off in all variants.
 
 Inputs (PRIVATE):
-    generic/survey_legs.csv                          # survey/02d
-    generic/survey_leg_times.csv                     # survey/05
-    generic/survey_leg_overheads.csv                 # survey/08a
-    generic/survey_summary.csv                       # survey/08c — for t_cut_min bake-in
+    generic/survey_trips.csv                         # survey/02d (--variant mtmc_trips)
+    generic/survey_trip_times.csv                    # survey/05 (--variant mtmc_trips)
+    generic/survey_trip_overheads.csv                # survey/08a (--variant mtmc_trips)
 
 Inputs (scenario storage, under <scenario>/):
     properties/nodes_{walk,bike,car}_extended.csv    # 02b
@@ -51,8 +71,7 @@ Outputs (scenario storage, under <scenario>/):
                                                       # rob_std_err, rob_t_test,
                                                       # rob_p_value)
     coefs/<kind>/utility_<variant>_stats.csv         # companion sidecar (rows:
-                                                      # sd_avg_<sd_col> +
-                                                      # t_cut_min_<mode>; two-col
+                                                      # sd_avg_<sd_col>; two-col
                                                       # `key, value`); same coef
                                                       # source as the parent
     biogeme/<variant>/                               # SCRATCH — biogeme logs + reports
@@ -83,14 +102,25 @@ from aperta_atlas.utils import step
 from aperta_atlas.variant import Variants
 
 from aoi_filter import filter_legs_by_aoi, load_aoi_polygon
-from main.common import UTILITY_T_REF_MIN, car_overhead_by_peak, car_routed_bias_by_peak
+from main.common import (
+    CHOICE_QUALITY_FLAGS,
+    TRIP_SET,
+    UTILITY_T_REF_MIN,
+    car_overhead_by_peak,
+    car_routed_bias_by_peak,
+    compute_sd_averages,
+    piecewise_time_coef_name,
+    survey_file,
+)
+from main.utility_config import FEATURE_SCALE as _FEATURE_SCALE
+from main.utility_config import POINT_FEATURE_SOURCES as _POINT_FEATURE_SOURCES
 from mode_configs import MODE_CONFIGS, TRANSIT_MODE_CONFIG
 from scenarios import get_scenario
 
 
-# Per-mode physical floor on per-leg time (seconds); protects the fit from
+# Per-mode physical floor on per-trip time (seconds); protects the fit from
 # below-floor values (e.g. short routed times + negative overheads). NPVM has no
-# same-zone transit times; such legs have no transit time and transit is unavailable.
+# same-zone transit times; such trips have no transit time and transit is unavailable.
 _MIN_ROUTE_TIME_S_PER_MODE: dict[str, float] = {
     'walk':    MODE_CONFIGS['walk'].min_route_time_s,
     'rbike':   MODE_CONFIGS['bike'].min_route_time_s,
@@ -111,7 +141,7 @@ _MODE_IDS: dict[str, int] = {
     'ebike25': 5,   # only present when variant.ebikes != 'exclude'
 }
 
-# Mode → routing profile in survey_leg_times.csv + survey_leg_overheads.csv.
+# Mode → routing profile in survey_trip_times.csv + survey_trip_overheads.csv.
 # Transit uses `t_routed_transit_z2z` (NPVM z2z lookup); car uses the
 # peak-str-aggregated `t_routed_car` column.
 _MODE_TO_PROFILE: dict[str, str] = {
@@ -128,44 +158,30 @@ _MODE_TO_PROFILE: dict[str, str] = {
 # (`_POINT_FEATURE_SOURCES`).
 _ENDPOINT_FEATURES: dict[str, tuple[str, ...]] = {
     'density_r500_norm':          ('rbike', 'transit', 'car'),
-    'bike_infra_score_avg_r250':  ('walk', 'rbike', 'transit'),
-    'speed_limit_avg_r250':       ('rbike', ),
+    # Bike traffic stress around the endpoint: shares of edges at levels 0-1 (none / very low)
+    # and 4-5 (high / very high); 2-3 is the reference. Walk is the base mode, as for density
+    # and traffic flow, so the rbike coefficient is the cycling-specific effect; against car,
+    # both shares mostly mark car-unfriendly places (paths, pedestrian areas; arterials).
+    'bike_stress_share_01_r250':  ('rbike', 'transit', 'car'),
+    'bike_stress_share_45_r250':  ('rbike', 'transit', 'car'),
+    'speed_limit_avg_r250':       ('rbike', 'transit', 'car'),
     'traffic_flow_avg_r250':      ('rbike', 'car', 'transit'),
     'mean_abs_slope_r250':        ('walk', 'rbike', 'transit'),
 }
 
-# Per-feature source graph (single source of truth in main.utility_config,
-# shared with 09b via `common.join_util_node_features`).
-from main.utility_config import POINT_FEATURE_SOURCES as _POINT_FEATURE_SOURCES
-
-# ROUTE variant: features from survey/05's per-profile route aggregates in
-# `survey_leg_times.csv`. Each biogeme feature copies from ONE default-profile
-# column per `_ROUTE_FEATURE_DEFAULTS`. Elevation here is cumulative-along-
-# route (survey/05 sums), not endpoint Δ; n_traffic_signals is route-only.
+# ROUTE variant: the endpoint features, as length-weighted means along a route (survey/05's
+# per-profile aggregates in `survey_trip_times.csv`), with the same free modes. Each copies from
+# ONE profile's column per `_ROUTE_FEATURE_DEFAULTS`: the car at base hours (a representative
+# urban route) for density, speed limit and traffic flow; cycling for bike stress and slope.
 _ROUTE_FEATURES: dict[str, tuple[str, ...]] = {
-    # 'elev_gain_route':                  ('walk', 'rbike', 'transit'),  # CAR = base
-    # 'elev_loss_route':                  ('walk', 'rbike', 'transit'),
-    'density_r500_norm_route':          ('rbike', 'transit', 'car'),   # walk = base
-    'bike_infra_score_avg_r250_route':  ('rbike', 'transit', 'car'),   # walk = base
-    'speed_limit_avg_r250_route':       ('walk', 'rbike', ),
-    'vc_beta_2.0_route':                ('car', ),
-    # 'traffic_flow_avg_r250_route':      ('car', ),
-    'mean_abs_slope_r250_route':        ('walk', 'rbike', 'transit'),  # CAR = base
-    'n_traffic_signals_route':          ('transit', ),  # CAR = base
-}
-
-# Which survey/05 column each route feature copies from. Default-mode picks:
-# rwalk for elev (walk-experienced climb); car_base for density / signals /
-# speed / flow (representative urban route); rbike for bike_infra + slope.
+    f'{root}_route': modes for root, modes in _ENDPOINT_FEATURES.items()}
 _ROUTE_FEATURE_DEFAULTS: dict[str, str] = {
-    'elev_gain_route':                  'elev_gain_rwalk',
-    'elev_loss_route':                  'elev_loss_rwalk',
     'density_r500_norm_route':          'density_r500_norm_car_base',
-    'bike_infra_score_avg_r250_route':  'bike_infra_score_avg_r250_rbike',
+    'bike_stress_share_01_r250_route':  'bike_stress_share_01_r250_rbike',
+    'bike_stress_share_45_r250_route':  'bike_stress_share_45_r250_rbike',
     'speed_limit_avg_r250_route':       'speed_limit_avg_r250_car_base',
-    'vc_beta_2.0_route':                'vc_beta_2.0_car_base',
+    'traffic_flow_avg_r250_route':      'traffic_flow_avg_r250_car_base',
     'mean_abs_slope_r250_route':        'mean_abs_slope_r250_rbike',
-    'n_traffic_signals_route':          'n_traffic_signals_car_base',
 }
 
 # Sociodemographic covariates → free-coef modes. Weather is bike-only (car
@@ -186,6 +202,47 @@ _SD_COL_MODES: dict[str, tuple[str, ...]] = {
     'sd_cat_income_16001+':         ('rbike', 'transit', 'car'),
 }
 _SD_COLS: tuple[str, ...] = tuple(_SD_COL_MODES)
+
+# `darkness`: departure in darkness (sun below civil twilight, survey `is_daylight` = 0),
+# relative to walking, like the covariates above. `seasons`: season terms (summer is the
+# reference) on the same modes, to control for confounding: darkness goes with winter, which
+# also changes mode choice (cold, snow), and the night profile is dark by the hour, in every
+# season. Named `sd_*` so that 09b evaluates them at their averages over the trips, like the
+# covariates (sidecar `sd_avg_*`; `add_condition_columns` in `_compute_utility_stats`), so the
+# season terms drop out of the released utilities.
+# Tested 2026-11-13 (switzerland-h10) for the night profile of the cross-modal logsum (67 % of
+# its legs depart in darkness, 7 % at base and peak hours). With seasons, cycling only:
+# darkness +0.03 (ns); seasons vs summer −0.55 (winter), −0.20 (spring), −0.16 (fall). Without
+# seasons: darkness −0.05 cycling, +0.10 transit, +0.01 car (ns). Both off: even the largest
+# naive effect shifts night utilities by ~0.06, and the released utilities are annual averages.
+_DARK_SD_COL_MODES: dict[str, tuple[str, ...]] = {
+    'sd_bool_dark':          ('rbike', 'transit', 'car'),
+}
+_SEASON_SD_COL_MODES: dict[str, tuple[str, ...]] = {
+    'sd_cat_season_winter':  ('rbike', 'transit', 'car'),
+    'sd_cat_season_spring':  ('rbike', 'transit', 'car'),
+    'sd_cat_season_fall':    ('rbike', 'transit', 'car'),
+}
+
+
+def add_condition_columns(trips: pd.DataFrame) -> pd.DataFrame:
+    """The trips with the darkness and season columns (`_DARK_SD_COL_MODES`,
+    `_SEASON_SD_COL_MODES`), from the survey's `is_daylight` and `season` at departure (NaN
+    where those are missing)."""
+    trips = trips.copy()
+    trips['sd_bool_dark'] = 1.0 - pd.to_numeric(trips['is_daylight'], errors='coerce')
+    season = trips['season']
+    for s in ('winter', 'spring', 'fall'):
+        trips[f'sd_cat_season_{s}'] = (season == s).astype(float).where(season.notna())
+    return trips
+
+
+def _sd_col_modes(variant) -> dict[str, tuple[str, ...]]:
+    """The covariates of `variant`: `_SD_COL_MODES`, plus darkness for `darkness` and the
+    season terms for `seasons`."""
+    return {**_SD_COL_MODES,
+            **(_DARK_SD_COL_MODES if variant.darkness else {}),
+            **(_SEASON_SD_COL_MODES if variant.seasons else {})}
 
 
 def _node_feature_anchors(location_features: str) -> tuple[str, ...]:
@@ -217,35 +274,29 @@ def _features_for_anchors(anchors: tuple[str, ...]) -> dict[str, tuple[str, ...]
         f"Unknown anchor tuple {anchors!r} — expected `('orig', 'dest')`, "
         f"`('od',)`, or `('route',)`.")
 
-
-# Meters-scale feature scaling (single source of truth in main.utility_config).
-from main.utility_config import FEATURE_SCALE as _FEATURE_SCALE
-
 _TIME_CAP_MIN = 5 * 60
-_MIN_LEG_DIST_LINE_M = 100.0
-_MAX_LEG_DIST_LINE_M = 200_000
-
-# Endpoint elevation cap (m). Drops alpine legs whose mode-choice character
-# skews the fit. None = disable. Looked up on nodes_walk_extended.csv.
-_MAX_ENDPOINT_ELEVATION_M: float | None = 1_000.0
+_MAX_TRIP_DIST_LINE_M = 200_000
 
 # ---------------------------------------------------------------------------
 # Data assembly
 # ---------------------------------------------------------------------------
 def _load_and_join(context) -> pd.DataFrame:
-    """Load survey legs + routed times + overheads. Left-join on the legs
-    index; missing columns become NaN and are handled downstream by the
-    availability + dropna logic. Scopes legs to the scenario AOI so
+    """Load the survey trips (`TRIP_SET`) + routed times + overheads. Left-join on the
+    trip index; missing columns become NaN and are handled downstream by the
+    availability + dropna logic. Scopes trips to the scenario AOI so
     utility estimation trains on trips within the calibration region."""
-    legs = context.get_generic('survey_legs.csv', storage=Storage.PRIVATE)
-    routed = context.get_generic('survey_leg_times.csv', storage=Storage.PRIVATE)
-    overhead = context.get_generic('survey_leg_overheads.csv', storage=Storage.PRIVATE)
+    trips = context.get_generic(survey_file('survey_legs.csv', TRIP_SET),
+                                storage=Storage.PRIVATE)
+    routed = context.get_generic(survey_file('survey_leg_times.csv', TRIP_SET),
+                                 storage=Storage.PRIVATE)
+    overhead = context.get_generic(survey_file('survey_leg_overheads.csv', TRIP_SET),
+                                   storage=Storage.PRIVATE)
     scenario = get_scenario(context.scenario)
     aoi_polygon = load_aoi_polygon(context)
-    legs = filter_legs_by_aoi(
-        legs, aoi_polygon, crs=scenario.crs_main, label='survey legs')
-    df = legs.join(routed, how='left').join(overhead, how='left')
-    logging.info(f"  → {len(df):,} legs joined (legs {len(legs):,}, "
+    trips = filter_legs_by_aoi(
+        trips, aoi_polygon, crs=scenario.crs_main, label='survey trips')
+    df = trips.join(routed, how='left').join(overhead, how='left')
+    logging.info(f"  → {len(df):,} trips joined (trips {len(trips):,}, "
                  f"routed {len(routed):,}, overhead {len(overhead):,})")
     return df
 
@@ -260,39 +311,22 @@ def _compute_mode_times(
     if not include_ebikes:
         modes = [m for m in modes if m != 'ebike25']
     for mode in modes:
-        if mode == 'transit':
-            net_s = df['t_routed_transit_z2z']
-            if time_type == 'gross':
-                # gross = t_routed + orig_ov + dest_ov − t_routed_bias
-                # (α scaling of z2z; see main.common.route_time_alpha).
-                ov_orig = df.get('t_overhead_orig_transit')
-                ov_dest = df.get('t_overhead_dest_transit')
-                bias = df.get('t_routed_bias_transit')
-                total_s = (net_s
-                           + ov_orig.fillna(0) + ov_dest.fillna(0)
-                           - (bias.fillna(0) if bias is not None else 0.0))
-            else:
-                total_s = net_s
-        elif mode == 'car':
-            net_s = df['t_routed_car']
-            if time_type == 'gross':
-                total_s = (net_s
-                           + car_overhead_by_peak(df, 'orig').fillna(0)
-                           + car_overhead_by_peak(df, 'dest').fillna(0)
-                           - car_routed_bias_by_peak(df).fillna(0))
-            else:
-                total_s = net_s
-        else:
-            profile = _MODE_TO_PROFILE[mode]
-            net_s = df[f't_routed_{profile}']
-            if time_type == 'gross':
-                bias = df.get(f't_routed_bias_{profile}')
-                total_s = (net_s
-                           + df[f't_overhead_orig_{profile}'].fillna(0)
-                           + df[f't_overhead_dest_{profile}'].fillna(0)
-                           - (bias.fillna(0) if bias is not None else 0.0))
-            else:
-                total_s = net_s
+        profile = _MODE_TO_PROFILE.get(mode, mode)   # transit: 'transit'
+        net_s = df['t_routed_transit_z2z' if mode == 'transit' else f't_routed_{profile}']
+        total_s = net_s
+        if time_type == 'gross' and mode == 'car':
+            total_s = (net_s
+                       + car_overhead_by_peak(df, 'orig').fillna(0)
+                       + car_overhead_by_peak(df, 'dest').fillna(0)
+                       - car_routed_bias_by_peak(df).fillna(0))
+        elif time_type == 'gross':
+            # gross = t_routed + orig_ov + dest_ov − t_routed_bias (α scaling of the routed
+            # time; see main.common.route_time_alpha).
+            bias = df.get(f't_routed_bias_{profile}')
+            total_s = (net_s
+                       + df[f't_overhead_orig_{profile}'].fillna(0)
+                       + df[f't_overhead_dest_{profile}'].fillna(0)
+                       - (bias.fillna(0) if bias is not None else 0.0))
         min_s = _MIN_ROUTE_TIME_S_PER_MODE.get(mode, 0.0)
         if min_s > 0:
             total_s = np.maximum(total_s, min_s)
@@ -309,8 +343,7 @@ def _join_point_node_features(
 ) -> pd.DataFrame:
     """Build every biogeme feature column implied by the variant. Endpoint
     anchors look each feature up on its source graph's node file (per
-    `_POINT_FEATURE_SOURCES`) and derive `elev_gain_net` / `elev_loss_net`
-    from Δelevation; route anchors copy from one default profile column
+    `_POINT_FEATURE_SOURCES`); route anchors copy from one default profile column
     per `_ROUTE_FEATURE_DEFAULTS`. Meters-scale features are divided by
     `_FEATURE_SCALE`.
     """
@@ -336,33 +369,16 @@ def _join_point_node_features(
             for side in ('orig', 'dest'):
                 node_id_col = f'{side}_node_id_{source_mode}'
                 bn = f'{src_col}_{side}'
-                # Prefer the fully-oriented biogeme name, else fall back to the
-                # un-oriented source column so one dict entry covers both sides.
-                scale = _FEATURE_SCALE.get(bn, _FEATURE_SCALE.get(src_col, 1.0))
+                scale = _FEATURE_SCALE.get(src_col, 1.0)
                 df[bn] = df[node_id_col].map(s) / scale
             if anchors == ('od',):
                 bn_od = f'{src_col}_od'
                 df[bn_od] = df[f'{src_col}_orig'] + df[f'{src_col}_dest']
-        # Net elev gain / loss — walk-graph elevation at both endpoints (any
-        # mode's node file would work; DEM sampling is graph-agnostic).
-        nodes_walk = _load('walk_extended')
-        if 'elevation' in nodes_walk.columns:
-            elev_lookup = nodes_walk['elevation']
-            elev_orig = df['orig_node_id_walk'].map(elev_lookup)
-            elev_dest = df['dest_node_id_walk'].map(elev_lookup)
-            delta = elev_dest - elev_orig
-            gain_scale = _FEATURE_SCALE.get('elev_gain_net', 1.0)
-            loss_scale = _FEATURE_SCALE.get('elev_loss_net', 1.0)
-            df['elev_gain_net'] = np.maximum(delta, 0.0) / gain_scale
-            df['elev_loss_net'] = np.maximum(-delta, 0.0) / loss_scale
-        else:
-            logging.warning("  → `elevation` missing from nodes_walk_extended.csv; "
-                            "elev_gain_net / elev_loss_net unavailable.")
     elif anchors == ('route',):
         for bn, source_col in _ROUTE_FEATURE_DEFAULTS.items():
             if source_col not in df.columns:
                 logging.warning(f"  → route-feature source {source_col!r} not in "
-                                f"survey_leg_times.csv; {bn!r} rows dropped.")
+                                f"survey_trip_times.csv; {bn!r} rows dropped.")
                 continue
             s = df[source_col]
             scale = _FEATURE_SCALE.get(bn, 1.0)
@@ -382,7 +398,7 @@ def _join_point_node_features(
 # Availability
 # ---------------------------------------------------------------------------
 def _ownership_available(df: pd.DataFrame, mode: str) -> pd.Series:
-    """Boolean per leg: is the household eligible for this mode based on
+    """Boolean per trip: is the household eligible for this mode based on
     ownership? Used only when `ownership='exogenous'`."""
     if mode == 'car':
         # sd_cat_n_cars_0 == 0 means "NOT in the zero-cars bin".
@@ -438,6 +454,31 @@ def _time_beta_names(mode: str) -> tuple[str, str]:
     return f'b_time_{mode}', f'b_time_log_{mode}'
 
 
+# Knots (minutes) of the `piecewise` time form: one slope per band, the last band open. One
+# grid (5, 10, 20, 45, 90), each mode using the knots within its times: in a finer test
+# (2026-11-15) slopes changed smoothly in log time, and neighboring bands 1.5× apart were often
+# equal, while finer bands picked up trip composition (non-monotonic slopes). Transit has no
+# knot at 20 min: a separate 0–20 band was uninformative (+0.014 ± 0.007; short transit trips
+# vary little in modeled time and compete with walking), so 0–45 shares one slope.
+_PIECEWISE_KNOTS_MIN: dict[str, tuple[float, ...]] = {
+    'walk':    (0, 5, 10, 20, 45),
+    'rbike':   (0, 5, 10, 20, 45),
+    'transit': (0, 45, 90),
+    'car':     (0, 10, 20, 45, 90),
+}
+
+
+def _piecewise_bands(mode: str) -> list[tuple[float, float]]:
+    """A mode's `piecewise` time bands (minutes), the last one open (`hi` = inf)."""
+    knots = _PIECEWISE_KNOTS_MIN[mode]
+    return list(zip(knots, [*knots[1:], math.inf]))
+
+
+def _piecewise_beta_names(mode: str) -> list[str]:
+    """Coef names of a mode's `piecewise` time form, one per band (`…_<last knot>_inf`)."""
+    return [piecewise_time_coef_name(mode, lo, hi) for lo, hi in _piecewise_bands(mode)]
+
+
 def _parse_car_peak_night(spec: str) -> tuple[bool, bool, list[str]]:
     """Parse comma-separated `car_peak_night` spec → `(has_asc, has_time,
     feat_names)`. Tokens combine ADDITIVELY. Reserved: `asc` (ASC modifier),
@@ -458,11 +499,24 @@ def _parse_car_peak_night(spec: str) -> tuple[bool, bool, list[str]]:
     return has_asc, has_time, feat_names
 
 
+def _parse_peak_night_asc_modes(spec: str) -> tuple[str, ...]:
+    """Parse the comma-separated `peak_night_asc_modes` spec. Walking is the base
+    (ASC 0) and the car is covered by `car_peak_night`, so neither is allowed."""
+    modes = tuple(t.strip() for t in spec.split(',') if t.strip())
+    bad = [m for m in modes if m in ('walk', 'car')]
+    if bad:
+        raise ValueError(f"peak_night_asc_modes: {bad} not allowed (walk is the base; "
+                         f"car uses `car_peak_night`).")
+    return modes
+
+
 def _utility_expression(
     mode: str, betas: dict, vars_: dict,
     features: dict[str, tuple[str, ...]],
-    is_walk: bool,
-    car_peak_night: str = 'asc',
+    car_peak_night: str,
+    peak_night_asc_modes: tuple[str, ...],
+    sd_col_modes: dict[str, tuple[str, ...]],
+    time_form: str,
 ) -> Any:
     """Biogeme utility expression for one mode. Location + SD terms are
     added only when the mode is in the feature's free-modes tuple.
@@ -470,16 +524,26 @@ def _utility_expression(
     """
     has_asc, has_time, feat_names = _parse_car_peak_night(car_peak_night)
     exprs = []
-    if not is_walk:
+    if mode != 'walk':
         exprs.append(betas[f'asc_{mode}'])
-        if mode == 'car' and has_asc:
-            exprs.append(betas['asc_car_peak'] * vars_['hour_peak'])
-            exprs.append(betas['asc_car_night'] * vars_['hour_night'])
+        if (mode == 'car' and has_asc) or mode in peak_night_asc_modes:
+            exprs.append(betas[f'asc_{mode}_peak'] * vars_['hour_peak'])
+            exprs.append(betas[f'asc_{mode}_night'] * vars_['hour_night'])
     # Time terms centered at UTILITY_T_REF_MIN (see the module docstring).
     t_c = vars_[f't_{mode}_min'] - UTILITY_T_REF_MIN
-    exprs.append(betas[f'b_time_{mode}'] * t_c)
-    exprs.append(betas[f'b_time_log_{mode}']
-                 * (vars_[f't_{mode}_min_log'] - math.log(UTILITY_T_REF_MIN)))
+    if time_form == 'piecewise':
+        pw_betas = [betas[n] for n in _piecewise_beta_names(mode)]
+        exprs.append(models.piecewise_formula(
+            vars_[f't_{mode}_min'], [*_PIECEWISE_KNOTS_MIN[mode], None], pw_betas))
+        # Centering: minus the term's value at T (a constant per band).
+        for beta, (lo, hi) in zip(pw_betas, _piecewise_bands(mode)):
+            at_ref = min(max(UTILITY_T_REF_MIN - lo, 0.0), hi - lo)
+            if at_ref > 0:
+                exprs.append(-at_ref * beta)
+    else:
+        exprs.append(betas[f'b_time_{mode}'] * t_c)
+        exprs.append(betas[f'b_time_log_{mode}']
+                     * (vars_[f't_{mode}_min_log'] - math.log(UTILITY_T_REF_MIN)))
     if mode == 'car' and has_time:
         exprs.append(betas['b_time_car_peak'] * vars_['hour_peak'] * t_c)
         exprs.append(betas['b_time_car_night'] * vars_['hour_night'] * t_c)
@@ -496,7 +560,7 @@ def _utility_expression(
     for bn, feat_modes in features.items():
         if mode in feat_modes:
             exprs.append(betas[f'b_{bn}_{mode}'] * vars_[bn])
-    for sd, sd_modes in _SD_COL_MODES.items():
+    for sd, sd_modes in sd_col_modes.items():
         if mode in sd_modes:
             exprs.append(betas[f'b_{sd}_{mode}'] * vars_[sd])
     return sum(exprs[1:], exprs[0])
@@ -504,24 +568,32 @@ def _utility_expression(
 
 def _register_betas(
     modes: list[str], features: dict[str, tuple[str, ...]],
-    car_peak_night: str = 'asc',
+    car_peak_night: str,
+    peak_night_asc_modes: tuple[str, ...],
+    sd_col_modes: dict[str, tuple[str, ...]],
+    time_form: str,
 ) -> dict:
     """Instantiate all Beta objects. Walk's ASC is fixed at 0 (base mode).
     Location + SD betas registered only for modes with a free coef.
-    Car peak/night adds extra betas per `_parse_car_peak_night`.
+    Car peak/night adds extra betas per `_parse_car_peak_night`; the modes in
+    `peak_night_asc_modes` get peak/night ASC shifts.
     """
     betas: dict[str, Beta] = {}
     for mode in modes:
         if mode != 'walk':
             betas[f'asc_{mode}'] = Beta(f'asc_{mode}', 0, None, None, 0)
-        b_t, b_ln = _time_beta_names(mode)
-        betas[b_t] = Beta(b_t, 0, None, None, 0)
-        betas[b_ln] = Beta(b_ln, 0, None, None, 0)
+        if mode in peak_night_asc_modes:
+            for name in (f'asc_{mode}_peak', f'asc_{mode}_night'):
+                betas[name] = Beta(name, 0, None, None, 0)
+        time_names = (_piecewise_beta_names(mode) if time_form == 'piecewise'
+                      else _time_beta_names(mode))
+        for name in time_names:
+            betas[name] = Beta(name, 0, None, None, 0)
         for bn, feat_modes in features.items():
             if mode in feat_modes:
                 name = f'b_{bn}_{mode}'
                 betas[name] = Beta(name, 0, None, None, 0)
-        for sd, sd_modes in _SD_COL_MODES.items():
+        for sd, sd_modes in sd_col_modes.items():
             if mode in sd_modes:
                 name = f'b_{sd}_{mode}'
                 betas[name] = Beta(name, 0, None, None, 0)
@@ -542,6 +614,7 @@ def _register_betas(
 
 def _biogeme_variables(
     modes: list[str], features: dict[str, tuple[str, ...]],
+    sd_cols: tuple[str, ...] = _SD_COLS,
 ) -> dict:
     """Instantiate all biogeme `Variable` handles referenced by the model."""
     v: dict[str, Variable] = {}
@@ -551,7 +624,7 @@ def _biogeme_variables(
         v[f'availability_{mode}'] = Variable(f'availability_{mode}')
     for bn in features:
         v[bn] = Variable(bn)
-    for sd in _SD_COLS:
+    for sd in sd_cols:
         v[sd] = Variable(sd)
     v['hour_peak'] = Variable('hour_peak')
     v['hour_night'] = Variable('hour_night')
@@ -567,7 +640,7 @@ def _fit_and_extract(
 ) -> tuple[pd.DataFrame, float, float]:
     """Set up + estimate the biogeme MNL / nested-logit model. Returns the
     coefficient table and rho² (bar) vs the null model and vs a constants-only
-    MNL (ASCs only, same legs, weights and availability), which reproduces the
+    MNL (ASCs only, same trips, weights and availability), which reproduces the
     mode shares and so shows what times, features and SD terms add."""
     modes = ['walk', 'rbike', 'transit', 'car']
     if variant.ebikes != 'exclude':
@@ -577,13 +650,22 @@ def _fit_and_extract(
     df = df.copy()
     df['choice'] = df['_chosen_mode'].map(_MODE_IDS).astype(int)
 
-    v = _biogeme_variables(modes, features)
-    betas = _register_betas(modes, features, variant.car_peak_night)
+    sd_col_modes = _sd_col_modes(variant)
+    v = _biogeme_variables(modes, features, tuple(sd_col_modes))
+    pn_modes = _parse_peak_night_asc_modes(variant.peak_night_asc_modes)
+    missing = [m for m in pn_modes if m not in modes]
+    if missing:
+        raise ValueError(f"peak_night_asc_modes: {missing} not among the fitted modes {modes}.")
+    if variant.time_form not in ('linlog', 'piecewise'):
+        raise ValueError(f"time_form: {variant.time_form!r} not in ('linlog', 'piecewise').")
+    betas = _register_betas(modes, features, variant.car_peak_night, pn_modes, sd_col_modes,
+                            time_form=variant.time_form)
 
     utilities = {
         _MODE_IDS[mode]: _utility_expression(
-            mode, betas, v, features, is_walk=(mode == 'walk'),
-            car_peak_night=variant.car_peak_night)
+            mode, betas, v, features,
+            car_peak_night=variant.car_peak_night, peak_night_asc_modes=pn_modes,
+            sd_col_modes=sd_col_modes, time_form=variant.time_form)
         for mode in modes
     }
     availability = {
@@ -610,7 +692,7 @@ def _fit_and_extract(
         biogeme_cols += [f't_{mode}_min', f't_{mode}_min_log',
                          f'availability_{mode}']
     biogeme_cols += list(features)
-    biogeme_cols += [c for c in _SD_COLS if c in df.columns]
+    biogeme_cols += [c for c in sd_col_modes if c in df.columns]
     biogeme_cols = [c for c in dict.fromkeys(biogeme_cols) if c in df.columns]
     df_bg = df[biogeme_cols].copy()
 
@@ -623,7 +705,7 @@ def _fit_and_extract(
         bg = biogeme.BIOGEME(database, {
             'loglike': log_prob, 'weight': v['weight_person'],
         })
-        bg.modelName = f'utility_{variant_name(variant)}'
+        bg.modelName = f'utility_{variant.name}'
         bg.calculate_null_loglikelihood(availability)
         results = bg.estimate()
 
@@ -633,7 +715,7 @@ def _fit_and_extract(
             'loglike': models.loglogit(utilities_c, availability, v['choice']),
             'weight': v['weight_person'],
         })
-        bg_c.modelName = f'utility_{variant_name(variant)}_constants'
+        bg_c.modelName = f'utility_{variant.name}_constants'
         results_c = bg_c.estimate()
     finally:
         os.chdir(cwd)
@@ -642,6 +724,9 @@ def _fit_and_extract(
     rho2 = float(results.data.rhoBarSquareNull)
     rho2_const = 1.0 - ((results.data.logLike - results.data.nparam)
                         / (results_c.data.logLike - results_c.data.nparam))
+    logging.info(f"  → final log-likelihood {results.data.logLike:,.1f} "
+                 f"({results.data.nparam} parameters); constants only "
+                 f"{results_c.data.logLike:,.1f}")
     # Rename biogeme's default columns to snake_case so the on-disk CSV
     # follows this codebase's convention.
     params = params.rename(columns={
@@ -653,17 +738,12 @@ def _fit_and_extract(
     return params, rho2, rho2_const
 
 
-def variant_name(variant) -> str:
-    """Registered variant name; matches the `--variant` CLI selector."""
-    return variant.name
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main(variant):
     context = init_context()
-    v = variant_name(variant)
+    v = variant.name
     scenario = get_scenario(context.scenario)
     if f'utility_{v}' not in scenario.coefs:
         logging.info(f"utility_{v} not declared in scenario {scenario.name!r} "
@@ -675,7 +755,7 @@ def main(variant):
         name=f'utility_{v}',
         calibrate_fn=lambda: _fit_utility(context, variant),
     )
-    # Companion sidecar — SD averages + t_cut_min. Same source declaration
+    # Companion sidecar — SD averages. Same source declaration
     # as the parent (validated in Scenario.__post_init__).
     coefs.resolve(
         context,
@@ -686,55 +766,48 @@ def main(variant):
 
 
 def _compute_utility_stats(context) -> pd.DataFrame:
-    """SD averages + t_cut_min per mode, as a two-column `key, value`
-    DataFrame for the `utility_<variant>_stats` sidecar. Only called on
-    `Calibrate()` scenarios."""
-    from main.common import compute_sd_averages, load_util_cutoffs_from_summary
-    raw_legs = context.get_generic('survey_legs.csv', storage=Storage.PRIVATE)
+    """SD averages, as a two-column `key, value` DataFrame for the
+    `utility_<variant>_stats` sidecar. Only called on `Calibrate()` scenarios."""
+    raw_trips = context.get_generic(survey_file('survey_legs.csv', TRIP_SET),
+                                    storage=Storage.PRIVATE)
     # Scope SD averages to the AOI so utility-stats align with the
     # region trained on in `_fit_utility` / `_load_and_join`.
     scenario = get_scenario(context.scenario)
     aoi_polygon = load_aoi_polygon(context)
-    raw_legs = filter_legs_by_aoi(
-        raw_legs, aoi_polygon, crs=scenario.crs_main, label='SD-stats legs')
-    sd_averages = compute_sd_averages(raw_legs)
-    try:
-        survey_summary = context.get_generic('survey_summary.csv', storage=Storage.PRIVATE)
-        t_cut_min_per_mode = load_util_cutoffs_from_summary(survey_summary)
-    except FileNotFoundError:
-        t_cut_min_per_mode = {}
-        logging.warning(
-            "  ⚠ survey_summary.csv missing — t_cut_min NOT baked into "
-            "stats. 09b's log-time extrapolation will fall back to pure "
-            "log. Re-run survey/08c to enable.")
-    stats = pd.DataFrame(
-        {'value': list(sd_averages.values()) + list(t_cut_min_per_mode.values())},
-        index=(
-            [f'sd_avg_{col}' for col in sd_averages]
-            + [f't_cut_min_{mode}' for mode in t_cut_min_per_mode]
-        ),
-    )
+    raw_trips = filter_legs_by_aoi(
+        raw_trips, aoi_polygon, crs=scenario.crs_main, label='SD-stats trips')
+    if 'is_daylight' in raw_trips.columns:   # averages for `darkness` / `seasons`
+        raw_trips = add_condition_columns(raw_trips)
+    sd_averages = compute_sd_averages(raw_trips)
+    stats = pd.DataFrame({'value': list(sd_averages.values())},
+                         index=[f'sd_avg_{col}' for col in sd_averages])
     stats.index.name = 'key'
-    logging.info(f"  → utility stats: {len(sd_averages)} sd_avg + "
-                 f"{len(t_cut_min_per_mode)} t_cut_min rows")
+    logging.info(f"  → utility stats: {len(sd_averages)} sd_avg rows")
     return stats
 
 
-def _fit_utility(context, variant) -> pd.DataFrame:
-    """Fit the biogeme MNL / nested-logit model and return the coef
-    DataFrame for `coefs.resolve` to persist. Only called on
-    `Calibrate()` scenarios."""
+def _modeled_sample(
+    context, variant,
+) -> tuple[pd.DataFrame, dict[str, tuple[str, ...]]]:
+    """The trips the model is fitted on, after every filter (weights normalized to mean 1),
+    with per-mode times, availability and the variant's location features; also returns
+    those features with their free modes. Also read by misc/mtmc_modal_split."""
     logging.info(f"variant: time={variant.time}, ownership={variant.ownership}, "
-                 f"ebikes={variant.ebikes}, single_leg_only={variant.single_leg_only}, "
+                 f"ebikes={variant.ebikes}, "
                  f"subset_fraction={variant.subset_fraction}, "
                  f"location_features={variant.location_features}, "
-                 f"car_peak_night={variant.car_peak_night}")
+                 f"time_form={variant.time_form}, "
+                 f"car_peak_night={variant.car_peak_night}, "
+                 f"peak_night_asc_modes={variant.peak_night_asc_modes}, "
+                 f"darkness={variant.darkness}, seasons={variant.seasons}")
 
     anchors = _node_feature_anchors(variant.location_features)
     features = _features_for_anchors(anchors)
 
-    with step('load survey legs + routed times + overheads'):
+    with step('load survey trips + routed times + overheads'):
         df = _load_and_join(context)
+        if variant.darkness or variant.seasons:
+            df = add_condition_columns(df)
 
     with step(f'compute per-mode times ({variant.time}, minutes)'):
         df = _compute_mode_times(df, variant.time, include_ebikes=(variant.ebikes != 'exclude'))
@@ -749,67 +822,32 @@ def _fit_utility(context, variant) -> pd.DataFrame:
     with step(f'compute availability flags ({variant.ownership})'):
         df = _compute_availability(df, variant.ownership, modes_for_avail)
 
-    if _MAX_ENDPOINT_ELEVATION_M is not None:
-        with step(f'elevation filter (≤ {_MAX_ENDPOINT_ELEVATION_M:.0f} m at orig + dest)'):
-            walk_nodes = context.get_properties('nodes', 'walk_extended')
-            if 'elevation' not in walk_nodes.columns:
-                raise KeyError("`_MAX_ENDPOINT_ELEVATION_M` set but `elevation` "
-                               "missing from nodes_walk_extended.csv.")
-            elev = walk_nodes['elevation']
-            elev_orig = df['orig_node_id_walk'].map(elev)
-            elev_dest = df['dest_node_id_walk'].map(elev)
-            mask = (
-                (elev_orig <= _MAX_ENDPOINT_ELEVATION_M)
-                & (elev_dest <= _MAX_ENDPOINT_ELEVATION_M)
-            )
-            n_before = len(df)
-            df = df[mask.fillna(False)]
-            logging.info(f"  → {len(df):,}/{n_before:,} kept ({100*len(df)/max(n_before,1):.1f} %)")
-
-    with step('speed + detour envelope filter (from survey standardization)'):
-        # Per-mode plausibility gates from the survey preparation; the
-        # same ones 04 and 07a train on.
+    with step('plausibility filter (CHOICE_QUALITY_FLAGS)'):
         n_before = len(df)
-        for flag in ('is_within_speed_envelope', 'is_within_detour_envelope'):
-            if flag in df.columns:
-                df = df[df[flag] == 1]
+        for flag in CHOICE_QUALITY_FLAGS:
+            df = df[df[flag] == 1]
         logging.info(f"  → {len(df):,}/{n_before:,} kept "
                      f"({100*len(df)/max(n_before,1):.1f} %)")
 
     with step('filter to modeled sample'):
         n0 = len(df)
-        df = df[
-            (df['dist_line'] >= _MIN_LEG_DIST_LINE_M)
-            & (df['dist_line'] <= _MAX_LEG_DIST_LINE_M)
-        ]
+        df = df[df['dist_line'] <= _MAX_TRIP_DIST_LINE_M]
         active_modes = set(modes_for_avail)
         df = df[df['_chosen_mode'].isin(active_modes)]
         df = df[df['availability_mismatch'] == 0]
         df = df[df['n_available_modes'] >= 2]
-        # Transit is exempt from single_leg_only — walk-to-stop + vehicle +
-        # walk-from-stop makes n_legs > 1 by construction.
-        if variant.single_leg_only:
-            if 'n_legs_in_trip' not in df.columns:
-                raise KeyError("single_leg_only=True requires n_legs_in_trip in "
-                               "survey_legs.csv.")
-            n_before = len(df)
-            df = df[
-                (df['n_legs_in_trip'] == 1)
-                | (df['mode_simplified'] == 'transit')
-            ]
-            logging.info(f"  → single_leg_only filter: {len(df):,}/{n_before:,} kept")
         # Drop rows with NaN in any biogeme-evaluated feature column.
         need = (
             list(features)
             + ['hour_peak', 'hour_night', 'weight_person']
-            + list(_SD_COLS)
+            + list(_sd_col_modes(variant))
         )
         need = [c for c in need if c in df.columns]
         df = df.dropna(subset=need)
         logging.info(f"  → n = {len(df):,} / {n0:,}  after filters")
         df = df.copy()
         # NaN per-mode times → above-cap placeholder; availability_<mode>=0
-        # already excludes them from that leg's choice set.
+        # already excludes them from that trip's choice set.
         placeholder_t = float(_TIME_CAP_MIN + 1)
         placeholder_t_log = float(np.log(placeholder_t))
         for m in modes_for_avail:
@@ -821,12 +859,20 @@ def _fit_utility(context, variant) -> pd.DataFrame:
             logging.info(f"  → subset_fraction={variant.subset_fraction}: "
                          f"{len(df):,}/{n_before:,} kept")
         df['weight_person'] = df['weight_person'] / df['weight_person'].sum() * len(df)
+    return df, features
+
+
+def _fit_utility(context, variant) -> pd.DataFrame:
+    """Fit the biogeme MNL / nested-logit model and return the coef
+    DataFrame for `coefs.resolve` to persist. Only called on
+    `Calibrate()` scenarios."""
+    df, features = _modeled_sample(context, variant)
 
     with step('fit biogeme model'):
         scratch_root = Path(context.path_for(Storage.SCRATCH, 'biogeme'))
         params, rho2, rho2_const = _fit_and_extract(
-            df, variant, features, run_dir=scratch_root / variant_name(variant))
-        logging.info(f"  → {len(df):,} legs; rho² (bar) vs null = {rho2:.4f}, "
+            df, variant, features, run_dir=scratch_root / variant.name)
+        logging.info(f"  → {len(df):,} trips; rho² (bar) vs null = {rho2:.4f}, "
                      f"vs constants only = {rho2_const:.4f}")
         with pd.option_context('display.max_rows', None):
             logging.info('\n' + params[['value', 'rob_p_value']].round(4).to_string())
@@ -843,44 +889,35 @@ variants = Variants([
     ('time', str),
     ('ownership', str),
     ('ebikes', str),
-    ('single_leg_only', bool),
     ('subset_fraction', float),
     ('location_features', str),
+    ('time_form', str),
     ('car_peak_night', str),
+    ('peak_night_asc_modes', str),
+    ('darkness', bool),
+    ('seasons', bool),
 ])
-variants.add(
-    name='default',
+# No peak / night shifts: one all-day constant per mode, so the released utilities hold at all
+# hours and the car's hour profiles differ only by their congested times. The shifts mostly
+# reflect who travels when (commuting at peak), not how well a mode serves those hours; with
+# them, the car's peak constant offset the peak congestion. Fitted 2026-11-14 (switzerland-h10,
+# all p < 0.05): peak transit +0.40, cycling +0.20, car +0.13; night cycling +0.19, car +0.10,
+# transit +0.06.
+_DEFAULT = dict(
     time='gross',
     ownership='endogenous',
     ebikes='exclude',
-    single_leg_only=False,
     subset_fraction=1.0,
     location_features='endpoints_combined',
-    # car_peak_night='asc,traffic_flow_avg_r250_od',
-    car_peak_night='asc',
+    time_form='piecewise',
+    car_peak_night='',
+    peak_night_asc_modes='',
+    darkness=False,
+    seasons=False,
 )
-variants.add(
-    name='default_single',
-    time='gross',
-    ownership='endogenous',
-    ebikes='exclude',
-    single_leg_only=True,
-    subset_fraction=1.0,
-    location_features='endpoints_combined',
-    # car_peak_night='asc,traffic_flow_avg_r250_od',
-    car_peak_night='asc',
-)
-variants.add(
-    name='default_route',
-    time='gross',
-    ownership='endogenous',
-    ebikes='exclude',
-    single_leg_only=False,
-    subset_fraction=1.0,
-    location_features='route',
-    # car_peak_night='asc,vc_beta_2.0_route',
-    car_peak_night='asc',
-)
+variants.add(name='default', **_DEFAULT)
+variants.add(name='default_route', **{**_DEFAULT, 'location_features': 'route'})
+variants.add(name='default_linlog', **{**_DEFAULT, 'time_form': 'linlog'})
 
 if __name__ == '__main__':
     variants.run(main, default='default')

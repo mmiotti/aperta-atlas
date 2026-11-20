@@ -7,25 +7,10 @@ shared across multiple preparation scripts (the OSM place name, the
 filesystem identifier, the per-mode network buffers, etc.).
 
 Each script in `preparation/world/{osm,elevation,land_use}/` consumes
-`AREAS` and fans it out into its own Variants. Adding a new entry here
-makes it available in every script automatically; tweaking a buffer
-for an existing area propagates everywhere.
-
-The split between area-level and script-level configuration:
-
-- **Area-level** (lives here): `place`, `name`, `source_pbf`,
-  per-mode `buffers`, `ghsl_tiles` (for the population script),
-  `aoi_buffer_m`. Anything that should be consistent across multiple
-  scripts for the same analysis area.
-
-- **Script-level** (lives in each script as module-level dicts):
-  per-mode tuning like `network_type`, `prune_dead_end_max_m`,
-  `tolerance_m`, `obstacle_buffer_m`. These are script-specific and
-  don't cross over.
-
-For mode-agnostic data (POIs, obstacles, buildings, DEM, population)
-the buffer should be the widest across modes — `widest_buffer(area)`
-returns this.
+`AREAS` and fans it out into its own Variants, so a new entry here is
+available in every script. Per-mode tuning that only one script uses
+(`network_type`, `prune_dead_end_max_m`, `obstacle_buffer_m`, ...) stays in
+that script.
 """
 
 from dataclasses import dataclass
@@ -81,14 +66,16 @@ class Area:
     so preparation scripts automatically scope their data to cover the
     full AOI + cross-border ring."""
 
+    left_hand_traffic: bool = False
+    """True where traffic drives on the left (UK). Decides which direction a
+    side-specific bike lane (`cycleway:left|right`) serves
+    (`aperta_atlas.osm.cycleway_in_direction`)."""
+
     is_swiss: bool = False
     """True iff the area lies entirely within Switzerland, in which case
     Swiss-specific data sources (STATPOP / STATENT hectares, MTMC / MOBIS
     survey microdata, NPVM traffic zones) are available for its extent.
-    Consulted by scripts that need one of those inputs (e.g.
-    `population_per_building_from_coef` for STATPOP density
-    stratification; `Scenario.__post_init__` for `cell_source='hectares'`
-    validation). Set to False (default) for non-Swiss areas."""
+    Consulted by `Scenario.__post_init__` for `cell_source='hectares'`."""
 
 
 AREAS: dict[str, Area] = {
@@ -100,15 +87,7 @@ AREAS: dict[str, Area] = {
         ghsl_tiles=('R4_C19',),
         is_swiss=True,
     ),
-    'bern': Area(
-        name='bern',
-        place='Canton of Bern, Switzerland',
-        source_pbf='europe',
-        buffers={'walk': 5_000, 'bike': 20_000, 'car': 40_000},
-        ghsl_tiles=('R4_C19',),
-        is_swiss=True,
-    ),
-    # Tighter Bern-area entry used by the Technical Validation scenarios
+    # Bern-area entry used by the Technical Validation scenarios
     # (`scenarios_technical_validation.py`). Verwaltungskreis Bern-Mittelland
     # is the administrative district surrounding Bern city (~940 km²,
     # ~415k pop). Chosen as a close proxy for BFS's "Agglomeration Bern"
@@ -133,6 +112,7 @@ AREAS: dict[str, Area] = {
         # Cambridge + 40 km buffer straddles the prime meridian, so the
         # buffered AOI spans two adjacent 10° GHSL tiles.
         ghsl_tiles=('R3_C18', 'R3_C19'),
+        left_hand_traffic=True,
     ),
     # Language-region areas used by the spatial cross-validation scenarios
     # (`scenarios_technical_validation.py`, `cv-*`). Multilingual cantons
@@ -173,15 +153,10 @@ AREAS: dict[str, Area] = {
     'switzerland-fr': Area(
         name='switzerland-fr',
         # 4 French-speaking cantons (VS/FR/BE excluded — bilingual FR/DE).
-        # Contiguous: JU shares a direct border with NE, so no gap needs
-        # to be bridged by the buffer. Ticino was previously included but
-        # dropped because it's an isolated Italian-speaking region
-        # separated from the FR cluster by VS + GR (both excluded), with
-        # no buffer wide enough to bridge — a two-piece AOI would break
-        # network routing between the pieces.
-        # Native "Canton de X" naming — English "Canton of X" made
-        # Nominatim sometimes return the city center point before the
-        # canton polygon (see switzerland-de note above).
+        # Contiguous: JU shares a direct border with NE. Ticino is left out:
+        # VS + GR (both excluded) separate it from this cluster, and a
+        # two-piece AOI would break routing. Native "Canton de X" naming
+        # (see switzerland-de).
         place=(
             'Canton de Genève, Switzerland',
             'Canton de Vaud, Switzerland',
@@ -197,18 +172,7 @@ AREAS: dict[str, Area] = {
 
 
 def widest_buffer(area: Area) -> int:
-    """Largest buffer (m) FROM `area.place` for mode-agnostic data
-    (POIs, obstacles, buildings, DEM, population).
-
-    Composed of two pieces:
-      - `area.aoi_buffer_m` — extends the AOI itself beyond the raw
-        OSM polygon (useful for small city cases).
-      - `max(area.buffers.values())` — the cross-border ring on TOP of
-        the AOI for any mode's accessibility radius.
-
-    Using a single combined buffer here keeps the file count small
-    (no `<area>_pois_walk.gpkg` / `<area>_pois_bike.gpkg`
-    proliferation) at the cost of slightly over-fetching for
-    narrower-mode use.
-    """
+    """Buffer (m) from `area.place` for mode-agnostic data (POIs, obstacles, buildings,
+    DEM, population): the AOI buffer plus the widest mode buffer, so one file per area
+    serves every mode."""
     return area.aoi_buffer_m + max(area.buffers.values())

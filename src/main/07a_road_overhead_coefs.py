@@ -1,12 +1,13 @@
 """
 Calibrate trip-endpoint overhead coefficients — road modes only.
 
-Fits, per road profile, on door-to-door TRIPS (`_main_mode_trips`: exactly
-one leg of the profile's mode plus any walking legs, e.g. the walk from a
-car park, which MTMC records as a leg of its own; for walking, single-leg
-walking trips)::
+Fits, per road profile, on door-to-door TRIPS (the trip set of survey/02d,
+`main.common.survey_trips`, shared with 07b and 09a: exactly one leg of the
+profile's mode plus any walking legs, e.g. the walk from a car park, which
+MTMC records as a leg of its own; for walking, single-leg walking trips; car
+trips as the driver or as a passenger)::
 
-    trip time = const + α · t_routed_<profile>(main leg)
+    trip time = const + α · t_routed_<profile>(trip start → trip end)
                       + Σ β_i · endpoint_feature_i(trip start)
                       + Σ β_i · endpoint_feature_i(trip end)
 
@@ -18,7 +19,8 @@ feature shouldn't depend on which end of the trip you're standing at).
 Network times are calibrated per leg (04, the movement); overheads per
 trip, so that walks to and from a parked vehicle and waiting between legs
 count as overhead where they occur. Trip time runs from the first leg's
-departure to the last leg's arrival.
+departure to the last leg's arrival; the routed time runs between the trip's
+ends, as the atlas routes between cells.
 
 α is fitted (α ≠ 1: residual scale bias in the routed times). The three
 car profiles share one overhead (constant + endpoint features) and one α
@@ -46,11 +48,13 @@ regression on relative residuals instead (`_HUBER_T` robust standard
 deviations: deviations within count as in a mean, larger ones linearly).
 OLS and a plain median regression on the reports are logged alongside.
 
-**Speed gate.** The survey flag `is_within_speed_envelope` (survey
-preparation, shared with 04) tolerates rounded reports: a leg fails only if
-every true time its report can stand for gives a speed outside its mode's
-envelope (e.g. a 700 m walk reported as "5 min" passes); a trip is used
-only if all its legs pass.
+**Speed gate.** A trip is used only if its main-mode leg is neither too slow nor
+too fast for its mode (`main.common.TRIP_QUALITY_FLAGS`: survey preparation's speed
+envelope, failed only if every true time the rounded report can stand for falls
+outside it; too fast checked from 10 min reported). Its walking legs count through
+the trip's unexplained time, and may take at most 15 min each
+(`TRIP_MAX_OTHER_LEG_S`): longer walks are mostly activities of their own, not
+the way to or from the vehicle.
 
 `fix_alpha` (per config) fixes the routed-time slope at 1 and fits only the
 overhead terms, so long trips don't trade slope against constant.
@@ -58,8 +62,8 @@ overhead terms, so long trips don't trade slope against constant.
 Transit overheads are fitted in `main/07b_transit_overhead_coefs.py`.
 
 Inputs (PRIVATE, under <scenario>/):
-    generic/survey_legs.csv                  # from survey/02d
-    generic/survey_leg_times.csv             # from survey/05
+    generic/survey_trips.csv                 # from survey/02d (--variant mtmc_trips)
+    generic/survey_trip_times.csv            # from survey/05 (--variant mtmc_trips)
 
 Inputs (scenario storage, under <scenario>/):
     properties/cells_snap.csv                # 02a → 02c — cell → node_id_<mode>, distance_<mode>
@@ -88,8 +92,8 @@ from aperta_atlas import coefs
 from aperta_atlas.context import Context, Storage, init_context
 from aperta_atlas.utils import step
 from aoi_filter import filter_legs_by_aoi, load_aoi_polygon
-from main.common import ROAD_OVERHEAD_DENSITY_COL
-from preparation.switzerland.private.surveys.common import in_trip_order, report_intervals
+from main.common import ROAD_OVERHEAD_DENSITY_COL, TRIP_QUALITY_FLAGS, TRIP_SET, survey_file
+from preparation.switzerland.private.surveys.common import report_intervals
 from scenarios import get_scenario
 
 
@@ -114,12 +118,10 @@ class OverheadCalibConfig:
     """One overhead calibration — a road profile."""
     name: str                                # output column in the coefs CSV
     sub_modes: list[str]                     # `mode_simplified` values to include
-    baseline_col: str                        # column in survey_leg_times.csv
+    baseline_col: str                        # column in survey_trip_times.csv
     endpoint_features: list[EndpointFeature] = field(default_factory=list)
     peak_filter: str | None = None           # optional main leg `peak_str` filter (car)
-    min_trip_distance: float = 1.0          # trip dist_line lower bound (m)
     max_trip_distance: float = 999_999.0     # trip dist_line upper bound (m)
-    max_dist_measured_ratio: float = 5.0     # trip dist_measured / dist_line cap
     share_endpoint_coefs: bool = False       # fit β · (orig + dest) as a single regressor
     # Fix the routed-time slope α at 1 (fit only the overhead terms on report − t_routed).
     fix_alpha: bool = False
@@ -275,7 +277,6 @@ def _fit_interval_em(y: pd.Series, X: pd.DataFrame, start: pd.Series, *,
 def _fit_and_log_ols(
     y: pd.Series, X: pd.DataFrame, *,
     ref_series: pd.Series,
-    name_width: int = 20,
 ) -> pd.Series:
     """Fit `sm.OLS(y, sm.add_constant(X))`, log R² + n + residual std +
     y-mean + ref_series-mean, then log each coefficient. Returns the
@@ -287,22 +288,18 @@ def _fit_and_log_ols(
         f"mean t_measured = {y.mean():.1f} s, "
         f"mean t_routed = {ref_series.mean():.1f} s")
     for name, coef in result.params.items():
-        logging.info(f"     {str(name):>{name_width}s}: {coef:.4f}")
+        logging.info(f"     {str(name):>20s}: {coef:.4f}")
     return result.params
 
 
-def _design(context: Context, cfg: OverheadCalibConfig, legs: pd.DataFrame,
+def _design(context: Context, cfg: OverheadCalibConfig, trips: pd.DataFrame,
             routed: pd.DataFrame) -> pd.DataFrame:
-    """The profile's trips (`_main_mode_trips`) within its distance range, with the
+    """The profile's trips (`_profile_trips`) within its distance range, with the
     endpoint features at the trip's ends (summed when `share_endpoint_coefs`);
     rows with missing values dropped."""
-    with step(f'{cfg.name}: trips (one {"/".join(cfg.sub_modes)} leg + walking legs) '
-              f'+ features'):
-        trips = _main_mode_trips(legs, routed, cfg)
-        trips = trips[(trips['dist_line'] >= cfg.min_trip_distance)
-                      & (trips['dist_line'] <= cfg.max_trip_distance)
-                      & (trips['dist_measured'] / trips['dist_line']
-                         < cfg.max_dist_measured_ratio)]
+    with step(f'{cfg.name}: trips (main mode {"/".join(cfg.sub_modes)}) + features'):
+        trips = _profile_trips(trips, routed, cfg)
+        trips = trips[trips['dist_line'] <= cfg.max_trip_distance]
         df = trips[['time_measured', 't_routed', 'orig_cell_id', 'dest_cell_id']].copy()
         for f in cfg.endpoint_features:
             orig, dest = f.source(context, trips)
@@ -345,18 +342,16 @@ def _fit(df: pd.DataFrame, X_cols: list[str], method: str, *,
 
 def _calibrate_overhead(
     context: Context, cfg: OverheadCalibConfig,
-    legs: pd.DataFrame, routed: pd.DataFrame, method: str | None = None,
+    trips: pd.DataFrame, routed: pd.DataFrame, method: str | None = None,
 ) -> pd.Series:
     """Fit one profile's overhead on its trips (`_design`) with `method` (default
     `_FIT_METHOD`). Returns the coefficient Series (`t_routed` = 1 when
     `cfg.fix_alpha`)."""
     method = method or _FIT_METHOD
-    df = _design(context, cfg, legs, routed)
+    df = _design(context, cfg, trips, routed)
     with step(f'{cfg.name}: fit ({method})'):
-        X_cols = ['t_routed'] + _feature_cols(cfg)
+        X_cols = ([] if cfg.fix_alpha else ['t_routed']) + _feature_cols(cfg)
         offset = df['t_routed'] if cfg.fix_alpha else None
-        if cfg.fix_alpha:
-            X_cols.remove('t_routed')
         params = _fit(df, X_cols, method, offset=offset,
                       label=', α fixed at 1' if cfg.fix_alpha else '')
     if cfg.fix_alpha:
@@ -366,14 +361,14 @@ def _calibrate_overhead(
 
 def _calibrate_pooled(
     context: Context, cfgs: list[OverheadCalibConfig],
-    legs: pd.DataFrame, routed: pd.DataFrame, method: str | None = None,
+    trips: pd.DataFrame, routed: pd.DataFrame, method: str | None = None,
 ) -> dict[str, pd.Series]:
     """One overhead (constant + endpoint features) and one routed-time slope α
     shared by `cfgs` (one mode, one config per time-of-day profile); each trip
     enters with the routed time of its own profile, so the profiles differ only
     in their network times. Returns one coefficient Series per config name."""
     method = method or _FIT_METHOD
-    df = pd.concat([_design(context, cfg, legs, routed) for cfg in cfgs])
+    df = pd.concat([_design(context, cfg, trips, routed) for cfg in cfgs])
     features = _feature_cols(cfgs[0])
     names = ', '.join(cfg.name for cfg in cfgs)
     with step(f'{names}: pooled fit ({method}; shared overhead and α)'):
@@ -422,27 +417,27 @@ _POOLED_PROFILES: tuple[str, ...] = ('car_peak', 'car_base', 'car_night')
 
 
 def _fit_road_overheads(context: Context) -> pd.DataFrame:
-    """Fit per-profile road overheads from MZMV survey legs + survey/05's
+    """Fit per-profile road overheads from the MTMC survey trips + survey/05's
     routed times; the profiles in `_POOLED_PROFILES` share one overhead and α
     (`_calibrate_pooled`). Returns a `param × profile` DataFrame."""
-    legs, routed = _load_survey_data(context)
+    trips, routed = _load_survey_data(context)
     all_coefs: dict[str, pd.Series] = {}
     pooled: list[OverheadCalibConfig] = []
     for cfg in _ROAD_CONFIGS:
         if cfg.baseline_col not in routed.columns:
             logging.warning(
                 f"profile={cfg.name}: {cfg.baseline_col!r} missing from "
-                f"survey_leg_times.csv; skipping (run survey/05 for this profile).")
+                f"survey_trip_times.csv; skipping (run survey/05 for this profile).")
             continue
         if cfg.name in _POOLED_PROFILES:
             pooled.append(cfg)
             continue
-        all_coefs[cfg.name] = _calibrate_overhead(context, cfg, legs, routed)
+        all_coefs[cfg.name] = _calibrate_overhead(context, cfg, trips, routed)
     if pooled:
-        all_coefs.update(_calibrate_pooled(context, pooled, legs, routed))
+        all_coefs.update(_calibrate_pooled(context, pooled, trips, routed))
     if not all_coefs:
         raise RuntimeError(
-            "No overhead models fit — survey_leg_times.csv has no matching "
+            "No overhead models fit — survey_trip_times.csv has no matching "
             "t_routed columns. Did survey/05 run successfully?")
     out = pd.DataFrame(all_coefs)
     out.index.name = 'param'
@@ -454,116 +449,55 @@ def _fit_road_overheads(context: Context) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def _main_mode_trips(legs: pd.DataFrame, routed: pd.DataFrame,
-                     cfg: OverheadCalibConfig) -> pd.DataFrame:
-    """One row per trip of exactly one leg of `cfg.sub_modes` plus any walking
-    legs (for walking: single-leg walking trips), with all its legs present
-    (none dropped by the validity or AOI filters) and passing the gates, the
-    trip within the gap envelope, and the main leg matching `cfg.peak_filter`.
-    Columns: time_measured (first departure → last arrival, incl. waiting
-    between legs; else the summed leg times), t_routed (the main leg's
-    `cfg.baseline_col`), orig_cell_id / dest_cell_id (the trip's ends),
-    dist_line (between the trip's ends), dist_measured (summed legs),
-    n_walk_legs (besides the main leg)."""
-    sub = in_trip_order(legs[legs['trip_id'].notna()])
-    trip = sub['trip_id']
-    is_main = sub['mode_simplified'].isin(cfg.sub_modes)
-    is_other_walk = (sub['mode_simplified'] == 'walk') & ~is_main
-    info = pd.DataFrame({
-        'n_present': trip.groupby(trip).size(),
-        'n_legs': sub.groupby('trip_id')['n_legs_in_trip'].first(),
-        'n_main': is_main.groupby(trip).sum(),
-        'n_walk': is_other_walk.groupby(trip).sum(),
-        'all_pass': sub['passes_gates'].groupby(trip).all(),
-    })
-    keep = ((info['n_present'] == info['n_legs']) & (info['n_main'] == 1)
-            & (info['n_main'] + info['n_walk'] == info['n_present']) & info['all_pass'])
-    if 'is_within_gap_envelope' in sub.columns:
-        keep &= sub['is_within_gap_envelope'].groupby(trip).min() == 1
-    sub = sub[trip.isin(keep.index[keep])]
-    g = sub.groupby('trip_id')
-    first, last = g.head(1).set_index('trip_id'), g.tail(1).set_index('trip_id')
-    main_leg = sub[sub['mode_simplified'].isin(cfg.sub_modes)]
+def _profile_trips(trips: pd.DataFrame, routed: pd.DataFrame,
+                   cfg: OverheadCalibConfig) -> pd.DataFrame:
+    """The trips of `cfg`'s main modes (`cfg.sub_modes`; `cfg.peak_filter` on the main leg's
+    `peak_str`), with `t_routed` the trip's `cfg.baseline_col`, routed between its ends."""
+    sel = trips['mode_simplified'].isin(cfg.sub_modes)
     if cfg.peak_filter is not None:
-        main_leg = main_leg[main_leg['peak_str'] == cfg.peak_filter]
-    out = pd.DataFrame({'t_routed': routed.loc[main_leg.index, cfg.baseline_col].to_numpy()},
-                       index=pd.Index(main_leg['trip_id'], name='trip_id'))
-    idx = out.index
-    span = (pd.to_datetime(last.loc[idx, 'datetime_arrival'], errors='coerce')
-            - pd.to_datetime(first.loc[idx, 'datetime_departure'], errors='coerce')
-            ).dt.total_seconds()
-    span = span.where(span >= 0, span + 86_400)            # trips across midnight
-    out['time_measured'] = span.fillna(g['time_measured'].sum().loc[idx])
-    out['orig_cell_id'] = first.loc[idx, 'orig_cell_id']
-    out['dest_cell_id'] = last.loc[idx, 'dest_cell_id']
-    out['dist_line'] = np.hypot(last.loc[idx, 'dest_x'] - first.loc[idx, 'orig_x'],
-                                last.loc[idx, 'dest_y'] - first.loc[idx, 'orig_y'])
-    out['dist_measured'] = g['dist_measured'].sum().loc[idx]
-    out['n_walk_legs'] = info.loc[idx, 'n_walk']
+        sel &= trips['peak_str'] == cfg.peak_filter
+    out = trips.loc[sel, ['time_measured', 'orig_cell_id', 'dest_cell_id', 'dist_line',
+                          'n_walk_legs']].copy()
+    out['t_routed'] = routed.loc[out.index, cfg.baseline_col]
     return out
 
 
 def _load_survey_data(context: Context) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load survey legs + routed times (both PRIVATE). Context caches
-    reads, so repeated calls are free after the first.
+    """Load the door-to-door survey trips (`TRIP_SET`, survey/02d) + their routed times
+    (survey/05), both PRIVATE. Context caches reads, so repeated calls are free after the
+    first.
 
-    Applies the same quality gates as `04_edge_weights.py`'s
-    `_apply_survey_gates`: overhead = time_measured − routed time, so any
-    noise / person-fitness bias that contaminates edge weights also
-    contaminates the overhead residual.
-
-    02d's `survey_legs.csv` already enforces `is_valid_domestic_trip`,
-    `is_land_based`, `is_within_elevation_band`, and the mode-choice
-    mode set — kept as defense-in-depth. The speed and detour envelope flags
-    are kept as a column `passes_gates` rather than dropping legs, so that
-    trips stay complete; `_main_mode_trips` uses only trips whose legs all
-    pass.
+    Keeps the plausible trips (`TRIP_QUALITY_FLAGS`: the door-to-door time and the main-mode
+    legs as 04 checks legs, the ends at least 100 m apart, the whole trip's detour and
+    unexplained time, no walking leg over 15 min) with both ends in the AOI.
     """
-    with step('load survey legs + routed times'):
-        legs = context.get_generic('survey_legs.csv', storage=Storage.PRIVATE)
-        routed = context.get_generic('survey_leg_times.csv', storage=Storage.PRIVATE)
-        n_before = len(legs)
-        if 'is_valid_domestic_trip' in legs.columns:
-            legs = legs[legs['is_valid_domestic_trip'] == 1]
-        if 'is_land_based' in legs.columns:
-            legs = legs[legs['is_land_based'].fillna(1) == 1]
-        if 'is_within_elevation_band' in legs.columns:
-            legs = legs[legs['is_within_elevation_band'] == 1]
-        n_after = len(legs)
-        if n_after < n_before:
-            logging.info(
-                f"  Validity filters: {n_before:,} → {n_after:,} legs "
-                f"kept ({n_before - n_after:,} dropped)")
-        passes = pd.Series(True, index=legs.index)
-        if 'is_within_speed_envelope' in legs.columns:
-            passes &= legs['is_within_speed_envelope'] == 1
-        if 'is_within_detour_envelope' in legs.columns:
-            passes &= legs['is_within_detour_envelope'] == 1
-        legs = legs.assign(passes_gates=passes)
-        logging.info(f"  → {int(passes.sum()):,} / {len(legs):,} legs within the speed and "
-                     f"detour envelopes")
-        # AOI filter: scope training to legs whose BOTH endpoints fall
-        # inside the scenario's AOI polygon. Pass-through for whole-
-        # country scenarios, load-bearing for CV scenarios.
+    with step('load survey trips + routed times'):
+        trips = context.get_generic(survey_file('survey_legs.csv', TRIP_SET),
+                                    storage=Storage.PRIVATE)
+        routed = context.get_generic(survey_file('survey_leg_times.csv', TRIP_SET),
+                                     storage=Storage.PRIVATE)
+        n_before = len(trips)
+        for flag in TRIP_QUALITY_FLAGS:
+            trips = trips[trips[flag] == 1]
+        logging.info(f"  → {len(trips):,} / {n_before:,} trips plausible")
+        # AOI filter: scope training to trips whose BOTH ends fall inside the scenario's AOI
+        # polygon. Pass-through for whole-country scenarios, load-bearing for CV scenarios.
         scenario = get_scenario(context.scenario)
-        aoi_polygon = load_aoi_polygon(context)
-        legs = filter_legs_by_aoi(
-            legs, aoi_polygon, crs=scenario.crs_main, label='survey legs')
-        # Reindex by stable leg_id (both files carry it as their index).
-        # Aligns routed to the post-gate legs subset AND surfaces any
-        # stale-05 / re-run-02d mismatch as a low overlap ratio.
-        n_overlap = int(routed.index.isin(legs.index).sum())
-        if n_overlap < 0.5 * len(legs):
+        trips = filter_legs_by_aoi(
+            trips, load_aoi_polygon(context), crs=scenario.crs_main, label='survey trips')
+        # Both files are indexed by trip_id; a low overlap surfaces a stale-05 / re-run-02d
+        # mismatch.
+        n_overlap = int(routed.index.isin(trips.index).sum())
+        if n_overlap < 0.5 * len(trips):
             raise DataError(
-                f"survey_leg_times.csv covers only {n_overlap:,}/{len(legs):,} "
-                f"post-gate legs — likely stale after a 02d re-run. "
-                f"Re-run survey/05_leg_times.")
-        routed = routed.reindex(legs.index)
+                f"survey_trip_times.csv covers only {n_overlap:,}/{len(trips):,} "
+                f"post-gate trips — likely stale after a 02d re-run. "
+                f"Re-run survey/05_leg_times --variant {TRIP_SET}.")
+        routed = routed.reindex(trips.index)
         t_routed_cols = sorted(c for c in routed.columns if c.startswith('t_routed_'))
-        logging.info(f"  → {len(legs):,} legs "
-                     f"({n_overlap:,} matched in routed), "
+        logging.info(f"  → {len(trips):,} trips ({n_overlap:,} matched in routed), "
                      f"t_routed columns: {t_routed_cols}")
-    return legs, routed
+    return trips, routed
 
 
 def main():

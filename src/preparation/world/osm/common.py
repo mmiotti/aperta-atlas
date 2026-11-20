@@ -1,5 +1,5 @@
 """Shared boilerplate for the per-variant PBF-stream scripts
-(`buildings_from_pbf`, `obstacles_from_pbf`, `pois_from_pbf`).
+(`networks_from_pbf`, `buildings_from_pbf`, `obstacles_from_pbf`, `pois_from_pbf`).
 
 Each of those scripts goes through the same sequence: check `osmium` is on
 PATH, resolve the source full-region PBF, clip it to the variant's
@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import tempfile
 from contextlib import contextmanager
+
+from shapely.geometry import MultiPolygon, Polygon
 
 from aperta_atlas.context import Context, Storage
 from aperta_atlas.utils import step
@@ -42,16 +44,9 @@ def _source_pbf(context: Context, pbf_name: str) -> str:
 
 @contextmanager
 def clipped_pbf(context: Context, variant, out_name: str):
-    """Yield a path to a per-variant clipped PBF inside a temp directory.
-
-    Builds the buffered AOI polygon for `variant`, writes it to a `.poly`
-    file, runs `osmium extract` to clip the source PBF, and yields the
-    clipped path. Both temp files are cleaned up on context-manager exit.
-
-    `out_name` is the variant-stable basename used for the poly + clipped
-    files (e.g. `'bern_buildings'`, `'obstacles_bern'`, `'pois_bern'`) —
-    only matters for the temp filenames + log output.
-    """
+    """Yield `(clipped PBF path, buffered AOI polygon)` for `variant`, the PBF clipped by
+    `osmium extract` inside a temp directory that is removed on exit. `out_name` is the
+    basename of the temp files."""
     _check_osmium_on_path()
     source_pbf = _source_pbf(context, variant.pbf_name)
 
@@ -73,4 +68,18 @@ def clipped_pbf(context: Context, variant, out_name: str):
             clip_mb = os.path.getsize(clipped) / (1024 * 1024)
             logging.info(f"  → clipped PBF: {clip_mb:,.1f} MB")
 
-        yield clipped
+        yield clipped, polygon
+
+
+def area_multipolygon(a) -> MultiPolygon | None:
+    """Shapely multipolygon (lon/lat) of a pyosmium area: each outer ring with its inner
+    rings as holes. None if no outer ring has at least 4 valid points."""
+    polygons = []
+    for outer in a.outer_rings():
+        shell = [(n.lon, n.lat) for n in outer if n.location.valid()]
+        if len(shell) < 4:
+            continue
+        holes = [[(n.lon, n.lat) for n in inner if n.location.valid()]
+                 for inner in a.inner_rings(outer)]
+        polygons.append(Polygon(shell, [h for h in holes if len(h) >= 4]))
+    return MultiPolygon(polygons) if polygons else None

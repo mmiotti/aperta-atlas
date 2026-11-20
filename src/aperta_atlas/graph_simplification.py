@@ -1,24 +1,14 @@
 """
-Graph topology simplification helpers — chain collapse and (future)
-intersection consolidation.
+Graph topology simplification helpers.
 
-Two related but distinct operations both reduce graph complexity:
-
-  1. **Chain collapse** (`collapse_degree_2_chains`): removes degree-2
-     interior nodes by merging the chain through them into a single
-     edge. Concatenates per-edge LineString geometry instead of
-     rebuilding it from node x/y (which is what
-     `ox.simplification.simplify_graph` does — and what destroys shape
-     detail when intersection-only pre-simplified graphs are processed).
-
-  2. **Intersection consolidation** (planned wrapper around
-     `ox.consolidate_intersections`): merges spatially-close degree-3+
-     nodes that conceptually form one intersection (split-by-OSM-tag
-     junctions, roundabouts). To be added when the
-     `networks_consolidation.py` orchestration script is built.
-
-Follows OSMnx's `osmnx.simplification` module precedent — both ops live
-under one umbrella.
+**Chain collapse** (`collapse_degree_2_chains`, also run by
+`prune_short_dead_ends`): removes degree-2 interior nodes by merging the
+chain through them into a single edge. Concatenates per-edge LineString
+geometry instead of rebuilding it from node x/y (which is what
+`ox.simplification.simplify_graph` does — and what destroys shape detail
+when intersection-only pre-simplified graphs are processed). Intersection
+consolidation is `ox.consolidate_intersections` plus
+`aperta_atlas.osm.clean_consolidated_edges` (`networks_consolidate.py`).
 
 Module-level invariants:
   - Operates on NetworkX `MultiDiGraph` / `MultiGraph`.
@@ -97,22 +87,8 @@ def _aggregate_attr(values_lengths: list[tuple]):
         arbitrarily by `Counter`). Picks a representative dominant
         value. Catches `highway`, `oneway`, `cycleway`,
         `cycleway:left/right/both`, `cyclestreet`, `service`,
-        `junction`, `access`, `ref`, etc.
-
-    Design rule of thumb: if you'd want a continuous summary of a
-    categorical attribute (e.g. "what fraction of this merged edge is
-    a bridge?"), numerize it to 0/1 upstream — the numeric mean does
-    the right thing for you. Mode is for "what flavour does this
-    merged edge predominantly have?" — used when the categories carry
-    distinct downstream semantics that can't be averaged (e.g. you'd
-    rather know the edge is mostly a `cycleway=track` than the mean
-    of {`track`, `lane`}).
-
-    Deviation from OSMnx's `simplify_graph` convention (which collects
-    differing values into a list per edge) — we collapse to a single
-    representative value here, which is what downstream analysis
-    actually wants and removes the need for downstream after-the-fact
-    list cleanup.
+        `junction`, `access`, `ref`, etc. To get a continuous summary of a
+        categorical attribute (e.g. the bridge fraction), numerize it upstream.
     """
     pairs = [(v, w) for v, w in values_lengths if v is not None]
     if not pairs:
@@ -155,13 +131,9 @@ def _merge_chain(g: nx.MultiDiGraph, path: list) -> dict | None:
         if not g.has_edge(u, v):
             return None
         # Interior chain edges have a single key per (u, v); first key wins.
-        keys = list(g[u][v].keys())
-        edge_attrs = g[u][v][keys[0]]
+        edge_attrs = next(iter(g[u][v].values()))
         edge_length = float(edge_attrs.get('length', 0.0))
         edge_records.append((edge_attrs, edge_length))
-
-    if not edge_records:
-        return None
 
     # Geometry: concatenate LineStrings.
     coords: list = []
@@ -224,7 +196,7 @@ def simplify_edge_geometries(
     vertices), so simplified edges still meet their node positions.
 
     Length-recomputation should follow this (e.g. via
-    `clean_consolidated_edges` in aperta) since the simplified
+    `aperta_atlas.osm.clean_consolidated_edges`) since the simplified
     geometry is slightly shorter than the original.
     """
     for _, _, _, d in g.edges(keys=True, data=True):
@@ -337,18 +309,10 @@ def prune_short_dead_ends(
             dead_ends.append(n)
 
     g.remove_nodes_from(dead_ends)
-
-    # Drop any isolated nodes (degree-0). Can happen if a junction's
-    # entire spider of short spokes was in the prune set above.
-    isolated = [n for n in g.nodes if g.degree(n) == 0]
-    g.remove_nodes_from(isolated)
-
-    # Collapse degree-2 chains formed by junctions that lost an arm
-    # (e.g. a 3-way junction with one pruned driveway becomes a degree-2
-    # through-point and should be merged into the surviving edge).
-    g = collapse_degree_2_chains(g)
-
-    return g
+    # Drop nodes left isolated (a junction whose spokes were all short).
+    g.remove_nodes_from([n for n in g.nodes if g.degree(n) == 0])
+    # Merge junctions that lost an arm (now degree-2 through-points).
+    return collapse_degree_2_chains(g)
 
 
 def collapse_degree_2_chains(g: nx.MultiDiGraph) -> nx.MultiDiGraph:
@@ -372,8 +336,8 @@ def collapse_degree_2_chains(g: nx.MultiDiGraph) -> nx.MultiDiGraph:
         between chain endpoints).
       - **Attributes**: length-weighted aggregation via `_aggregate_attr`
         — numeric attrs (`maxspeed`, `lanes`, …) become a length-weighted
-        mean across the chain; categorical attrs (`highway`, `oneway`,
-        `bridge`, …) become the length-weighted mode. OSMnx instead
+        mean across the chain (incl. `bridge` / `tunnel`, numerized upstream);
+        categorical attrs (`highway`, `oneway`, …) become the length-weighted mode. OSMnx instead
         collects differing values into a list per attribute, leaving
         downstream code to do after-the-fact list cleanup.
 

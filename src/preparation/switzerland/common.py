@@ -1,33 +1,15 @@
 """
 Shared helpers for `preparation/switzerland/` scripts (analogous to
-`preparation/world/common.py`).
+`preparation/world/common.py`), mostly BFS conventions shared by the STATPOP
+(population) and STATENT (employment) dasymetric scripts:
 
-Covers BFS-specific conventions shared across STATENT (employment) and
-STATPOP (population) — and any future BFS-derived orchestrators:
-
-  - **Hectare-cell polygons** (`build_hectare_cells`): both releases
-    publish per-100m-cell totals indexed by `(E_KOORD, N_KOORD)`
-    lower-left-corner LV95 coordinates; downstream dasymetric mapping
-    consumes these as a polygon GeoDataFrame.
-
-  - **Privacy-suppression uncap** (`replace_smaller_equal`): BFS caps
-    small per-cell counts (≤ 3 for STATPOP, ≤ 4 for STATENT) as the
-    literal cap value. The helper redraws the capped values from a
-    weighted distribution that approximates the true tail.
-
-  - **Per-category output merge helpers** (`merge_per_category_outputs`,
-    `combine_learned_per_category`): glue for orchestrators that run
-    one `dasymetric.per_building` / `learn_coefficients` pass per
-    category (sector, age band, …) and need to stitch the per-category
-    results back into a single per-building GeoDataFrame and a single
-    wide-form calibrated-coefficients table.
-
-  - **Swiss country polygon** (`load_swiss_country`, `filter_to_inside_ch`):
-    load the country polygon from political_boundaries.py's output and
-    filter a buildings GeoDataFrame to those inside CH borders. Used by
-    dasymetric orchestrators so the calibration area is the country
-    (not the cells subset), which is required for β to extrapolate
-    correctly when applied bottom-up.
+  - hectare cells and privacy uncapping (`build_hectare_cells`, `detect_privacy_cap`,
+    `replace_smaller_equal`);
+  - per-category output merges (`merge_per_category_outputs`,
+    `combine_learned_per_category`);
+  - the Swiss country polygon (`load_swiss_country`, `filter_to_inside_ch`);
+  - density stratification of building tags (`classify_density_stratum`,
+    `stratify_building_tags`, `expand_relevant_tags`, `derive_stratification_from_tags`).
 """
 
 import os
@@ -37,18 +19,11 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import box
 
-from aperta import geo_processing
 from aperta_atlas.context import Storage
 
 
-CRS_CH = 'EPSG:2056'           # Swiss metric CRS (LV95 / CH1903+) —
-                               # what BFS publishes in for STATPOP /
-                               # STATENT / NPVM / etc. The canonical
-                               # in-Switzerland CRS; doesn't change.
-CRS_LATLON = 'EPSG:4326'       # WGS84 lat/lon — for external APIs +
-                               # OSM ingest before reprojection.
-_CRS_LV95 = CRS_CH             # Internal alias kept for one in-file
-                               # reference. Swiss metric CRS — what BFS publishes in
+CRS_CH = 'EPSG:2056'           # Swiss metric CRS (LV95 / CH1903+), as BFS publishes
+CRS_LATLON = 'EPSG:4326'       # WGS84 lat/lon, for external APIs and OSM ingest
 _HECTARE_SIZE_M = 100          # BFS-standard cell size (100m × 100m)
 
 
@@ -88,6 +63,20 @@ def replace_smaller_equal(
     return a
 
 
+def detect_privacy_cap(values: np.ndarray) -> int:
+    """Return BFS's privacy-cap value inferred from `values`.
+
+    BFS caps true counts 1..n by replacing them with the literal cap
+    value n (any cell that would report 1, 2, …, n publishes n instead).
+    The smallest strictly-positive integer in the array IS the cap.
+    Assumes at least one capped cell exists — safe at national hectare
+    scale."""
+    positive = values[values > 0]
+    if positive.size == 0:
+        raise ValueError("No positive values in the array — cannot detect cap.")
+    return int(positive.min())
+
+
 def build_hectare_cells(stat_df: pd.DataFrame) -> gpd.GeoDataFrame:
     """Construct 100m × 100m LV95 hectare-cell polygons from a BFS-style
     DataFrame indexed on `(E_KOORD, N_KOORD)` lower-left-corner
@@ -114,7 +103,7 @@ def build_hectare_cells(stat_df: pd.DataFrame) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(
         {'cell_id': np.arange(len(stat_df))},
         geometry=polys,
-        crs=_CRS_LV95,
+        crs=CRS_CH,
     )
 
 
@@ -172,14 +161,13 @@ def combine_learned_per_category(
         return pd.DataFrame()
     merged: pd.DataFrame | None = None
     n_obs_series: pd.Series | None = None
-    for col, df in learned_per_category.items():
+    for df in learned_per_category.values():
         if df.empty:
             continue
-        non_obs_cols = [c for c in df.columns if c != 'n_observations']
-        slice_df = df[non_obs_cols]
+        slice_df = df[[c for c in df.columns if c != 'n_observations']]
         merged = slice_df if merged is None else merged.join(slice_df, how='outer')
-        obs_here = df['n_observations'] if 'n_observations' in df.columns else None
-        if obs_here is not None:
+        if 'n_observations' in df.columns:
+            obs_here = df['n_observations']
             n_obs_series = (
                 obs_here if n_obs_series is None
                 else n_obs_series.combine(obs_here, max, fill_value=0))
@@ -271,50 +259,9 @@ def filter_to_inside_ch(
 
 # ---------------------------------------------------------------------------
 # Density-based building stratification (used by STATPOP + STATENT dasymetric
-# calibration when a tag's intensity varies meaningfully with local density).
+# calibration when a tag's intensity varies meaningfully with local density;
+# the density itself comes from `preparation.world.land_use.strata`).
 # ---------------------------------------------------------------------------
-
-
-def compute_hectare_density(
-    buildings: gpd.GeoDataFrame,
-    cells: gpd.GeoDataFrame,
-    cell_totals: pd.DataFrame,
-    column: str,
-    radius_m: float = 1_000.0,
-) -> pd.Series:
-    """Per-building density of `column` in a `radius_m` ring, sourced
-    from the hectare grid.
-
-    Wraps `aperta.geo_processing.cross_sum_within_radius` with the
-    conventions the two dasymetric-calibration scripts share:
-    building centroids are the targets, hectare centroids are the
-    sources, and the return is density (sum / π·r²) — i.e. the source
-    unit per m². Multiply by 1e6 for the more intuitive per-km² units.
-
-    Args:
-        buildings: polygon GDF with a metric CRS.
-        cells: hectare polygons (from `build_hectare_cells`), with
-            `cell_id`; must share `buildings.crs`.
-        cell_totals: DataFrame indexed by cell_id including `column`.
-        column: hectare value column to sum (e.g. `'population_total'`).
-        radius_m: ring radius in metres. Default 1 km (Swiss walkability
-            + local-context envelope).
-
-    Returns:
-        pd.Series of density values (per m²), indexed by
-        `buildings.index`, aligned name = `<column>_density_<radius>m`.
-    """
-    hex_pts = cells.copy()
-    hex_pts.geometry = cells.geometry.centroid
-    hex_pts = hex_pts.join(cell_totals[column], on='cell_id')
-    return geo_processing.cross_sum_within_radius(
-        targets=buildings.set_geometry(buildings.geometry.centroid),
-        sources=hex_pts,
-        radius=radius_m,
-        weight_column=column,
-        return_density=True,
-        name=f'{column}_density_{int(radius_m)}m',
-    )
 
 
 def classify_density_stratum(

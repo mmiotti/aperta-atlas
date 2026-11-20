@@ -52,6 +52,7 @@ from main.common import (
     per_cell_transit_overhead,
     resolve_road_overhead_column,
     route_time_alpha,
+    zone_weights,
 )
 from mode_configs import TRANSIT_MODE_CONFIG
 from scenarios import get_scenario
@@ -77,14 +78,9 @@ def _z2z_lookup(context) -> dict[tuple, float]:
     `{(orig_zone, dest_zone): cost_s}` dict for O(1) per-pair lookup."""
     idx = context.get_tiered_odm(network_name='transit', data_name='z2z_pairs')
     cost = context.get_tiered_odm(network_name='transit', data_name='time_net_npvm')
-    z2z_idx = idx.zones_to_zones or {}
     z2z_cost = cost.zones_to_zones or {}
-    lookup: dict[tuple, float] = {}
-    for orig, dests in z2z_idx.items():
-        vals = z2z_cost[orig]
-        for i, dest in enumerate(dests):
-            lookup[(orig, dest)] = float(vals[i])
-    return lookup
+    return {(orig, dest): float(val) for orig, dests in (idx.zones_to_zones or {}).items()
+            for dest, val in zip(dests, z2z_cost[orig])}
 
 
 def _fill_transit_base_costs(
@@ -176,7 +172,7 @@ def _build_transit_gross(
         alpha_transit = route_time_alpha(transit_coefs['transit'])
         _scale_tiered_costs_in_place(base_costs, alpha_transit)
         per_cell_ov = per_cell_transit_overhead(cells_m, transit_coefs)
-        cb_weight = cells_m['combined_total']
+        cb_weight = zone_weights(cells_m)
         zone_ids_series = cells_m['zone_id']
         zone_mean_ov = weighted_group_mean(per_cell_ov, cb_weight, zone_ids_series)
 
@@ -322,7 +318,7 @@ def main():
                     density_col=density_col_local,
                     snap_dist_col=f'distance_{mode}',
                 )
-                cb_weight = cells_m['combined_total']
+                cb_weight = zone_weights(cells_m)
                 zone_ids = cells_m['zone_id']
                 orig_zone_ov = weighted_group_mean(orig_ov, cb_weight, zone_ids)
                 dest_zone_ov = weighted_group_mean(dest_ov, cb_weight, zone_ids)

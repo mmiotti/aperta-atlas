@@ -5,10 +5,10 @@ Joins the source `Steuerbares Einkommen pro Einwohner/-in` series onto the exist
 `municipalities` table (created by `political_boundaries.py`) and writes a companion
 `municipalities_income.csv` in the same namespace.
 
-Inputs (under <DATA_DIR_PUBLIC>/raw/switzerland/income/):
+Inputs (PUBLIC, under raw/switzerland/income/):
     KM10-27600-18-c-polg-2024-d-APPENDIX/27600_DE.csv
-Inputs (same-namespace; prior stage):
-    municipalities.csv  (from political_boundaries.py)
+Inputs (PUBLIC, under preparation/switzerland/general/):
+    municipalities.csv                  # from political_boundaries.py
 
 Outputs (PUBLIC, under preparation/switzerland/general/):
     municipalities_income.csv
@@ -21,8 +21,7 @@ import logging
 
 import pandas as pd
 
-from aperta_atlas.context import init_context
-from aperta_atlas.context import Storage
+from aperta_atlas.context import Storage, init_context
 
 
 _VARIABLE_NAME = 'Steuerbares Einkommen pro Einwohner/-in, in Franken'

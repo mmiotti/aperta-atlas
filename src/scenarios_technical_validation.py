@@ -61,19 +61,11 @@ Parameter choices shared by the res-*, radii-* and data-* scenarios
   one released coef bundle and apply it with whatever data and
   resolution they have.
 
-- ``mode_configs`` — walk, bike, car with one profile each (``rwalk``,
-  ``rbike``, ``car_base``), plus transit (``transit_source='npvm'``:
-  NPVM zone-to-zone times plus per-cell overheads).
-  Reduced-mobility / e-bike variants are excluded (out of scope here).
+- ``mode_configs`` — one profile per road mode (``rwalk``, ``rbike``,
+  ``car_base``) plus NPVM transit; see ``_TV_MODE_CONFIGS``.
 
-- ``accessibility_grids`` — two compact grids with one setting per metric
-  family at each of three reaches (counts up to 10 / 15 / 30 min, k = 1 /
-  10 / 30, half-decays of 1 / 2 / 5 min, utility β = 2 / 1 / 0.7), matched
-  by effective reach (see the grid definition below).
-  Three destination types with contrasting spatial patterns
-  (dense-urban clustered, mixed, tightly-clustered): grocery POIs,
-  secondary employment, gastronomy POIs. Time-based and utility-based
-  variants; distance-line is skipped as least-informative for resolution.
+- ``accessibility_grids`` — one setting per metric family at each of three
+  reaches, three contrasting destination types; see ``_TV_DEST_COLS``.
 
 The res-* scenarios span the cell-resolution ladder:
 
@@ -87,11 +79,11 @@ supported by ``main/01_cells_zones.py`` but kept commented out below.
 """
 from dataclasses import dataclass, replace
 
-# The `_`-prefixed presets are module-private in `scenarios.py` but imported
-# here on purpose, so both modules stay in sync when a preset changes.
 from aperta_atlas.coefs import Calibrate, ImportFrom
 from aperta_atlas.context import Storage
 from mode_configs import MODE_CONFIGS, OdmRadii
+# The `_`-prefixed presets are module-private in `scenarios.py` but imported
+# here on purpose, so both modules stay in sync when a preset changes.
 from scenarios import (
     AccessibilityGrid,
     Scenario,
@@ -286,7 +278,7 @@ SCENARIOS: dict[str, Scenario] = {
 # scenarios inherit PRIVATE for output collocation.
 #
 # Region scoping: calibration stages (03a, 04, 07a, 07b, 09a) restrict their
-# training legs / counters to the scenario's AOI via `aoi_filter.py`, requiring
+# training legs to the scenario's AOI via `aoi_filter.py`, requiring
 # BOTH leg endpoints inside so cross-region legs don't leak out-of-region
 # behaviour into training. For `switzerland-h10` the AOI is all of Switzerland,
 # so the filter passes every in-country leg through.

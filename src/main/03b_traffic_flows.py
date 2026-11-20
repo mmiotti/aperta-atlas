@@ -56,9 +56,6 @@ _BASELINE_DURATION = 1.2
 _INITIAL_MULT = {'density_r1000_norm': 0.25}
 _INITIAL_ADD = {'is_4way': 15.0, 'is_traffic_signal': 15.0}
 
-# Trip-generation weights + cost-bin edges are calibrated in 03a and
-# loaded via `context.get_coefs(...)`.
-
 # Sampling. TODO: make configurable / fraction of population count.
 _N_ORIG = 100_000
 _N_DEST = 100
@@ -83,8 +80,13 @@ _TIER_HIGHWAY_MIN_RANK = 6
 _TIER_MAIN_MIN_RANK    = 3
 
 # BPR exponents. Textbook β=4 (US Highway Capacity Manual); β=2 fit Swiss
-# data better in an earlier calibration and is the one 04 and 09a use.
+# data better in an earlier calibration and is the one 04 uses.
 _VC_BETA = [2.0, 4.0]
+# Cap on `vc` before the power (`vc_beta_*`; the `vc` column stays raw). A daily v/c above 2 is an
+# artifact, not congestion: a ramp with untagged lanes (1 by default), an edge merged with a lower
+# class, or sampling noise. Uncapped, `vc**β` lets one such edge dominate a route's congestion
+# term in 04's fit (vc 9 → vc² 81, against a P95 of about 0.1).
+_VC_MAX = 2.0
 
 
 def _cap_per_lane(highway) -> float:
@@ -177,8 +179,7 @@ def main():
 
     # ---------- Initial per-edge duration ---------------------------------
     with step('compute initial per-edge duration (priors)'):
-        n_set = 0
-        for u, v, k, d in graph.edges(keys=True, data=True):
+        for *_, d in graph.edges(data=True):
             length = float(d['length'])
             speed_kph = float(d['speed_kph'])
             base = length / (speed_kph * _KMH_TO_MS) * _BASELINE_DURATION
@@ -189,9 +190,8 @@ def main():
                 c * float(d.get(f, 0.0)) for f, c in _INITIAL_ADD.items()
             )
             d['duration_initial'] = max(base + mult_term + add_term, base * 0.2)
-            n_set += 1
         logging.info(
-            f"  → set duration_initial on {n_set:,} edges; sample stats: "
+            f"  → set duration_initial on {graph.number_of_edges():,} edges; sample stats: "
             f"min={min(d['duration_initial'] for *_, d in graph.edges(keys=True, data=True)):.1f} s, "
             f"max={max(d['duration_initial'] for *_, d in graph.edges(keys=True, data=True)):.0f} s")
 
@@ -287,7 +287,7 @@ def main():
             f"  → flow_estimate (veh/day): mean {flows.mean():.0f}, max {flows.max():.0f}")
 
     # BPR-style congestion intensity: `vc = flow / capacity` (both
-    # veh/day), then `vc_beta = vc**β`. 04_edge_weights uses `vc_beta`
+    # veh/day), then `vc_beta = min(vc, _VC_MAX)**β`. 04_edge_weights uses `vc_beta`
     # as a multiplier feature in car profiles.
     with step(f'compute BPR vc + vc_beta (β={_VC_BETA})'):
         flows_dict = flows.to_dict()
@@ -314,18 +314,19 @@ def main():
                 'vc':            vc,
             }
             for beta in _VC_BETA:
-                rows[_edge_id(*keys)][f'vc_beta_{beta:.1f}'] = vc ** beta
+                rows[_edge_id(*keys)][f'vc_beta_{beta:.1f}'] = min(vc, _VC_MAX) ** beta
         flows_df = pd.DataFrame.from_dict(rows, orient='index').round(4)
         flows_df.index.name = 'edge_id'
         logging.info(
             f"  → vc: median {flows_df['vc'].median():.3f}, "
             f"P95 {flows_df['vc'].quantile(0.95):.3f}, "
-            f"max {flows_df['vc'].max():.3f}")
+            f"max {flows_df['vc'].max():.3f}; "
+            f"{int((flows_df['vc'] > _VC_MAX).sum()):,} edges capped at {_VC_MAX} for vc_beta")
         context.create_properties(flows_df, data_name='car_flows')
 
     # Per-node neighborhood aggregations: mean of car-edge quantities
-    # over edges whose midpoint is within r of the node. Consumed by
-    # 09a as endpoint features (`traffic_flow_avg_r*` + `vc_beta_*_avg_r*`).
+    # over edges whose midpoint is within r of the node. 09a's endpoint
+    # features use `traffic_flow_avg_r250` (main/utility_config.py).
     _NEIGHBORHOOD_FIELDS: list[tuple[str, str]] = [
         ('flow_estimate', 'traffic_flow_avg'),
         ('vc_beta_2.0',   'vc_beta_2.0_avg'),

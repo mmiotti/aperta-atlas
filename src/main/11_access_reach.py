@@ -19,7 +19,8 @@ of the straight-line distance (and of the mode's door-to-door time) over the
 weighted destinations; the output gives its median over a random sample of
 active AOI cells, for all of them and split by the residents and jobs within
 1 km straight-line (`DENSITY_CLASSES`). Settings with similar r50 measure
-accessibility at a similar scale, whatever their metric family.
+accessibility at a similar scale, whatever their metric family. The cross-modal
+utility profiles of 10 get r50 in km only, as they have no single travel time.
 
 Inputs (scenario storage, under `<scenario>/`):
     odm/<mode>_{geo_pairs,time_gross_<profile>,util_<profile>_default}.npz
@@ -45,7 +46,12 @@ import pandas as pd
 
 from aperta import routing
 from aperta.accessibility import _stitched_for, _stitched_weights
-from aperta.od_pairs import TieredODGeoPairs, get_euclidean_dists, lookup_dest_column_geo
+from aperta.od_pairs import (
+    TieredODGeoPairs,
+    aggregate_across_modes,
+    get_euclidean_dists,
+    lookup_dest_column_geo,
+)
 from aperta_atlas.context import init_context
 from aperta_atlas.utils import step
 
@@ -70,18 +76,19 @@ def _kernels(grid) -> list[tuple[str, str, object]]:
     (s, disutility, m) to per-destination factors; nearest-k kernels are the
     integer k (see `_nearest_k_take`)."""
     out: list[tuple[str, str, object]] = []
+    # Bins are half-open, lo <= cost < hi, as in `aperta.accessibility` (stage 10's counts).
     if grid.travel_cost == 'time_gross':
         e = grid.bin_edges_min
-        out += [('counts', f'{a}_{b}min', (lambda c, lo=a * 60, hi=b * 60: (c > lo) & (c <= hi)))
+        out += [('counts', f'{a}_{b}min', (lambda c, lo=a * 60, hi=b * 60: (c >= lo) & (c < hi)))
                 for a, b in zip(e, e[1:])]
-        out += [('cumulative', f'0_{b}min', (lambda c, hi=b * 60: c <= hi)) for b in e[2:]]
+        out += [('cumulative', f'0_{b}min', (lambda c, hi=b * 60: c < hi)) for b in e[2:]]
         out += [('gravity', f'exp{h}min', (lambda c, beta=_LN2 / (h * 60): np.exp(-beta * c)))
                 for h in grid.gravity_half_decay_min]
     elif grid.travel_cost == 'dist_line':
         e = grid.bin_edges_m
-        out += [('counts', f'{int(a)}_{int(b)}m', (lambda c, lo=a, hi=b: (c > lo) & (c <= hi)))
+        out += [('counts', f'{int(a)}_{int(b)}m', (lambda c, lo=a, hi=b: (c >= lo) & (c < hi)))
                 for a, b in zip(e, e[1:])]
-        out += [('cumulative', f'0_{int(b)}m', (lambda c, hi=b: c <= hi)) for b in e[2:]]
+        out += [('cumulative', f'0_{int(b)}m', (lambda c, hi=b: c < hi)) for b in e[2:]]
         out += [('gravity', f'exp{int(h)}m', (lambda c, beta=_LN2 / h: np.exp(-beta * c)))
                 for h in grid.gravity_half_decay_m]
     else:  # util
@@ -162,6 +169,94 @@ def _reach_for(cost: TieredODGeoPairs, dist: TieredODGeoPairs, time: TieredODGeo
                 if t is not None:
                     arr[i, 2:] = _weighted_quantiles(t_sorted, t_order, f, _QUANTILES)
     return out
+
+
+def _subset_origins(odm: TieredODGeoPairs, cells, zones) -> TieredODGeoPairs:
+    """`odm` restricted to the origin cells `cells` (and their zones `zones`)."""
+    def sub(tier, keys):
+        return None if tier is None else {k: tier[k] for k in keys if k in tier}
+    return TieredODGeoPairs(cells_to_cells=sub(odm.cells_to_cells, cells),
+                            cells_to_zones=sub(odm.cells_to_zones, cells),
+                            zones_to_zones=sub(odm.zones_to_zones, zones))
+
+
+def _crossmodal_reach_for(costs: list[TieredODGeoPairs], dist: TieredODGeoPairs,
+                          weights: dict[str, TieredODGeoPairs], betas, origins,
+                          cell_to_zone) -> dict[tuple[str, str, str], np.ndarray]:
+    """As `_reach_for`, for 10's cross-modal profile (gravity, km only: there is no
+    single travel time). `costs` are the per-mode disutilities D_m on shared pairs.
+    A destination's weight follows 10's construction: w·(Σ_m e^(−D_m))^β for β ≤ 1
+    (modes combined per pair), and for β > 1 (modes above destinations) the mode
+    shares ∝ S_m^(1/β), S_m = Σ_d w·e^(−β·D_m), times each mode's destination
+    distribution, i.e. w·Σ_m S_m^(1/β − 1)·e^(−β·D_m)."""
+    out: dict[tuple[str, str, str], np.ndarray] = {}
+    for i, origin in enumerate(origins):
+        if origin not in costs[0].cells_to_cells:
+            continue
+        stitched = [_stitched_for(origin, c, cell_to_zone) for c in costs]
+        _, cell_sl, c2z_sl, zone_sl = stitched[0]
+        n = (cell_sl.stop, c2z_sl.stop - c2z_sl.start, zone_sl.stop - zone_sl.start)
+        zone = cell_to_zone.get(origin)
+        d = _stitch(dist, origin, zone, n) / 1_000.0
+        e = np.nan_to_num(np.exp(-np.stack([s[0] for s in stitched]).astype(np.float64)))
+        ok = np.isfinite(d) & (e.sum(axis=0) > 0)
+        d, e = d[ok], e[:, ok]
+        d_order = np.argsort(d)
+        d_sorted = d[d_order]
+        for dest, odm in weights.items():
+            w = np.nan_to_num(_stitch(odm, origin, zone, n)[ok])
+            w = np.where(w > 0, w, 0.0)
+            if not w.any():
+                continue
+            for b in betas:
+                if b <= 1:
+                    f = w * e.sum(axis=0) ** b
+                else:
+                    eb = e ** b
+                    s = eb @ w
+                    use = s > 0
+                    f = w * (s[use] ** (1 / b - 1) @ eb[use])
+                arr = out.setdefault((dest, 'gravity', f'exp{b}'),
+                                     np.full((len(origins), 4), np.nan, dtype=np.float32))
+                arr[i, :2] = _weighted_quantiles(d_sorted, d_order, f, _QUANTILES)
+    return out
+
+
+def _crossmodal_part(context, scenario, grid, car_profile: str, origins, cell_to_zone,
+                     centroids, cells_m, zones_m, dests) -> dict:
+    """Reach of the cross-modal profile `crossmodal_<car_profile>` on the sampled
+    origins: the four modes' ODMs, cut to those origins, aligned on their union pairs."""
+    zones = {cell_to_zone[o] for o in origins if o in cell_to_zone}
+    odms = {label: tuple(_subset_origins(x, origins, zones) for x in pc)
+            for label, pc in _m10._crossmodal_inputs(context, scenario, grid,
+                                                      car_profile).items()}
+    costs = []
+    for m in range(len(odms)):   # each mode's D on the union pairs (missing: +inf)
+        union, aligned = aggregate_across_modes(odms, aggregator=lambda s, m=m: s[m])
+        costs.append(aligned)
+    node_d = get_euclidean_dists(centroids, union)
+    dist = TieredODGeoPairs(**{t: getattr(node_d, t) for t in _TIERS})
+    weights = {d: lookup_dest_column_geo(d, union, cells_m, zones=zones_m) for d in dests
+               if grid.dest_cols is None or d in grid.dest_cols}
+    return _crossmodal_reach_for(costs, dist, weights, grid.gravity_util_betas, origins,
+                                 cell_to_zone)
+
+
+def _append_rows(rows: list[dict], part: dict, strata, grid_name: str, label: str) -> None:
+    """One row per (destination, metric, parameter, origin class) of `part`: the
+    median and quartiles over the origins of each statistic."""
+    for (dest, metric, param), arr in part.items():
+        for stratum, mask in strata:
+            sub = arr[mask]
+            r = {'grid': grid_name, 'profile': label, 'metric': metric,
+                 'param': param, 'dest': dest, 'origins': stratum,
+                 'n_origins': int(np.isfinite(sub[:, 0]).sum())}
+            for j, name in enumerate(_STATS):
+                finite = np.isfinite(sub[:, j])
+                for stat, q in (('median', 50), ('p25', 25), ('p75', 75)):
+                    r[f'{name}_{stat}'] = (float(np.percentile(sub[finite, j], q))
+                                           if finite.any() else np.nan)
+            rows.append(r)
 
 
 def _people_within(dist: TieredODGeoPairs, weights: dict[str, TieredODGeoPairs], origins,
@@ -247,9 +342,6 @@ def compute_reach(context, n_origins: int, seed: int) -> pd.DataFrame:
                     except FileNotFoundError:
                         logging.info(f"  → no utility ODM for {label}; skipping")
                         continue
-                    if case.min_route_disutility is not None:
-                        cost = routing.floor_intrazonal_costs(
-                            cost, min_cost=case.min_route_disutility)
                 if label not in time_cache:   # the time and util grids share it
                     time_cache.clear()
                     time_cache[label] = routing.floor_intrazonal_costs(
@@ -261,18 +353,13 @@ def compute_reach(context, n_origins: int, seed: int) -> pd.DataFrame:
                     cost = time
             part = _reach_for(cost, dist, time, weights, _kernels(grid), origins,
                               cell_to_zone, scaled)
-            for (dest, metric, param), arr in part.items():
-                for stratum, mask in strata:
-                    sub = arr[mask]
-                    r = {'grid': grid_name, 'profile': label, 'metric': metric,
-                         'param': param, 'dest': dest, 'origins': stratum,
-                         'n_origins': int(np.isfinite(sub[:, 0]).sum())}
-                    for j, name in enumerate(_STATS):
-                        finite = np.isfinite(sub[:, j])
-                        for stat, q in (('median', 50), ('p25', 25), ('p75', 75)):
-                            r[f'{name}_{stat}'] = (float(np.percentile(sub[finite, j], q))
-                                                   if finite.any() else np.nan)
-                    rows.append(r)
+            _append_rows(rows, part, strata, grid_name, label)
+    for car_profile in (grids['util'].crossmodal_car_profiles if 'util' in grids else ()):
+        label = f'crossmodal_{car_profile}'
+        with step(f'util / {label}'):
+            part = _crossmodal_part(context, scenario, grids['util'], car_profile, origins,
+                                    cell_to_zone, centroids, cells_m, zones_m, dests)
+            _append_rows(rows, part, strata, 'util', label)
     return pd.DataFrame(rows)
 
 

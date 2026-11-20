@@ -91,9 +91,8 @@ def main(variant):
                                 f"(run its pipeline first).")
                 continue
             logging.info(f"  → {len(pair_rows)} column(s) compared, mode={info['mode']!r}")
-            for r in pair_rows:
-                rows.append({'group': group, 'target': target, 'reference': reference,
-                             'mode': info['mode'], **r})
+            rows.extend({'group': group, 'target': target, 'reference': reference,
+                         'mode': info['mode'], **r} for r in pair_rows)
 
     if not rows:
         logging.warning(f"group {group!r}: nothing to compare.")

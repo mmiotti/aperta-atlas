@@ -57,24 +57,18 @@ class CoefSource:
 
 @dataclass(frozen=True)
 class Calibrate(CoefSource):
-    """Source: this scenario fits the coef from its own data via the
-    appropriate calibration script. Output → `coefs/calibrated/<name>.csv`."""
+    """Fit the coef from this scenario's own data (see module docstring)."""
 
 
 @dataclass(frozen=True)
 class ImportFrom(CoefSource):
-    """Source: copy the coef from another scenario in the same project.
-    Output → `coefs/transferred/<name>.csv` (verbatim copy of the source
-    scenario's effective coef; the `transferred/` subfolder itself
-    records the provenance)."""
+    """Copy the coef from another scenario of the project (see module docstring)."""
     scenario: str
 
 
 @dataclass(frozen=True)
 class HandWritten(CoefSource):
-    """Source: the user places the coef file at `coefs/manual/<name>.csv`
-    by hand. The calibration script doesn't touch the file; it only
-    verifies it exists before downstream stages try to read it."""
+    """Coef file placed by hand at `coefs/manual/<name>.csv` (see module docstring)."""
 
 
 # Subfolder name per source kind. Kept here so callers don't hand-roll the
@@ -176,7 +170,6 @@ def resolve(
         context.create_coefs(src_df, name, kind='transferred')
         return src_df
     if isinstance(source, HandWritten):
-        # Verify file exists; load and return.
         try:
             return context.get_coefs(name)
         except FileNotFoundError as exc:

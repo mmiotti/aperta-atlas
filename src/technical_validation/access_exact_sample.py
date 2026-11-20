@@ -18,10 +18,8 @@ against scipy's Dijkstra on the same CSR graph — two independent
 shortest-path implementations — and the per-origin timings are logged
 (scipy, prototype on one thread, prototype in parallel).
 
-**Prototype for aperta.** The functions in the "MIGRATION CANDIDATES"
-section below are intended to move into aperta (planned for 0.5.0a) as
-the "flat" OD alternative to the tiered pairs, once this prototype has
-proven itself. Everything after that section is atlas-specific.
+**Prototype for aperta:** see the MIGRATION CANDIDATES section below; everything
+after it is atlas-specific.
 
 Scope: road modes, `time_gross` and `util` grids. Utility grids apply 09b's
 disutility (time, log time, origin / destination endpoint features — no
@@ -65,7 +63,6 @@ import pandas as pd
 from numba import get_num_threads, get_thread_id, njit, prange
 
 from aperta import accessibility, overhead, routing
-from aperta.accessibility import exp_decay
 from aperta.data_processing import weighted_group_mean
 from aperta.network_processing import attach_edge_properties
 from aperta.od_pairs import TieredODGeoPairs, lookup_dest_column_geo
@@ -79,17 +76,19 @@ from main.common import (
     build_disutility_odm,
     build_disutility_spec,
     extract_sd_averages_from_coefs,
-    extract_t_cut_min_from_coefs,
     flatten_bin_dest_columns,
     flatten_decay_dest_columns,
     flatten_k_dest_columns,
     gravity_decays_from_half_decay_min,
+    gravity_decays_util,
     join_util_node_features,
     per_cell_road_overheads,
     profile_to_util_mode,
     resolve_road_overhead_column,
     route_time_alpha,
     scaled_weights_for_nearest_k,
+    util_logsums,
+    zone_weights,
 )
 from scenarios import get_scenario
 from scenarios_technical_validation import technical_validation_plan
@@ -324,24 +323,21 @@ class UtilInputs:
     features joined, and the utility coefs + stats per variant."""
 
     def __init__(self, context, cells: pd.DataFrame, variants: set[str]):
-        zones = context.get_properties('zones', ['snap'])
         self.cells = cells.copy()
-        self.zones = zones.copy()
+        self.zones = context.get_properties('zones', ['snap']).copy()
         join_util_node_features(self.cells, self.zones, context)
         self.cells['unit_id'] = self.cells.index
         self.zones['unit_id'] = self.zones.index
         self.coefs = {v: context.get_coefs(f'utility_{v}') for v in variants}
-        stats = {v: context.get_coefs(f'utility_{v}_stats') for v in variants}
-        self.sd_avg = {v: extract_sd_averages_from_coefs(stats[v]) for v in variants}
-        self.t_cut = {v: extract_t_cut_min_from_coefs(stats[v]) or None for v in variants}
+        self.sd_avg = {v: extract_sd_averages_from_coefs(context.get_coefs(f'utility_{v}_stats'))
+                       for v in variants}
 
     def spec(self, variant: str, profile_label: str):
         """09b's disutility spec for one profile, or None if not modelled."""
         if profile_to_util_mode(profile_label) is None:
             return None
         return build_disutility_spec(self.coefs[variant], profile_label,
-                                     sd_averages=self.sd_avg[variant],
-                                     t_cut_min_per_mode=self.t_cut[variant])
+                                     sd_averages=self.sd_avg[variant])
 
 
 def _scipy_check(csr, router: CsrRouter, origin_nodes, targets, cutoff) -> dict:
@@ -375,7 +371,7 @@ def _metrics_for_batch(costs_final, pairs_geo, cells, cell_to_zone, grid,
     """Run 10's three metric families for one grid on a batch of origins."""
     bins = bins_from_edges_min(grid.bin_edges_min)
     if is_util:
-        decays = [exp_decay(f'exp{b}', beta=b) for b in grid.gravity_util_betas]
+        decays = gravity_decays_util(grid.gravity_util_betas)
     else:
         decays = gravity_decays_from_half_decay_min(grid.gravity_half_decay_min)
     ks = list(grid.nearest_k)
@@ -390,8 +386,8 @@ def _metrics_for_batch(costs_final, pairs_geo, cells, cell_to_zone, grid,
             cell_to_zone, ks=ks))
     if decays:
         raw = accessibility.gravity(costs_final, weights, cell_to_zone, decays)
-        # As in 10: utility gravity is the logsum; 0 → NaN (unreachable).
-        out['gravity'] = flatten_decay_dest_columns(np.log(raw.where(raw > 0)) if is_util else raw)
+        # As in 10: utility gravity is the logsum, (1/β)·ln Σ; 0 → NaN (unreachable).
+        out['gravity'] = flatten_decay_dest_columns(util_logsums(raw) if is_util else raw)
     return out
 
 
@@ -468,8 +464,9 @@ def _exact_for_profile(context, scenario, case, profile, cells, coefs, sample,
         orig_ov, dest_ov = per_cell_road_overheads(
             cells_m, coefs[ov_label], density_col=dens, snap_dist_col=f'distance_{mode}')
         cell_to_zone = cells['zone_id'].to_dict()
-        zone_ov_o = weighted_group_mean(orig_ov, cells_m['combined_total'], cells_m['zone_id'])
-        zone_ov_d = weighted_group_mean(dest_ov, cells_m['combined_total'], cells_m['zone_id'])
+        weights = zone_weights(cells_m)
+        zone_ov_o = weighted_group_mean(orig_ov, weights, cells_m['zone_id'])
+        zone_ov_d = weighted_group_mean(dest_ov, weights, cells_m['zone_id'])
 
     parts: dict[tuple[str, str], list[pd.DataFrame]] = {}
     t_route, n_routed = 0.0, 0
@@ -488,8 +485,8 @@ def _exact_for_profile(context, scenario, case, profile, cells, coefs, sample,
             n_routed += len(u_nodes)
 
             pairs_geo, costs = flat_geo_pairs(matrix[inverse], batch.index, dests.nodes, dests)
-            # Same post-processing as 08a (net) and 10 (gross).
-            costs = routing.floor_intrazonal_costs(costs, min_cost=case.min_route_time_s)
+            # Same post-processing as 08a (α, overheads), then the time floor of
+            # 09b and 10 on the gross times.
             if alpha != 1.0:
                 costs = TieredODGeoPairs(cells_to_cells={
                     k: v * alpha for k, v in costs.cells_to_cells.items()})
@@ -498,21 +495,20 @@ def _exact_for_profile(context, scenario, case, profile, cells, coefs, sample,
                 origin_zone=zone_ov_o, dest_zone=zone_ov_d, cell_to_zone=cell_to_zone)
             if check_pairs:
                 checks.append(_pair_check(pipe_pairs, pipe_costs, pairs_geo, gross))
+            gross = routing.floor_intrazonal_costs(gross, min_cost=case.min_route_time_s)
 
             for grid_key, grid in grids.items():
                 is_util = grid.travel_cost == 'util'
                 if is_util:
                     if specs[grid_key] is None:
                         continue
-                    # 09b: disutility from 08a's gross times; then 10's floor.
+                    # As 09b: disutility from the floored gross times.
                     assert util is not None
                     final = build_disutility_odm(
                         cost_odm_sec=gross, pairs_geo=pairs_geo, spec=specs[grid_key],
                         cells_m=util.cells, zones_m=util.zones)
-                    final = routing.floor_intrazonal_costs(
-                        final, min_cost=case.min_route_disutility)
                 else:
-                    final = routing.floor_intrazonal_costs(gross, min_cost=case.min_route_time_s)
+                    final = gross
                 res = _metrics_for_batch(final, pairs_geo, cells, cell_to_zone, grid,
                                          scaled_dests, is_util)
                 for metric, df in res.items():

@@ -3,9 +3,9 @@ Distribute Swiss hectare-level employment totals (BFS STATENT) across OSM
 building footprints via dasymetric mapping.
 
 Pipeline: load STATENT CSV → uncap privacy-suppressed values → read
-sector totals directly (B08EMPTS1/2/3) + per-industry FTE from NOGA-08
-codes → build 100 m hectare cell polygons → classify buildings by local
-emp density (1 km ring) → stratify OSM tag values (`_SPLIT_TAGS` ×
+sector totals directly (B08EMPTS1/2/3) + per-industry employees from NOGA-08
+codes → build 100 m hectare cell polygons → classify buildings by GHS-POP
+density (1 km ring) → stratify OSM tag values (`_SPLIT_TAGS` ×
 rural/suburban/urban) → one NNLS fit per category (`employment_total`
 + each sector) with per-cell rescaling to match STATENT totals exactly
 → per-cell proportional split of sector into 11 industries.
@@ -15,12 +15,14 @@ with weights `[0.45, 0.25, 0.20, 0.10]` to approximate the true tail.
 Fixed RNG seed for reproducibility. Cap is auto-detected from the total
 column.
 
-**Density-based stratification** (see `_SPLIT_TAGS`,
-`STRATUM_THRESHOLDS`). Tag values in `_SPLIT_TAGS` get separate NNLS
-coefficients per stratum, because FTE intensity (jobs/m²) for the same
-tag varies with local employment density. Non-split tags share one
-intensity across strata. Density source is STATENT (independent of
-STATPOP-side pop-density stratification).
+**Density-based stratification** (see `_SPLIT_TAGS` and
+`preparation.world.land_use.strata`). Tag values in `_SPLIT_TAGS` get
+separate NNLS coefficients per stratum, because job intensity (jobs/m²)
+for the same tag varies with how built-up the surroundings are.
+Non-split tags share one intensity across strata. The strata are the
+same as for population, from GHS-POP residents within 1 km, so they can
+be reproduced wherever the coefficients are applied (a STATENT density
+would put every building outside Switzerland into the rural stratum).
 
 **Sector totals read directly** from `B08EMPTS1/2/3` (primary /
 secondary / tertiary), not aggregated from per-industry codes.
@@ -47,6 +49,7 @@ Inputs (PUBLIC, under raw/switzerland/statent/):
     betriebszaehlungen_<year>_ha_2056.csv   # BFS release
 Cross-source (via `context.source(...)`):
     preparation/world/osm/shapes/buildings_<country>.gpkg
+    preparation/world/land_use/population_<country>.tif  # GHS-POP, density strata
 
 Outputs (PUBLIC, under preparation/switzerland/land_use/):
     properties/buildings_employment_statent_<year>.csv   # per-building
@@ -55,7 +58,7 @@ Outputs (PUBLIC, under preparation/switzerland/land_use/):
         # retail, transport_logistics, hospitality_recreation, services,
         # research_technology, healthcare_veterinary, education_welfare}.
     coefs/employment_statent_<year>.csv                  # per-(tag, category)
-        # intensities (FTE/m²). Consumed by
+        # intensities (employees/m²). Consumed by
         # preparation/world/land_use/employment_per_building_from_coef.py
         # via context.get_coefs(...).
     hectares_statent_<year>.{gpkg,csv}                   # hectare-cell
@@ -80,18 +83,18 @@ from aperta_atlas.utils import step
 from aperta_atlas.variant import Variants
 
 from preparation.switzerland.common import (
-    build_hectare_cells, classify_density_stratum, combine_learned_per_category,
-    compute_hectare_density, expand_relevant_tags, filter_to_inside_ch,
-    load_swiss_country, merge_per_category_outputs, replace_smaller_equal,
-    stratify_building_tags,
+    build_hectare_cells, combine_learned_per_category, expand_relevant_tags,
+    filter_to_inside_ch, load_swiss_country, merge_per_category_outputs,
+    detect_privacy_cap, replace_smaller_equal, stratify_building_tags,
 )
+from preparation.world.land_use.strata import building_strata
 
 
 # Max distance (in metres) for the nearest-building fallback for cells
 # with no building overlap (only for those cells). Set conservatively.
 _NEAREST_FALLBACK_MAX_M = 200.0
 
-# OSM tag values whose FTE intensity varies with local emp density.
+# OSM tag values whose employee intensity varies with the density of the surroundings.
 # Each split tag gets separate NNLS coefficients per stratum
 # (rural / suburban / urban). Non-split tags share one intensity.
 _SPLIT_TAGS: set[str] = {
@@ -107,40 +110,14 @@ _SPLIT_TAGS: set[str] = {
     'school',
 }
 
-# Per-km² breakpoints for the 3-way rural / suburban / urban split.
-# Can be different from population's, but in practice, similar cutoffs made
-# sense (there is less employment overall than population, but employment is
-# more concentrated).
-STRATUM_THRESHOLDS: tuple[float, float] = (500.0, 5_000.0)
-
 # STATENT filename pattern (BFS public release; both .csv and .gpkg exist,
 # we read the .csv).
 _STATENT_CSV_PATTERN = 'switzerland/statent/betriebszaehlungen_{year}_ha_2056.csv'
 
 
-def _detect_privacy_cap(values: np.ndarray) -> int:
-    """Return BFS's privacy-cap value inferred from `values`.
-
-    BFS caps true counts 1..n by replacing them with the literal cap
-    value n (any cell that would report 1, 2, …, n publishes n instead).
-    The smallest strictly-positive integer in the array IS the cap.
-    Assumes at least one capped cell exists — safe at national hectare
-    scale."""
-    positive = values[values > 0]
-    if positive.size == 0:
-        raise ValueError("No positive values in the array — cannot detect cap.")
-    return int(positive.min())
-
 # NOGA-08 / NACE Rev. 2 industry codes published by STATENT under
 # `B08<code>EMP` (B08 = data series; <code> = NOGA-08 2-digit industry;
-# EMP = FTE count).
-#
-# Sector totals (`employment_primary`, `_secondary`, `_tertiary`) are
-# read DIRECTLY from BFS-published `B08EMPTS{1,2,3}` columns
-# (see `_SECTOR_COLS`), not aggregated from these industry codes —
-# per-industry values carry higher relative capping error.
-# `_INDUSTRY_CODES` + `_INDUSTRY_TO_SECTOR` remain the source of truth
-# for the per-industry breakdown columns.
+# EMP = employees, not FTE, which STATENT publishes as `B08VZA*`).
 #
 # Sector boundaries follow the standard BFS / Eurostat Fisher-Clark
 # rollup of NACE Rev. 2:
@@ -185,11 +162,7 @@ _INDUSTRY_TO_SECTOR: dict[str, str] = {
     'education_welfare':     'tertiary',
 }
 
-# Per-sector STATENT column names — BFS publishes sector totals directly
-# (`B08EMPTS1` = primary, `B08EMPTS2` = secondary, `B08EMPTS3` = tertiary).
-# Reading these DIRECTLY is strictly better than aggregating per-industry
-# codes: sector totals are single privacy-capped values, whereas summing
-# 10-40 per-industry cells accumulates the capping error additively.
+# Per-sector STATENT columns: the BFS-published sector totals (see the module docstring).
 _SECTOR_COLS: dict[str, str] = {
     'primary':   'B08EMPTS1',
     'secondary': 'B08EMPTS2',
@@ -212,20 +185,15 @@ def _load_and_aggregate_statent(
     one `employment_<industry>` per entry in `_INDUSTRY_CODES`, and
     `employment_total`. Cells outside Switzerland are not in the CSV
     by design. Privacy cap auto-detected from the total column.
-
-    Sector totals are read DIRECTLY from `B08EMPTS{1,2,3}` — not
-    aggregated from per-industry codes — because per-industry values
-    carry higher relative capping error than the sector totals.
-    Per-industry columns remain useful for finer-grained analysis and
-    are exposed as-is (noisy for small industries in sparse cells).
+    Per-industry columns are noisy for small industries in sparse cells.
     """
     coords = ['E_KOORD', 'N_KOORD']
     df = pd.read_csv(csv_path, sep=';').set_index(coords)
     logging.info(f"  → loaded {len(df):,} STATENT hectare rows, {len(df.columns)} columns")
 
-    # `B08EMPT` is the published per-cell FTE total (privacy-capped).
+    # `B08EMPT` is the published per-cell employee total (privacy-capped).
     total_arr = df['B08EMPT'].to_numpy(copy=True)
-    cap = _detect_privacy_cap(total_arr)
+    cap = detect_privacy_cap(total_arr)
     logging.info(f"  → detected STATENT privacy cap = {cap}")
     logging.info(
         f"  → sum of raw B08EMPT (with caps in place): {total_arr.sum():,.0f}")
@@ -241,10 +209,7 @@ def _load_and_aggregate_statent(
         return v.astype(float)
 
     def _aggregate_industry(codes: list[str]) -> np.ndarray:
-        """Sum of per-industry STATENT columns after privacy uncapping.
-        Note: cap error accumulates additively with the number of codes
-        summed — sector totals should be read directly, not aggregated
-        this way (see `_SECTOR_COLS`)."""
+        """Sum of per-industry STATENT columns after privacy uncapping."""
         col_names = [f'B08{c}EMP' for c in codes if f'B08{c}EMP' in df.columns]
         if not col_names:
             return np.zeros(len(df), dtype=float)
@@ -262,7 +227,7 @@ def _load_and_aggregate_statent(
         new_cols[f'employment_{industry}'] = _aggregate_industry(codes)
     out = pd.DataFrame(new_cols, index=df.index)
     logging.info(
-        f"  → aggregated; national total FTE: {out['employment_total'].sum():,.0f}; "
+        f"  → aggregated; national total employees: {out['employment_total'].sum():,.0f}; "
         f"by sector: " +
         ", ".join(f"{s}={out[f'employment_{s}'].sum():,.0f}" for s in _SECTORS))
     return out
@@ -294,11 +259,8 @@ def main(variant) -> None:
         cell_totals.index.name = 'cell_id'
 
     with step('persist STATENT hectare cells + per-hectare values as generic artifacts'):
-        # Re-key cell_id from positional int to coordinate-stable string
-        # ('E_N' from LV95 lower-left corners) so downstream consumers
-        # (e.g. atlas 01, cell_source='hectares') can safely union
-        # STATPOP and STATENT hectares — both share the same BFS 100 m
-        # grid, so coordinates are the natural cross-source key.
+        # Coordinate-stable cell ids ('E_N', LV95 lower-left corners), so that atlas 01
+        # (cell_source='hectares') can union the STATPOP and STATENT hectares.
         coord_ids = [f'{int(e)}_{int(n)}' for e, n in zip(
             stat_df.index.get_level_values(0),
             stat_df.index.get_level_values(1))]
@@ -314,23 +276,17 @@ def main(variant) -> None:
             kws={'float_format': '%.4f'},
         )
 
-    with step('load OSM building shapes (buildings_download.py output)'):
+    with step('load OSM building shapes (buildings_from_pbf.py output)'):
         buildings_ctx = context.source('preparation/world/osm')
         buildings = buildings_ctx.get_shapes('buildings', data_name=variant.buildings_country)
-        # `build_hectare_cells` always sets crs=LV95 — assertion narrows
-        # the type checker's `CRS | None` to `CRS`.
         assert cells.crs is not None
         if buildings.crs != cells.crs:
             buildings = buildings.to_crs(cells.crs)
         logging.info(f"  → {len(buildings):,} buildings loaded; reprojected to {buildings.crs}")
 
     with step('filter buildings to inside CH borders (calibration area)'):
-        # `learn_coefficients`'s bias correction assumes `buildings` IS
-        # the calibration area's building set. The OSM input includes
-        # the country + buffer ring; we must trim to CH so the published
-        # β values reflect "average intensity across all CH buildings of
-        # this tag" — invariant to buffer presence and consistent under
-        # bottom-up application.
+        # `learn_coefficients`' bias correction assumes `buildings` is the calibration
+        # area's building set, so the OSM input (country + buffer ring) is trimmed to CH.
         n_before = len(buildings)
         country = load_swiss_country(context)
         buildings = filter_to_inside_ch(buildings, country)
@@ -338,16 +294,11 @@ def main(variant) -> None:
             f"  → {len(buildings):,} of {n_before:,} buildings inside CH "
             f"({len(buildings)/n_before*100:.1f} %)")
 
-    with step('classify buildings by local employment density (1 km ring)'):
-        buildings['emp_density_1km'] = compute_hectare_density(
-            buildings, cells, cell_totals,
-            column='employment_total', radius_m=1_000.0,
-        )
-        buildings['stratum'] = classify_density_stratum(
-            buildings['emp_density_1km'], STRATUM_THRESHOLDS)
+    with step('classify buildings by GHS-POP density (1 km ring)'):
+        buildings['stratum'] = building_strata(context, buildings, variant.buildings_country)
         counts = buildings['stratum'].value_counts()
         logging.info(
-            f"  → stratum counts: " +
+            "  → stratum counts: " +
             ", ".join(f"{s}={counts.get(s, 0):,}"
                       for s in ('rural', 'suburban', 'urban')))
 
@@ -394,7 +345,7 @@ def main(variant) -> None:
         out = merge_per_category_outputs(buildings, per_building_outputs)
         sector_sum = sum(out[f'employment_{s}'].sum() for s in _SECTORS)
         logging.info(
-            f"  → distributed {out['employment_total'].sum():,.0f} total FTE "
+            f"  → distributed {out['employment_total'].sum():,.0f} total employees "
             f"across {len(out):,} buildings | " +
             ", ".join(f"{s}={out[f'employment_{s}'].sum():,.0f}"
                       for s in _SECTORS) +
@@ -403,7 +354,7 @@ def main(variant) -> None:
     with step('combine per-category learned coefficients into one wide-form table'):
         learned = combine_learned_per_category(learned_per_category)
 
-    # 10-industry breakdown via per-cell proportional split within sector.
+    # 11-industry breakdown via per-cell proportional split within sector.
     with step('industry proportional split (within sector, per cell)'):
         out = dasymetric.apply_proportional_split(
             out, cells, cell_totals,
@@ -411,7 +362,7 @@ def main(variant) -> None:
         )
         for industry in _INDUSTRY_CODES:
             tot = out[f'employment_{industry}'].sum()
-            logging.info(f"  → {industry}: {tot:,.0f} FTE")
+            logging.info(f"  → {industry}: {tot:,.0f} employees")
 
     data_name = f'employment_statent_{variant.year}'
     keep_cols = (
@@ -422,11 +373,6 @@ def main(variant) -> None:
 
     with step('save per-building employment + calibrated coefficients'):
         context.create_properties(props, data_name=data_name)
-        # Calibrated per-(OSM tag, sector) intensities — namespace-scoped
-        # coef. The downstream public-data consumer
-        # (`preparation/world/land_use/employment_per_building_from_coef`)
-        # reads it back via `get_coefs`. Lives at
-        # `preparation/switzerland/land_use/coefs/<data_name>.csv`.
         context.create_coefs(learned, data_name)
 
     context.close()

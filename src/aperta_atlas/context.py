@@ -58,15 +58,8 @@ pass through to do filesystem work. It owns:
     module (`CANONICAL_UNITS`: `cells`, `zones`, `nodes`, `edges`,
     `buildings`).
 
-Cross-namespace reads use `context.source('<path>', storage=...)` where
-`<path>` mirrors the on-disk layout:
-    context.source('preparation/switzerland/general')         # preparation
-    context.source(f'{context.project}/switzerland-h10')      # same project,
-                                                                # other scenario
-    context.source('lumos/2020')                              # cross-project (rare)
-The optional `storage=` kwarg pins the source ctx's default_storage
-(useful when a namespace's STORAGE constant is wrong for this read, or
-unreachable cross-repo).
+Cross-namespace reads use `context.source('<path>', storage=...)` (see
+`Context.source`).
 
 Optional dependency tracking lives in `aperta_atlas.tracking`; `Context`
 delegates to it from `register_used_data`, `close`, and the start-of-run
@@ -75,7 +68,6 @@ banner emitted by `init_context`. Activate via
 """
 
 import inspect
-import json
 import logging
 import os
 import re
@@ -143,17 +135,9 @@ def _install_level_counter() -> None:
 
 
 class Storage(Enum):
-    """Where a typed asset lives on disk.
-
-    PUBLIC    — DATA_DIR_PUBLIC/{preparation/<remainder> | <project>/<scenario>}/...
-    PRIVATE   — DATA_DIR_PRIVATE/...                                                  (same shape)
-                (proprietary inputs / outputs derived from them; not for redistribution)
-    SCRATCH   — WORKING_DIR/scratch/...                                               (same shape)
-                (transient/intermediate; OK to delete)
-    RESULTS   — WORKING_DIR/results/<project>/<scenario>/...
-                (only callable from project namespaces; preparation produces
-                prepared data, not results)
-    """
+    """Where a typed asset lives on disk (path layout: module docstring). PRIVATE:
+    proprietary inputs and outputs derived from them, not for redistribution; SCRATCH:
+    transient, OK to delete; RESULTS: project namespaces only."""
 
     PUBLIC = "public"
     PRIVATE = "private"
@@ -206,10 +190,7 @@ def _unit_id_col(unit: str) -> str:
 
 def _unit_for_id_col(col: str) -> str | None:
     """Reverse lookup: unit whose `id_col` is `col`, else `None`."""
-    for name, id_col in CANONICAL_UNITS.items():
-        if id_col == col:
-            return name
-    return None
+    return next((u for u, c in CANONICAL_UNITS.items() if c == col), None)
 
 
 def _warn_if_unknown_unit(unit: str, where: str = "") -> None:
@@ -255,7 +236,7 @@ def _file_suffix(data_name: str | None) -> str:
 
 
 def _get_geo_type_str(
-    geo_type: str | list[str] | None = None,
+    geo_type: str | None = None,
     df: pd.DataFrame | gpd.GeoDataFrame | None = None,
 ) -> str:
     """Resolve geo_type to its on-disk string form.
@@ -279,9 +260,7 @@ def _get_geo_type_str(
         return unit
     if isinstance(geo_type, str):
         return geo_type
-    if isinstance(geo_type, list):
-        return '__'.join(set(geo_type))
-    raise DataError(f"`geo_type` must be str or list[str] (got {type(geo_type)}).")
+    raise DataError(f"`geo_type` must be str (got {type(geo_type)}).")
 
 
 def _verify_index_matches_geo_type(df, geo_type: str, where: str) -> None:
@@ -452,9 +431,15 @@ def _unpack_odm(
 ) -> dict:
     """Inverse of `_pack_odm`. Numeric arrays come back as read-only views
     into the shared `values` buffer (mutate via `.copy()`); string-dest
-    arrays come back as native lists (no shared storage)."""
+    arrays come back as native lists, sharing one `str` per distinct ID."""
     is_string = values.dtype.kind in ('U', 'S')
-    if not is_string:
+    if is_string:
+        # Each dest ID recurs in many origins' lists; one str object per
+        # distinct ID (lists hold references) needs ~7× less memory than a
+        # fresh str per entry (9 vs 63 bytes per ID at H3 ids).
+        uniq, inverse = np.unique(values, return_inverse=True)
+        values = np.array(uniq.tolist(), dtype=object)[inverse]
+    else:
         # Slices share storage with `values`; lock to prevent surprise
         # cross-origin mutation. Callers that need to mutate should
         # `.copy()` the slice first.
@@ -498,55 +483,12 @@ def verify_match(a, b) -> None:
         )
 
 
-# Tiered-ODM tier order. Tuple of `TieredODNodePairs` field names —
-# used both for iteration order and as the per-tier prefix inside the
-# saved `.npz` archive (`<tier>__keys` etc.). Any non-empty subset of
-# tiers may be populated.
+# Tiered-ODM tier order (`TieredODNodePairs` field names; also the `.npz` tier prefixes).
 _TIER_ODM_NAMES: tuple[str, ...] = (
     'cells_to_cells',
     'cells_to_zones',
     'zones_to_zones',
 )
-
-
-# =============================================================================
-# Properties composition (no Context required — composes already-loaded frames)
-# =============================================================================
-
-
-def combine_properties(*dfs: pd.DataFrame) -> pd.DataFrame:
-    """Index-match and column-concatenate already-loaded property DataFrames.
-
-    Use this to compose properties from multiple sources (or to add a transformed
-    frame to a loaded one):
-
-        general  = context.source('preparation/switzerland/general')
-        surveys  = context.source('preparation/switzerland/surveys')
-        df = combine_properties(
-            general.get_properties('cells', 'core'),
-            surveys.get_properties('cells', 'survey_extras').rename(columns={'foo': 'survey_foo'}),
-        )
-
-    All inputs must share the same index. The duplicated index-as-column (added
-    by `get_properties`) is collapsed automatically.
-    """
-    if not dfs:
-        raise DataError("combine_properties requires at least one DataFrame.")
-    cleaned: list[pd.DataFrame] = []
-    for df in dfs:
-        if df.index.name and df.index.name in df.columns:
-            cleaned.append(df.drop(columns=df.index.name))
-        else:
-            cleaned.append(df.copy())
-    for i in range(len(cleaned) - 1):
-        verify_match(cleaned[i], cleaned[i + 1])
-    out = pd.concat(cleaned, axis=1)
-    if len(out.columns) > len(set(out.columns)):
-        vc = out.columns.value_counts()
-        raise DataError(f"Duplicate columns after combine_properties: {list(vc.index[vc > 1])}")
-    if out.index.name:
-        out[out.index.name] = out.index
-    return out
 
 
 @dataclass(frozen=True)
@@ -593,20 +535,6 @@ class Context:
             return 'preparation'
         return 'project'
 
-    @cached_property
-    def namespace_remainder(self) -> str:
-        """Namespace with leading role-segment stripped.
-
-        For preparation: `'preparation/switzerland/general'` → `'switzerland/general'`.
-        For project namespaces: strips the leading `<project>/` segment so a script
-        in `src/main/x.py` (namespace `atlas/main`) yields remainder `'main'`.
-        """
-        if self.namespace.startswith('preparation/'):
-            return self.namespace[len('preparation/'):]
-        if self.project is not None and self.namespace.startswith(f'{self.project}/'):
-            return self.namespace[len(self.project) + 1:]
-        return self.namespace
-
     # ----------------------- path resolution ------------------------------
 
     def path_for(self, storage: 'Storage', relative_path: str) -> str:
@@ -617,8 +545,7 @@ class Context:
         """
         # Sub-path under the storage root depends on the namespace role.
         if self.project is None:
-            # preparation namespace
-            sub = os.path.join('preparation', self.namespace_remainder)
+            sub = self.namespace                    # preparation/<region>/<sub>
         else:
             assert self.scenario is not None
             sub = os.path.join(self.project, self.scenario)
@@ -637,27 +564,14 @@ class Context:
                     f"Storage.RESULTS is not allowed from preparation/* namespaces "
                     f"(current namespace: '{self.namespace}'). Preparation produces "
                     f"prepared data, not results.")
-            assert self.scenario is not None
-            base = os.path.join(self.working_dir, 'results', self.project, self.scenario)
+            base = os.path.join(self.working_dir, 'results', sub)
         else:
             raise ValueError(f"Unknown storage: {storage!r}")
         return os.path.join(base, relative_path)
 
     def raw_path(self, storage, relative_path: str) -> str:
-        """Resolve a path under the raw-data tree.
-
-        Raw data is read-only external/upstream input that no aperta-atlas script
-        produced (e.g. swisstopo TLM, OFS census downloads). Lives at:
-
-            <DATA_DIR_PUBLIC>/raw/<rel>     (Storage.PUBLIC)
-            <DATA_DIR_PRIVATE>/raw/<rel>    (Storage.PRIVATE)
-
-        Unlike `path_for`, raw paths do not include role / namespace / scenario
-        segments — the caller supplies the full relative path under `raw/`.
-
-        Storage.SCRATCH and Storage.RESULTS are invalid here — raw is by definition
-        external read-only data.
-        """
+        """Resolve `<DATA_DIR_PUBLIC|PRIVATE>/raw/<rel>`: read-only external inputs, with no
+        namespace or scenario segments (module docstring). SCRATCH and RESULTS are rejected."""
         if storage == Storage.PUBLIC:
             return os.path.join(self.data_dir_public, 'raw', relative_path)
         if storage == Storage.PRIVATE:
@@ -694,21 +608,10 @@ class Context:
 
     @cached_property
     def default_storage(self):
-        """Default `Storage` class for I/O calls that don't specify
-        `storage=`.
-
-        Lookup chain (highest priority first):
-          1. `default_storage_override` — set by `init_context` from the
-             caller-script's own `STORAGE` constant (for preparation
-             scripts), or by `source(path, storage=...)` on the caller
-             side (for cross-namespace reads).
-          2. For project namespaces: `SCENARIOS[scenario].storage` via
-             dynamic import of the top-level `scenarios` module.
-          3. Fallback: `Storage.PUBLIC`. For preparation source contexts
-             this means: if the caller of `source()` didn't pass `storage=`,
-             reads go to the PUBLIC root. Reads from PRIVATE preparation
-             namespaces must pass `storage=Storage.PRIVATE` explicitly.
-        """
+        """Default `Storage` for I/O calls without `storage=`: `default_storage_override` if
+        set, else `SCENARIOS[scenario].storage` for project namespaces, else
+        `Storage.PUBLIC` — so a `source()` read from a PRIVATE preparation namespace needs
+        `storage=Storage.PRIVATE`."""
         if self.default_storage_override is not None:
             return self.default_storage_override
         if self.project is None or self.scenario is None:
@@ -808,15 +711,8 @@ class Context:
           context.source(f'{context.project}/{other_scenario}')
               → idiomatic same-project, different-scenario form.
 
-        `storage=` pins the source ctx's `default_storage` to a specific
-        class. Useful when:
-
-          - A preparation namespace mixes PUBLIC and PRIVATE data and you
-            know which one this read targets.
-          - You're sourcing cross-repo and the foreign STORAGE / SCENARIOS
-            lookup falls back to PUBLIC but the data is actually PRIVATE.
-          - You want the source's typed I/O calls to land in a specific
-            root without passing `storage=` on every single get_/create_.
+        `storage=` pins the source ctx's `default_storage`, e.g. for a PRIVATE preparation
+        namespace or a cross-repo read whose lookup would fall back to PUBLIC.
         """
         if not path or path.startswith('/') or path.endswith('/'):
             raise ValueError(
@@ -824,7 +720,6 @@ class Context:
                 f"with no leading/trailing slash. Got {path!r}.")
         parts = path.split('/')
         first = parts[0]
-        sub_namespace = path
 
         if first == 'preparation':
             if len(parts) < 2:
@@ -848,7 +743,7 @@ class Context:
             parent=self.parent if self.parent else self,
             project=sub_project,
             scenario=sub_scenario,
-            namespace=sub_namespace,
+            namespace=path,
             read_only=True,
             created_data=set(),
             used_data=set(),
@@ -924,7 +819,7 @@ class Context:
 
     def get_shapes(
         self,
-        geo_type: str | list[str],
+        geo_type: str,
         data_name: str | None = None,
         storage: Storage | None = None,
         allow_cache: bool = True,
@@ -937,15 +832,14 @@ class Context:
         _warn_if_unknown_unit(geo_type_str, where='get_shapes')
         relative = f"shapes/{geo_type_str}{_file_suffix(data_name)}.gpkg"
         full = self.path_for(storage, relative)
-        cache_key = full
-        if cache_key in cache:
-            return cache[cache_key]
+        if full in cache:
+            return cache[full]
         gdf = gpd.read_file(full)
         gdf = gdf.set_index(gdf.columns[0])
         _verify_index_matches_geo_type(gdf, geo_type_str, where='get_shapes')
         gdf[gdf.index.name] = gdf.index
         if allow_cache:
-            cache[cache_key] = gdf
+            cache[full] = gdf
         self.register_used_data(relative, storage, len(gdf))
         _verify_index_type(gdf)
         return gdf
@@ -988,9 +882,8 @@ class Context:
         _warn_if_unknown_unit(geo_type_str, where='get_properties')
         relative = f"properties/{geo_type_str}{_file_suffix(data_name)}.csv"
         full = self.path_for(storage, relative)
-        cache_key = full
-        if cache_key in cache:
-            return cache[cache_key]
+        if full in cache:
+            return cache[full]
         # `low_memory=False` disables pandas' chunked-read dtype-inference,
         # which throws `IndexError: list index out of range` in
         # `_concatenate_chunks` on multi-million-row property files where
@@ -1000,7 +893,7 @@ class Context:
         df = pd.read_csv(full, index_col=0, low_memory=False)
         _verify_index_matches_geo_type(df, geo_type_str, where='get_properties')
         if allow_cache:
-            cache[cache_key] = df
+            cache[full] = df
         self.register_used_data(relative, storage, len(df))
         _verify_index_type(df)
         return df
@@ -1035,9 +928,6 @@ class Context:
     ) -> pd.DataFrame | gpd.GeoDataFrame:
         """Load properties for `geo_type`; optionally join multiple `data_name`
         files (column-wise) and attach shapes.
-
-        For cross-source composition, load each frame separately (typically via
-        `context.source(...).get_properties(...)`) and merge with `combine_properties`.
 
         Return type narrows on `add_shapes` (via overloads): `pd.DataFrame` when
         False (default), `gpd.GeoDataFrame` when True or a str (the shapes data_name).
@@ -1122,11 +1012,8 @@ class Context:
         `TieredODNodePairs`). Variants of the same logical ODM go via the
         `data_name` (e.g. `'travel_time_detoured'`).
 
-        On-disk format: compressed `.npz` with `allow_pickle=False` (safe
-        to load, array dtypes preserved). Each populated tier `<t>` stores
-        three CSR-style arrays (`<t>__keys`, `<t>__offsets`,
-        `<t>__values`); a top-level `__tier_names__` array lists which
-        tiers are present.
+        On-disk format: compressed `.npz` with `allow_pickle=False` (dtypes
+        preserved); CSR layout as described above `_ODM_TIER_NAMES_SENTINEL`.
 
         To check an ODM matches the network it claims to belong to, call
         `aperta.network_processing.verify_odm_against_network(odm, nodes)`
@@ -1192,9 +1079,8 @@ class Context:
         storage = storage or self.default_storage
         relative = f"odm/{network_name}_{data_name}.npz"
         full = self.path_for(storage, relative)
-        cache_key = full
-        if cache_key in cache:
-            return cache[cache_key]
+        if full in cache:
+            return cache[full]
 
         loaded: dict[str, dict | None] = {f: None for f in _TIER_ODM_NAMES}
         total_items = 0
@@ -1214,18 +1100,14 @@ class Context:
                 )
                 loaded[field] = odm
                 total_items += _odm_n_items(odm)
-        if all(loaded[f] is None for f in _TIER_ODM_NAMES):
+        if all(v is None for v in loaded.values()):
             raise DataError(
                 f"Tiered ODM at {full!r} has no populated tiers. "
                 f"Re-create it.")
 
-        pairs = TieredODNodePairs(
-            cells_to_cells=loaded['cells_to_cells'],
-            cells_to_zones=loaded['cells_to_zones'],
-            zones_to_zones=loaded['zones_to_zones'],
-        )
+        pairs = TieredODNodePairs(**loaded)
         if allow_cache:
-            cache[cache_key] = pairs
+            cache[full] = pairs
         self.register_used_data(relative, storage, total_items)
         return pairs
 
@@ -1294,33 +1176,21 @@ class Context:
             ox.save_graphml(_to_skeleton(network), filepath=full)
             self.register_created_data(relative, storage, None)
 
-        if save_shapes:
-            if save_shapes is True or save_shapes == 'nodes':
-                self.create_shapes(_nodes_to_gdf(network), data_name=data_name, storage=storage)
-            if save_shapes is True or save_shapes == 'edges':
-                self.create_shapes(_edges_to_gdf(network), data_name=data_name, storage=storage)
-
-        if save_properties:
-            # Suffix semantics: properties_name is appended to data_name to keep
-            # the network's own properties under one prefix, matching the
-            # `get_nw` reader.
-            props_name = nw_name if properties_name is None else f'{nw_name}_{properties_name}'
-            if save_properties is True or save_properties == 'nodes':
-                n_gdf = _nodes_to_gdf(network)
-                drop = NW_SKELETON_NODE_ATTRS | {'geometry'}
-                n_props = n_gdf.drop(columns=[c for c in drop if c in n_gdf.columns])
+        sides = (('nodes', _nodes_to_gdf, NW_SKELETON_NODE_ATTRS),
+                 ('edges', _edges_to_gdf, NW_SKELETON_EDGE_ATTRS))
+        for side, to_gdf, _ in sides:
+            if save_shapes is True or save_shapes == side:
+                self.create_shapes(to_gdf(network), data_name=data_name, storage=storage)
+        props_name = nw_name if properties_name is None else f'{nw_name}_{properties_name}'
+        for side, to_gdf, skeleton_attrs in sides:
+            if save_properties is True or save_properties == side:
+                gdf = to_gdf(network)
+                drop = skeleton_attrs | {'geometry'}
+                props = gdf.drop(columns=[c for c in drop if c in gdf.columns])
                 if properties_columns is not None:
-                    n_props = n_props[[c for c in properties_columns if c in n_props.columns]]
-                if len(n_props.columns) > 0:
-                    self.create_properties(n_props, data_name=props_name, storage=storage)
-            if save_properties is True or save_properties == 'edges':
-                e_gdf = _edges_to_gdf(network)
-                drop = NW_SKELETON_EDGE_ATTRS | {'geometry'}
-                e_props = e_gdf.drop(columns=[c for c in drop if c in e_gdf.columns])
-                if properties_columns is not None:
-                    e_props = e_props[[c for c in properties_columns if c in e_props.columns]]
-                if len(e_props.columns) > 0:
-                    self.create_properties(e_props, data_name=props_name, storage=storage)
+                    props = props[[c for c in properties_columns if c in props.columns]]
+                if len(props.columns) > 0:
+                    self.create_properties(props, data_name=props_name, storage=storage)
 
     def get_nw(
         self,
@@ -1350,15 +1220,14 @@ class Context:
         nw_name = data_name or 'network'
         relative = f'nw/{nw_name}.graphml'
         full = self.path_for(storage, relative)
-        cache_key = full
-        if allow_cache and cache_key in cache:
-            nw = cache[cache_key]
+        if allow_cache and full in cache:
+            nw = cache[full]
         else:
             ox = _require_osmnx()
             nw = ox.load_graphml(full)
             self.register_used_data(relative, storage, None)
             if allow_cache:
-                cache[cache_key] = nw
+                cache[full] = nw
 
         # If layering properties, work on a copy so the cache stays clean.
         if add_node_properties is not None or add_edge_properties is not None:
@@ -1381,7 +1250,7 @@ class Context:
                 ))
         return nw
 
-    # -------------- generic files (.csv .gpkg .npy .graphml .json .asc) --
+    # -------------- generic files (.csv .gpkg .npy, figures) ------------
 
     def create_generic(
         self,
@@ -1392,7 +1261,7 @@ class Context:
         kws: dict | None = None,
     ) -> None:
         """Write `payload` to `relative_path`, dispatching on its extension:
-          .csv, .gpkg, .npy, .asc, .graphml, .json — via the obvious writer
+          .csv, .gpkg, .npy — via the obvious writer
           .png/.pdf/.svg/.jpg/.jpeg — `payload` is a matplotlib Figure (saved via .savefig)
 
         In project namespaces the file goes under a `generic/` subfolder
@@ -1418,21 +1287,9 @@ class Context:
                     _verify_unique_index(payload)
                 payload.to_file(full, **kws)
                 n = len(payload)
-            case '.asc':
-                fmt = "%.1f" if kws.get('as_float') else "%d"
-                np.savetxt(full, payload, fmt=fmt)
-                n = len(payload)
             case '.npy':
                 np.save(full, payload, allow_pickle=True)
                 n = None
-            case '.graphml':
-                ox = _require_osmnx()
-                ox.save_graphml(payload, filepath=full)
-                n = None
-            case '.json':
-                with open(full, 'w') as fp:
-                    json.dump(payload, fp)
-                n = len(payload)
             case '.png' | '.pdf' | '.svg' | '.jpg' | '.jpeg':
                 # `payload` is a matplotlib Figure. `bbox_inches='tight'` is the
                 # near-universal default for publication-ready figures; override
@@ -1453,16 +1310,14 @@ class Context:
     ) -> Any:
         """Load a file written by `create_generic`, dispatching on extension:
         .csv (`index_col=0` unless `kws` says otherwise), .gpkg, .npy (a
-        pickled object, returned via `.item()`), .graphml, .json. `.asc` and
-        figures are write-only.
+        pickled object, returned via `.item()`). Figures are write-only.
         """
         storage = storage or self.default_storage
         p = Path(relative_path)
         relative = self._generic_relative_path(storage, relative_path)
         full = self.path_for(storage, relative)
-        cache_key = full
-        if cache_key in cache:
-            return cache[cache_key]
+        if full in cache:
+            return cache[full]
 
         n: int | None
         match p.suffix:
@@ -1477,18 +1332,10 @@ class Context:
             case '.npy':
                 payload = np.load(full, allow_pickle=True).item()
                 n = None
-            case '.graphml':
-                ox = _require_osmnx()
-                payload = ox.load_graphml(full)
-                n = None
-            case '.json':
-                with open(full) as fp:
-                    payload = json.load(fp)
-                n = None
             case _:
                 raise DataError(f"File extension not supported: {relative_path}")
         if allow_cache:
-            cache[cache_key] = payload
+            cache[full] = payload
         self.register_used_data(relative, storage, n)
         return payload
 
@@ -1583,7 +1430,7 @@ class Context:
             rel = f'coefs/{kind}/{name}.csv'
         out_path = self.path_for(storage, rel)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        _write_coefs_csv(df, out_path)
+        df.to_csv(out_path, float_format='%.4f')
         self.register_created_data(rel, storage, n=len(df))
 
 
@@ -1601,11 +1448,6 @@ def _read_coefs_csv(path: str) -> pd.DataFrame:
     is_2row = len(peek) >= 2 and peek[1].strip() and not _looks_numeric(peek[1])
     header = [0, 1] if is_2row else 0
     return pd.read_csv(path, index_col=0, header=header)
-
-
-def _write_coefs_csv(df: pd.DataFrame, path: str) -> None:
-    """Write a coef DataFrame with `param` index + profile columns."""
-    df.to_csv(path, float_format='%.4f')
 
 
 def _looks_numeric(s: str) -> bool:
@@ -1639,29 +1481,19 @@ def _read_scenarios_module():
 def _read_project_name() -> str | None:
     """Read `PROJECT_NAME` from the top-level `scenarios` module (None if
     the module / constant isn't defined)."""
-    mod = _read_scenarios_module()
-    return getattr(mod, 'PROJECT_NAME', None) if mod else None
+    return getattr(_read_scenarios_module(), 'PROJECT_NAME', None)
 
 
 def _read_default_scenario() -> str | None:
     """Read `DEFAULT_SCENARIO` from the top-level `scenarios` module."""
-    mod = _read_scenarios_module()
-    return getattr(mod, 'DEFAULT_SCENARIO', None) if mod else None
+    return getattr(_read_scenarios_module(), 'DEFAULT_SCENARIO', None)
 
 
 def _read_scenario_storage(scenario: str) -> 'Storage | None':
     """Read `SCENARIOS[scenario].storage` from the top-level `scenarios`
     module. Returns `None` if any link is missing (caller falls back to
     `Storage.PUBLIC`)."""
-    mod = _read_scenarios_module()
-    if mod is None:
-        return None
-    scenarios_dict = getattr(mod, 'SCENARIOS', None)
-    if scenarios_dict is None:
-        return None
-    s = scenarios_dict.get(scenario)
-    if s is None:
-        return None
+    s = getattr(_read_scenarios_module(), 'SCENARIOS', {}).get(scenario)
     return getattr(s, 'storage', None)
 
 
@@ -1688,19 +1520,8 @@ def init_context(
     namespace: str | None = None,
     caller_base_name: str | None = None,
 ) -> Context:
-    """Initialize context. Most arguments are inferred from the caller path and CLI.
-
-    Namespace is derived from the caller's path under `src/`:
-
-      `src/preparation/<region>/<sub>/x.py`
-          → namespace `preparation/<region>/<sub>` (scenario-free).
-      `src/<subfolder>/<...>/x.py`        (any folder other than preparation/)
-          → namespace `<PROJECT_NAME>/<subfolder>` (project-bound).
-
-    `PROJECT_NAME` is read from the top-level `scenarios` module
-    (`src/scenarios.py`). One repo = one project; the project name is in
-    on-disk paths (`<DATA_DIR_*>/<project>/<scenario>/...`) so multiple
-    project repos can share a `DATA_DIR_*` without collision.
+    """Initialize context. Most arguments are inferred from the caller path and CLI;
+    the namespace from the caller's path under `src/` (module docstring).
 
     Scenario resolution for project namespaces (first non-None wins):
       1. explicit `scenario=` kwarg
@@ -1725,10 +1546,11 @@ def init_context(
     logging.getLogger('pyogrio').setLevel(logging.WARNING)
     _install_level_counter()
 
+    caller_file = inspect.stack()[1][1]
     if caller_base_name is None:
-        caller_base_name = os.path.basename(inspect.stack()[1][1])
+        caller_base_name = os.path.basename(caller_file)
 
-    caller_full_path = os.path.abspath(inspect.stack()[1][1])
+    caller_full_path = os.path.abspath(caller_file)
     re_module = re.compile(r'(.+?/)(src/(.+?)/[^/]+\.py)$')
     res = re_module.match(caller_full_path.replace('\\', '/'))
     caller_storage: 'Storage | None' = None
@@ -1845,9 +1667,7 @@ def init_context(
     return context
 
 
-def _parse_bool_env(key: str, default: bool = False) -> bool:
+def _parse_bool_env(key: str) -> bool:
     """Read a boolean env var (`'1'`, `'true'`, `'yes'`, `'on'` → True; otherwise False)."""
     val = env_values.get(key)
-    if val is None:
-        return default
-    return val.strip().lower() in ('1', 'true', 'yes', 'on')
+    return val is not None and val.strip().lower() in ('1', 'true', 'yes', 'on')

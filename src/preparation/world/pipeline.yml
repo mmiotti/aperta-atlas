@@ -62,7 +62,10 @@ stages:
   # STATENT-derived coefs from preparation/switzerland/land_use/ — which
   # must have been built once (in any area's prior run, since the coefs
   # are area-agnostic). Re-run order across areas doesn't matter for
-  # these stages.
+  # these stages. The calibrations (population_statpop, employment_statent)
+  # themselves read the `switzerland` area's GHS-POP raster (population_ghs
+  # above) for their density strata, so they run between population_ghs
+  # (area `switzerland`) and these two stages.
   - name: population_per_building_from_coef
     module: preparation.world.land_use.population_per_building_from_coef
     variants: ['${area}']

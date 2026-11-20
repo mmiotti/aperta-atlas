@@ -1,12 +1,6 @@
 """
-Shared helpers for `preparation/world/` scripts.
-
-Every per-variant script in `preparation/world/{osm,elevation,land_use}/`
-needs to build a buffered AOI polygon from the case-level `place` name —
-the OSM-clip steps write it to `.poly` format for `osmium extract`;
-the elevation and population scripts use the polygon directly to clip
-their source rasters. Centralised here so there's one place to evolve
-the polygon-construction logic.
+Shared helpers for `preparation/world/` scripts: the buffered AOI polygon of an area's
+`place`, and its `.poly` file for `osmium extract`.
 """
 
 import geopandas as gpd
@@ -28,8 +22,7 @@ def buffered_place_polygon(
     A tuple of place names is geocoded piecewise and unioned before
     buffering — used by multi-canton Area entries (e.g. the language-
     region cross-validation scenarios). The unioned geometry may be a
-    MultiPolygon if the constituent places are geographically disjoint
-    (e.g. TI is disjoint from the FR-speaking cantons).
+    MultiPolygon if the constituent places are geographically disjoint.
 
     The buffer happens in a local UTM (chosen by `ox.projection.project_gdf`)
     so the radius is metrically meaningful; the result is reprojected back
@@ -72,16 +65,13 @@ def write_poly_file(polygon_gdf: gpd.GeoDataFrame, output_path: str) -> None:
         END
         END
 
-    A MultiPolygon geometry emits one numbered ring per part (needed for
-    disjoint multi-place AOIs, e.g. TI + the FR-speaking cantons).
+    A MultiPolygon geometry emits one numbered ring per part (disjoint
+    multi-place AOIs).
 
     See https://wiki.openstreetmap.org/wiki/Osmosis/Polygon_Filter_File_Format
     """
     geom = polygon_gdf.geometry.iloc[0]
-    if isinstance(geom, MultiPolygon):
-        parts = list(geom.geoms)
-    else:
-        parts = [geom]
+    parts = list(geom.geoms) if isinstance(geom, MultiPolygon) else [geom]
     with open(output_path, 'w') as f:
         f.write('polygon\n')
         for i, part in enumerate(parts, start=1):

@@ -4,7 +4,7 @@ When `APERTA_TRACK_DEPENDENCIES=1` in `.env`, every script run records:
 
   - which input data files it read (`used_data`)
   - which output data files it wrote (`created_data`)
-  - which config / variant parameters it actually used
+  - which variant parameters it actually used (`used_variant`)
   - a content-aware hash of the script source (`get_file_hash`)
 
 Subsequent runs validate that upstream data hasn't gone stale — the
@@ -30,8 +30,6 @@ import logging
 import os
 import time
 from typing import TYPE_CHECKING
-
-import numpy as np
 
 if TYPE_CHECKING:
     from aperta_atlas.context import Context
@@ -255,9 +253,9 @@ def update_status(context: 'Context') -> dict:
 
 def check_dependencies(
     context: 'Context', data_names: list[str], initial_check: bool,
-) -> bool:
+) -> None:
     """Validate that each entry in `data_names` was created by a script whose
-    current hash and used-config still match what was recorded at creation time.
+    current file hash still matches what was recorded at creation time.
 
     `initial_check=True` runs once at script start over the full prior `used_data`
     list. `initial_check=False` runs per `register_used_data` call to catch
@@ -319,20 +317,11 @@ def check_dependencies(
             f" {char} "
             f"{'✅ ' + str(count) + ' dependencies validated.' if initial_check else '✅ Dependency validated.'}"
         )
-    return True
 
 
 # ---------------------------------------------------------------------------
 # Banner / log header at script start
 # ---------------------------------------------------------------------------
-
-
-def _param_value(param) -> str:
-    if not isinstance(param, (float, int, str, type)):
-        return f'{type(param)}...'
-    if isinstance(param, int):
-        return f'{param:,}'
-    return str(param)
 
 
 def log_context_info(context: 'Context') -> None:
@@ -377,8 +366,6 @@ def log_context_info(context: 'Context') -> None:
             spaces = "   "
         else:
             spaces = ""
-        # `used_config` log line removed — see comment above. Old
-        # `status.json` entries may still carry the field; ignored.
         logging.info(f"{spaces}   Prev. runtime: {initial_status['runtime']:.1f}s")
         if not related:
             check_dependencies(context, initial_status['used_data'], True)

@@ -3,20 +3,8 @@ OSM way classification rules per network type (walk / bike / drive / all),
 plus OSM-specific post-consolidation helpers.
 
 Single source of truth for "is this OSM way usable for routing in this
-mode" — used at two points in the pipeline:
-
-  1. Network EXTRACTION (build time): filter the incoming OSM way stream
-     to only mode-usable ways. Consumed by
-     `preparation/world/osm/networks_from_pbf.py` via `is_usable` (or
-     the `filter_ways` generator).
-
-  2. Network POST-PROCESSING (cost assignment): mark unusable edges
-     with `cost_excluded_<network_type>=True`, leaving them in the
-     graph for visualization / multi-modal analysis but ensuring
-     downstream cost-assignment can skip them. Use case: unifying
-     API-derived and PBF-derived graphs to the same usability semantics
-     (the API path uses OSMnx's filter, which differs from ours — e.g.
-     OSMnx's walk filter drops cycleways even when `foot=designated`).
+mode": `is_usable` filters the OSM way stream at network extraction
+(`preparation/world/osm/networks_from_pbf.py`).
 
 Plus the OSM-specific helpers that clean up a graph after
 `osmnx.consolidate_intersections`: `clean_consolidated_edges` and its
@@ -32,22 +20,28 @@ cases. False exclusions cause topology cutoffs that are very hard to
 recover from downstream (the Cambridge-MA cycleway-as-walk-connector
 issue is the canonical example: OSMnx's walk filter drops ALL cycleways,
 breaking the pedestrian network where bike paths bridge two walkable
-areas).
+areas). One deliberate exception: the bike network leaves out
+mountain-hiking trails, which bikes may use but the everyday cyclist the
+networks stand for does not (layer 3).
 
 Four rule layers (ALL must pass for a way to be usable):
 
   1. **Universal access**: ways tagged `access=private`, `access=no`, or
      `area=yes` excluded for any mode. First two are explicit "no public
-     access"; third is a polygon (plaza, parking lot) that isn't a
-     linear route.
+     access", unless a mode-specific tag allows the mode (OSM's access
+     hierarchy: `access=no` + `bicycle=yes` is a street closed to motor
+     traffic but open to bikes; `_mode_access_override`); third is a
+     polygon (plaza, parking lot) that isn't a linear route.
 
   2. **Universal highway-value exclusion**: highway values that aren't
      routes at all for any mode (`abandoned`, `construction`, `proposed`,
-     etc.) — see `_UNIVERSAL_HIGHWAY_EXCLUDE`.
+     `via_ferrata`, etc.) — see `_UNIVERSAL_HIGHWAY_EXCLUDE`.
 
   3. **Mode-specific access exclusions**: explicit "this mode excluded":
        - walk: `foot=no`; or `motorroad=yes` (motorway-equivalent)
-       - bike: `bicycle=no`; or `motorroad=yes`
+       - bike: `bicycle=no`; or `motorroad=yes`; or a mountain-hiking
+         trail (`sac_scale` T2 or harder) that is not part of a
+         mountain-bike route (`_SAC_SCALES_NOT_FOR_BIKES`)
        - drive: `motor_vehicle=no` OR `motorcar=no`
 
   4. **Mode-specific highway-value rule** (`_HIGHWAY_RULES`):
@@ -60,7 +54,7 @@ Four rule layers (ALL must pass for a way to be usable):
 
 
 # 2. Universal highway-value exclusions — apply to every network_type.
-# Match OSMnx's convention in `_overpass.py`. These represent things
+# Match OSMnx's convention in `_overpass.py`, plus `via_ferrata`. These represent things
 # that aren't usable routes for any mode (planned/abandoned/demolished
 # roads, transit platforms, motorway service areas, race tracks, etc.).
 _UNIVERSAL_HIGHWAY_EXCLUDE: frozenset[str] = frozenset({
@@ -75,6 +69,7 @@ _UNIVERSAL_HIGHWAY_EXCLUDE: frozenset[str] = frozenset({
     'razed',         # demolished
     'rest_area',     # motorway rest area — feature, not route
     'services',      # motorway services area — feature, not route
+    'via_ferrata',   # protected climbing route, needs climbing gear
 })
 
 
@@ -148,7 +143,9 @@ _DRIVE_ALLOWED_SERVICE_SUBTYPES: frozenset[str] = frozenset({
 # dicts (e.g. `HighwayGraphHandler` in `networks_from_pbf.py`) must
 # include AT LEAST these keys when present on the source way; without
 # them the rules can't apply. Auxiliary tags (oneway, lanes, maxspeed,
-# etc.) are the caller's separate concern.
+# etc.) are the caller's separate concern. `is_usable` also reads
+# `mtb_route` ('yes' on ways in a `route=mtb` relation), which is not a
+# way tag: callers set it from the relations.
 NEEDED_TAGS: tuple[str, ...] = (
     'highway',
     'service',
@@ -156,10 +153,50 @@ NEEDED_TAGS: tuple[str, ...] = (
     'area',
     'foot',
     'bicycle',
+    'sac_scale',
     'motor_vehicle',
     'motorcar',
     'motorroad',
+    # `sidepath_rule` (sidewalks mapped as their own ways):
+    'footway',
+    'sidewalk',
+    'sidewalk:both',
+    'sidewalk:left',
+    'sidewalk:right',
 )
+
+
+# Mode-specific tags that override `access=no|private` (layer 1).
+_MODE_ACCESS_KEYS: dict[str, tuple[str, ...]] = {
+    'walk': ('foot',), 'bike': ('bicycle',), 'drive': ('motor_vehicle', 'motorcar'),
+}
+# Values that admit general car traffic; `forestry`, `agricultural`, `permit`, `delivery`, …
+# admit only some vehicles, so the road stays closed to cars.
+_DRIVE_ACCESS_ALLOWED: frozenset[str] = frozenset({
+    'yes', 'designated', 'permissive', 'destination', 'customers',
+})
+
+
+def _mode_access_override(tags: dict, network_type: str) -> bool:
+    """Whether a mode-specific tag allows `network_type` on a way tagged `access=no|private`.
+    Walk / bike err on the side of keeping the way: any explicit `foot` / `bicycle` value
+    other than `no` / `private` (incl. `dismount`, `unknown`) overrides."""
+    values = [tags[k] for k in _MODE_ACCESS_KEYS.get(network_type, ()) if tags.get(k)]
+    if not values:
+        return False
+    if network_type == 'drive':
+        return any(v in _DRIVE_ACCESS_ALLOWED for v in values)
+    return all(v not in ('no', 'private') for v in values)
+
+
+# Hiking-trail grades (`sac_scale`, OSM wiki) left out of the bike network: T2 (mountain hiking)
+# and harder. Bikes are often allowed there, but the networks stand for everyday cyclists, who
+# do not ride (or push) up mountain trails. Ways in a mountain-bike route (`mtb_route`) stay;
+# the hard ones are pushed (`bike_push`). T1 (`hiking`) stays: often a gravel path.
+_SAC_SCALES_NOT_FOR_BIKES: frozenset[str] = frozenset({
+    'mountain_hiking', 'demanding_mountain_hiking', 'alpine_hiking',
+    'demanding_alpine_hiking', 'difficult_alpine_hiking',
+})
 
 
 def is_usable(tags: dict, network_type: str) -> bool:
@@ -168,10 +205,9 @@ def is_usable(tags: dict, network_type: str) -> bool:
     module docstring.
 
     Tag values are compared with string `==` / `in`, matching OSM's
-    convention that tag values are strings. The merged-edge case
-    (where `highway` may be list-valued after our pre-simplification)
-    is handled for `highway` only — other tags shouldn't be
-    list-valued by construction.
+    convention that tag values are strings. A list-valued `highway`
+    (merged edges, e.g. OSMnx-simplified) is handled for `highway` only —
+    other tags shouldn't be list-valued by construction.
 
     Raises `ValueError` for unknown `network_type`.
     """
@@ -181,7 +217,7 @@ def is_usable(tags: dict, network_type: str) -> bool:
             f"{sorted(_HIGHWAY_RULES)}.")
 
     # Layer 1: universal access exclusions.
-    if tags.get('access') in ('private', 'no'):
+    if tags.get('access') in ('private', 'no') and not _mode_access_override(tags, network_type):
         return False
     if tags.get('area') == 'yes':
         return False
@@ -199,6 +235,9 @@ def is_usable(tags: dict, network_type: str) -> bool:
             return False
         if tags.get('motorroad') == 'yes':
             return False
+        if (tags.get('sac_scale') in _SAC_SCALES_NOT_FOR_BIKES
+                and tags.get('mtb_route') != 'yes'):
+            return False
     elif network_type == 'drive':
         if tags.get('motor_vehicle') == 'no' or tags.get('motorcar') == 'no':
             return False
@@ -209,10 +248,8 @@ def is_usable(tags: dict, network_type: str) -> bool:
         return False
     rule = _HIGHWAY_RULES[network_type]
 
-    # Merged-edge case: highway may be list-valued after
-    # collapse_degree_2_chains' length-weighted aggregation. Universal
-    # exclude filters per-element; way is usable if ANY of its remaining
-    # highway values passes the mode rule.
+    # List-valued highway (merged edges): universal exclude filters per element; the
+    # way is usable if ANY of its remaining highway values passes the mode rule.
     if isinstance(hw, list):
         hw = [h for h in hw if h not in _UNIVERSAL_HIGHWAY_EXCLUDE]
         if not hw:
@@ -299,46 +336,8 @@ def emit_directions(tags: dict, network_type: str) -> tuple[bool, bool]:
     return (True, True)
 
 
-def filter_ways(ways_iter, network_type: str):
-    """Generator yielding only `(way_id, tags, nodes)` tuples whose
-    `tags` pass `is_usable(tags, network_type)`.
-    """
-    for way_id, tags, nodes in ways_iter:
-        if is_usable(tags, network_type):
-            yield (way_id, tags, nodes)
-
-
-def mark_unusable_edges(
-    graph, network_type: str, *, attr_key: str | None = None,
-) -> int:
-    """Set a boolean `cost_excluded_<network_type>` attribute (or
-    `attr_key` if given) on every edge in `graph`: True for edges that
-    fail `is_usable` in this network_type, False otherwise. Returns
-    the count of edges marked True.
-
-    Used by downstream cost-assignment code: edges marked True should
-    receive infinite cost so routing won't traverse them, but the edge
-    stays in the graph for visualization / multi-modal analysis.
-
-    Also useful for post-processing an API-derived graph (built with
-    OSMnx's filter conventions) to match the PBF-extraction
-    semantics — call once per mode to flag any mismatches.
-    """
-    key = attr_key if attr_key is not None else f'cost_excluded_{network_type}'
-    n_unusable = 0
-    for _, _, _, d in graph.edges(keys=True, data=True):
-        unusable = not is_usable(d, network_type)
-        d[key] = unusable
-        if unusable:
-            n_unusable += 1
-    return n_unusable
-
-
 # -----------------------------------------------------------------------
-# Post-consolidation edge cleanup (OSM-specific). Moved from
-# `aperta.network_processing` 2026-06-05: the `lanes`/`oneway` semantics
-# these helpers depend on are OSM conventions, so they belong in the
-# OSM-aware aperta-atlas layer rather than the algorithm library.
+# Post-consolidation edge cleanup (OSM `lanes` / `oneway` conventions).
 # -----------------------------------------------------------------------
 
 
@@ -392,6 +391,50 @@ BRIDGE_YES_VALUES = {
 TUNNEL_YES_VALUES = {
     'yes', 'building_passage', 'culvert', 'avalanche_protector',
 }
+# Surface types (`surface_type` in `edges_<mode>_extended.csv`, main/02b). "Smooth" unpaved:
+# rideable with most bikes.
+SURFACE_TYPES: tuple[str, ...] = ('paved', 'cobble', 'unpaved_smooth', 'unpaved_rough')
+# OSM `surface` values (OSM wiki, Key:surface) by type. Values not listed (rare, ambiguous or
+# several, e.g. `asphalt;gravel`) count as unknown.
+_SURFACE_TYPE_BY_SURFACE: dict[str, str] = {
+    **dict.fromkeys((
+        'paved', 'asphalt', 'chipseal', 'concrete', 'concrete:lanes', 'concrete:plates',
+        'paving_stones', 'paving_stones:lanes', 'bricks', 'metal', 'metal_grid', 'wood',
+        'rubber', 'tiles'), 'paved'),
+    **dict.fromkeys(
+        ('sett', 'cobblestone', 'unhewn_cobblestone', 'cobblestone:flattened'), 'cobble'),
+    **dict.fromkeys(('unpaved', 'compacted', 'fine_gravel', 'gravel'), 'unpaved_smooth'),
+    **dict.fromkeys((
+        'pebblestone', 'rock', 'shells', 'ground', 'dirt', 'earth', 'grass', 'grass_paver',
+        'mud', 'sand', 'woodchips', 'clay', 'snow', 'ice', 'salt'), 'unpaved_rough'),
+}
+# `tracktype` (where `surface` is missing): grade1 solid (paved), grade2 solid but unpaved
+# (gravel, compacted), grade3-5 mixed to soft.
+_SURFACE_TYPE_BY_TRACKTYPE: dict[str, str] = {
+    'grade1': 'paved', 'grade2': 'unpaved_smooth', 'grade3': 'unpaved_rough',
+    'grade4': 'unpaved_rough', 'grade5': 'unpaved_rough',
+}
+# `smoothness` (OSM wiki): `intermediate` and better is fine for a city bike.
+_SURFACE_TYPE_BY_SMOOTHNESS: dict[str, str] = {
+    **dict.fromkeys(('excellent', 'good', 'intermediate'), 'unpaved_smooth'),
+    **dict.fromkeys(('bad', 'very_bad', 'horrible', 'very_horrible', 'impassable'),
+                    'unpaved_rough'),
+}
+
+
+def surface_type(data: dict) -> str | None:
+    """An edge's surface type (`SURFACE_TYPES`), None if unknown: from `surface`, else from
+    `tracktype`; for unpaved ways, `smoothness` (where tagged) decides smooth or rough. Merged
+    edges with several values: the first one with a type."""
+    def first(key: str, table: dict[str, str]) -> str | None:
+        return next((table[v] for v in _tag_values(data, key)
+                     if isinstance(v, str) and v in table), None)
+
+    kind = first('surface', _SURFACE_TYPE_BY_SURFACE) or first(
+        'tracktype', _SURFACE_TYPE_BY_TRACKTYPE)
+    if kind in ('unpaved_smooth', 'unpaved_rough'):
+        kind = first('smoothness', _SURFACE_TYPE_BY_SMOOTHNESS) or kind
+    return kind
 
 
 # Default edge-attribute aggregators applied to LIST-VALUED edge attrs
@@ -416,6 +459,7 @@ _DEFAULT_EDGE_ATTR_AGGS = {
     "highway": _highest_rank_highway,
     "bridge": _mean_numeric,
     "tunnel": _mean_numeric,
+    "steps": _mean_numeric,
 }
 
 
@@ -430,6 +474,8 @@ def _parse_lanes(raw) -> float | None:
     """
     if isinstance(raw, list):
         raw = raw[0] if raw else None
+    if isinstance(raw, str):
+        raw = raw.split(";")[0]                 # `2;3` (one value per part of the way)
     try:
         v = float(raw)
     except (TypeError, ValueError):
@@ -494,29 +540,14 @@ def clean_consolidated_edges(
          `_DEFAULT_DROP_EDGE_ATTRS`). Saves disk space + avoids
          round-trip ambiguity for non-aggregated list-valued attrs.
       2. Collapse list-valued attrs whose key is in `edge_attr_aggs`
-         (defaults to `_DEFAULT_EDGE_ATTR_AGGS`) to a single value
-         via the per-attr aggregator. OSMnx 2.x doesn't expose
-         `edge_attr_aggs` to `consolidate_intersections`, so this is
-         the post-pass that catches `lanes` / `maxspeed` / `highway` /
-         `bridge` / `tunnel` lists. The `highway` aggregator uses
-         `OSM_HIGHWAY_RANKS` for max-rank tie-breaking. `bridge` and
-         `tunnel` arrive as floats from `collapse_degree_2_chains`
-         (length-weighted fractions in `networks_from_pbf.py`); the
-         numeric mean here handles the rare parallel-edge merge case.
-      3. Recompute `length` from `geometry.length` (metric CRS). OSMnx
-         sums `length` across merged source edges, which inflates it
-         for parallel-path merges — the merged edge's actual geometry
-         is shorter than that sum.
+         (defaults to `_DEFAULT_EDGE_ATTR_AGGS`, see its comment) to a
+         single value; OSMnx 2.x doesn't expose `edge_attr_aggs` to
+         `consolidate_intersections`.
+      3. Recompute `length` from `geometry.length` (metric CRS; see the
+         `_DEFAULT_EDGE_ATTR_AGGS` comment).
 
-    Per-edge derived attributes like `lanes_per_direction` are NOT
-    written here — those belong in `networks_decorate.py`, which owns
-    every per-edge / per-node attribute addition the pipeline cares
-    about. This function is strictly cleanup (drop / collapse /
-    re-length) so the consolidate step has a single, narrow purpose.
-
-    Suitable both for graphs produced by `aperta.network_processing.
-    consolidate_intersections` and for graphs from a direct
-    `ox.consolidate_intersections` call.
+    Derived per-edge attributes (e.g. `lanes_per_direction`) are written by
+    `networks_decorate.py`, not here.
 
     Args:
         graph: an OSMnx-style consolidated MultiDiGraph in a metric CRS
@@ -539,11 +570,448 @@ def clean_consolidated_edges(
             d["length"] = float(geom.length)
 
 
+# Sidepaths: a sidewalk or cycle track mapped as its own way beside a road, so that the street is
+# in the walk / bike network twice. `drop_sidepath_ways` removes the way the mode does not use.
+SIDEPATH_ROAD_HIGHWAYS: frozenset[str] = frozenset({
+    "trunk", "trunk_link", "primary", "primary_link", "secondary", "secondary_link",
+    "tertiary", "tertiary_link", "unclassified", "residential", "living_street", "service",
+    "road",
+})
+# `bicycle=*` values under which cyclists may ride a path or footway.
+BICYCLE_ALLOWED: frozenset[str] = frozenset({"yes", "designated", "permissive"})
+# A way the mode does use runs "alongside" if it covers this share of the dropped way's length
+# within this distance.
+SIDEPATH_ALONGSIDE_M = 20.0
+SIDEPATH_ALONGSIDE_SHARE = 0.8
+
+
+def sidepath_rule(tags: dict, network_type: str) -> str | None:
+    """Why `network_type` does not use this way although `is_usable` keeps it, or None.
+
+      - bike: a sidewalk (`footway=sidewalk`) without any `bicycle` tag (cyclists ride on
+        the road beside it; an explicit value, even `dismount`, keeps it); a road with
+        `bicycle=use_sidepath` (cyclists must take the way beside it). Crossings stay: they
+        link footways to the road (stubs left at dropped sidewalks are short dead ends that
+        `networks_from_pbf`'s dead-end pruning removes);
+      - walk: a road with sidewalks mapped separately on both sides (`sidewalk=separate`,
+        `sidewalk:both=separate`, or left and right `separate`) or `foot=use_sidepath`.
+    """
+    highway = tags.get("highway")
+    if network_type == "bike":
+        if (highway == "footway" and tags.get("footway") == "sidewalk"
+                and tags.get("bicycle") is None):
+            return "footway=sidewalk"
+        if highway in SIDEPATH_ROAD_HIGHWAYS and tags.get("bicycle") == "use_sidepath":
+            return "bicycle=use_sidepath"
+    elif network_type == "walk" and highway in SIDEPATH_ROAD_HIGHWAYS:
+        if (tags.get("foot") == "use_sidepath"
+                or "separate" in (tags.get("sidewalk"), tags.get("sidewalk:both"))
+                or (tags.get("sidewalk:left") == "separate"
+                    and tags.get("sidewalk:right") == "separate")):
+            return "sidewalks mapped separately"
+    return None
+
+
+def _sidepath_partner(tags: dict, rule: str) -> bool:
+    """Whether a way the mode keeps can stand in for a way dropped under `rule`."""
+    highway = tags.get("highway")
+    if rule.startswith("footway="):                 # bike: the road beside the sidewalk
+        return highway in SIDEPATH_ROAD_HIGHWAYS
+    if rule == "bicycle=use_sidepath":              # bike: the track beside the road
+        return highway == "cycleway" or tags.get("bicycle") in BICYCLE_ALLOWED
+    return highway in ("footway", "path", "pedestrian", "cycleway", "bridleway", "steps")
+
+
+def drop_sidepath_ways(graph, network_type: str) -> dict[str, float]:
+    """Remove ways that `network_type` does not use from a freshly built graph. Mutates `graph`.
+
+    Errs on the side of keeping a way. An OSM way (all edges with its `osmid`) is dropped only
+    if (1) `sidepath_rule` names it, (2) a way the mode does use runs alongside it, in both
+    directions (`two_way`): within
+    `SIDEPATH_ALONGSIDE_M` over `SIDEPATH_ALONGSIDE_SHARE` of its length, so no route is lost,
+    only a duplicate, and (3) dropping it disconnects nothing: dropped ways that touch a part
+    of the graph that lost its connection to the largest component are put back, until none
+    does. Whole ways go or stay, so streets do not fragment.
+
+    Expects the graph as `networks_from_pbf.build_multidigraph` returns it: WGS84 edge
+    geometries, `osmid` = OSM way id, OSM tags as edge attributes. No-op for other network
+    types than walk and bike. Returns counts and km (one direction) of what was dropped, kept
+    for lack of a way alongside, and put back.
+    """
+    import networkx as nx
+    import numpy as np
+    import osmnx as ox
+    import shapely
+
+    stats = {"ways_dropped": 0, "km_dropped": 0.0, "ways_kept_no_alongside": 0,
+             "ways_put_back": 0}
+    if network_type not in ("walk", "bike"):
+        return stats
+    edges = ox.projection.project_gdf(ox.graph_to_gdfs(graph, nodes=False, fill_edge_geometry=True))
+    attrs = {(u, v, k): d for u, v, k, d in graph.edges(keys=True, data=True)}
+    rules = {e: sidepath_rule(d, network_type) for e, d in attrs.items()}
+    candidates = {e for e, r in rules.items() if r}
+    if not candidates:
+        return stats
+
+    # (2) A way the mode uses alongside, per OSM way and rule.
+    way_of = {e: attrs[e].get("osmid") for e in attrs}
+    geom = dict(zip(edges.index, edges.geometry))
+    keep_ways = set()
+    def two_way(e) -> bool:
+        """The way also runs the other way in this graph (so a duplicate dropped beside it
+        loses no direction, e.g. a sidewalk beside a road that is one-way for bikes)."""
+        back = graph.get_edge_data(e[1], e[0]) or {}
+        return any(d.get("osmid") == way_of[e] for d in back.values())
+
+    for rule in {rules[e] for e in candidates}:
+        partner_edges = [e for e in attrs if not rules[e] and _sidepath_partner(attrs[e], rule)
+                         and two_way(e)]
+        tree = shapely.STRtree([geom[e] for e in partner_edges])
+        by_way: dict = {}
+        for e in candidates:
+            if rules[e] == rule:
+                by_way.setdefault(way_of[e], []).append(e)
+        for way, way_edges in by_way.items():
+            line = shapely.union_all([geom[e] for e in way_edges])
+            near = tree.query(line, predicate="dwithin", distance=SIDEPATH_ALONGSIDE_M)
+            covered = 0.0
+            if len(near):
+                cover = shapely.union_all(
+                    shapely.buffer(np.asarray(tree.geometries)[near], SIDEPATH_ALONGSIDE_M))
+                covered = line.intersection(cover).length
+            if covered < SIDEPATH_ALONGSIDE_SHARE * line.length:
+                keep_ways.add(way)
+    stats["ways_kept_no_alongside"] = len(keep_ways)
+    drop = {e for e in candidates if way_of[e] not in keep_ways}
+
+    # (3) Drop, then put back dropped ways that touch anything that lost its connection.
+    largest = max(nx.weakly_connected_components(graph), key=len)
+    graph.remove_edges_from(drop)
+    put_back = set()
+    while drop:
+        connected = max(nx.weakly_connected_components(graph), key=len)
+        stranded = {n for n in largest - connected if graph.degree(n) > 0}
+        ways = {way_of[e] for e in drop if e[0] in stranded or e[1] in stranded}
+        if not ways:
+            break
+        back = {e for e in drop if way_of[e] in ways}
+        graph.add_edges_from((u, v, k, attrs[(u, v, k)]) for u, v, k in back)
+        drop -= back
+        put_back |= ways
+    stats["ways_put_back"] = len(put_back)
+
+    stats["ways_dropped"] = len({way_of[e] for e in drop})
+    # Two-way ways have an edge per direction: count each way's length once.
+    seen = set()
+    for e in drop:
+        if (way_of[e], frozenset(e[:2])) not in seen:
+            seen.add((way_of[e], frozenset(e[:2])))
+            stats["km_dropped"] += geom[e].length / 1_000
+    graph.remove_nodes_from([n for n in list(graph.nodes) if graph.degree(n) == 0])
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Speed limits and bike traffic stress
+# ---------------------------------------------------------------------------
+
+_MPH_KMH = 1.609344
+# Implicit limits (`maxspeed=CH:urban` etc.), by the part after the country prefix; `rural`
+# differs by country.
+_MAXSPEED_IMPLICIT_KMH: dict[str, float] = {
+    "urban": 50, "zone30": 30, "zone:30": 30, "zone20": 20, "zone:20": 20, "zone": 30,
+    "living_street": 20, "walk": 7, "motorway": 120, "trunk": 100, "rural": 80,
+}
+_MAXSPEED_RURAL_KMH: dict[str, float] = {
+    "DE": 100, "AT": 100, "IT": 90, "FR": 80, "CH": 80,
+}
+_MAXSPEED_GB_KMH: dict[str, float] = {      # national speed limits, in mph
+    "GB:nsl_single": 60 * _MPH_KMH, "GB:nsl_dual": 70 * _MPH_KMH,
+    "GB:nsl_restricted": 30 * _MPH_KMH, "GB:motorway": 70 * _MPH_KMH,
+}
+
+
+def parse_maxspeed_kmh(value) -> float | None:
+    """An OSM `maxspeed` value in km/h: numbers (`50`, `30 mph`), implicit limits
+    (`CH:urban`, `DE:rural`, `GB:nsl_single`, `CH:zone30`), several values (`50;80`: the
+    highest). None if missing, not understood or not above 0 (`maxspeed=0` is a tagging error,
+    not a limit)."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None    # NaN compares False
+    text = str(value).strip()
+    if not text:
+        return None
+    parts = [p.strip() for p in text.replace("|", ";").split(";") if p.strip()]
+    if len(parts) > 1:
+        speeds = [s for s in (parse_maxspeed_kmh(p) for p in parts) if s is not None]
+        return max(speeds) if speeds else None
+    if text in _MAXSPEED_GB_KMH:
+        return _MAXSPEED_GB_KMH[text]
+    lower = text.lower()
+    try:
+        if lower.endswith("mph"):
+            return parse_maxspeed_kmh(float(lower[:-3].strip()) * _MPH_KMH)
+        return parse_maxspeed_kmh(
+            float(lower.removesuffix("km/h").removesuffix("kmh").strip().replace(",", ".")))
+    except ValueError:
+        pass
+    country, _, kind = text.partition(":")
+    kind = (kind or country).lower()
+    if kind == "rural":
+        return _MAXSPEED_RURAL_KMH.get(country.upper(), 80)
+    return _MAXSPEED_IMPLICIT_KMH.get(kind)
+
+
+def _tag_values(data: dict, key: str) -> list:
+    """A tag's values on an edge; merged edges carry lists after consolidation."""
+    value = data.get(key)
+    return value if isinstance(value, list) else [value]
+
+
+# Ways a bike can be pushed along but not ridden: footways, pedestrian ways, corridors and steps
+# without bike access, and anything tagged `bicycle=dismount`. The bike network keeps them where
+# they carry connectivity (`drop_sidepath_ways`).
+_PUSH_HIGHWAYS: frozenset[str] = frozenset({"footway", "pedestrian", "corridor", "steps"})
+# Mountain-bike trails rated S2 or harder (`mtb:scale`, OSM wiki: steps, large roots and rocks)
+# are pushed too, whatever the bike access: everyday cyclists walk them.
+_PUSH_MTB_SCALE = 2
+
+
+def _hard_mtb_trail(value) -> bool:
+    """Whether an `mtb:scale` value is `_PUSH_MTB_SCALE` or harder, by its leading digit (`2+`;
+    a float when read back from CSV)."""
+    s = str(value)
+    return s[:1].isdigit() and int(s[0]) >= _PUSH_MTB_SCALE
+
+
+def bike_push(data: dict) -> bool:
+    """Whether a bike has to be pushed on this edge. Merged edges count as ridable if any of
+    their values is."""
+    if all(_hard_mtb_trail(v) for v in _tag_values(data, "mtb:scale")):
+        return True
+    bicycle = _tag_values(data, "bicycle")
+    if any(b in BICYCLE_ALLOWED for b in bicycle):
+        return False
+    if "dismount" in bicycle:
+        return True
+    return all(h in _PUSH_HIGHWAYS for h in _tag_values(data, "highway"))
+
+
+# Bike traffic stress, 0 (none) to 5 (very high), loosely after the Level of Traffic Stress
+# (Mekuria, Furth & Nixon 2012; Furth's LTS 2.0 criteria: speed limit and lanes per direction,
+# by type of bike infrastructure), with road class standing in for traffic volume (main roads
+# busy, local streets quiet). The speed limit (and lanes) set a row, whose baseline is the level
+# with a painted lane; separation from motor traffic takes one off, mixed traffic adds one. With
+# a painted lane or in mixed traffic, a one-way street (for motor traffic) moves one row towards
+# less stress (no oncoming traffic), a climb one row towards more (the speed difference to motor
+# traffic is largest uphill; descents have stresses of their own, so they stay neutral). A way
+# separated from motor traffic is rated by the road beside it (`bike_stress_beside`), not as
+# no stress throughout: riding next to a busy road is more stressful than on a quiet path, and
+# the level also stands in for the stress of crossing that road's junctions.
+STRESS_MAIN_ROADS: frozenset[str] = frozenset({
+    "motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link",
+    "secondary", "secondary_link", "tertiary", "tertiary_link",
+})
+_CYCLEWAY_SEPARATED: frozenset[str] = frozenset({"track", "opposite_track", "share_sidewalk"})
+_CYCLEWAY_PAINTED: frozenset[str] = frozenset({     # incl. bus lanes shared with bikes
+    "lane", "lanes", "opposite_lane", "yes", "right", "left", "both",
+    "share_busway", "opposite_share_busway",
+})
+# Ways without motor traffic.
+_CAR_FREE_HIGHWAYS: frozenset[str] = frozenset({
+    "cycleway", "path", "track", "bridleway", "footway", "pedestrian", "steps", "corridor",
+})
+# `cycleway*` values that mean "no bike infrastructure on this carriageway" (`separate`: the
+# bike way is mapped as its own way).
+_CYCLEWAY_NONE: frozenset[str] = frozenset({"no", "none", "separate", "use_sidepath"})
+
+
+def _motor_traffic_direction(tags: dict) -> bool | None:
+    """Direction of motor traffic on a way: True along it, False against it (`oneway=-1`),
+    None both ways. Roundabouts are one-way unless tagged otherwise."""
+    oneway = tags.get("oneway")
+    if oneway in ("yes", "true", "1") or (
+            tags.get("junction") in ("roundabout", "circular") and oneway != "no"):
+        return True
+    if oneway == "-1":
+        return False
+    return None
+
+
+def motor_traffic_oneway(tags: dict) -> bool:
+    """Whether motor traffic on this way is one-way (bike traffic stress)."""
+    return _motor_traffic_direction(tags) is not None
+
+
+def cycleway_in_direction(tags: dict, forward: bool, left_hand_traffic: bool = False) -> str:
+    """The bike infrastructure (`cycleway*` value) for travel along the OSM way (`forward`)
+    or against it; `'no'` if there is none.
+
+      - `cycleway` and `cycleway:both` serve both directions of a two-way road and the traffic
+        direction of a one-way road (`cycleway:both` also the other one if bikes may ride
+        against it, `oneway:bicycle=no`); contraflow values (`opposite*`) serve the direction
+        against the traffic.
+      - Two-way road: the lane on the traffic side (right; left with `left_hand_traffic`)
+        serves the way's direction, the other side the opposite one.
+      - One-way road: the traffic-side lane serves the traffic direction; a lane on the other
+        side is the contraflow lane if its value says so or bikes may ride against the
+        traffic, else it also serves the traffic direction.
+
+    Several values for one direction: separated before painted before the rest.
+    """
+    traffic = _motor_traffic_direction(tags)
+    contraflow_ok = tags.get("oneway:bicycle") == "no"
+    near, far = (("cycleway:left", "cycleway:right") if left_hand_traffic
+                 else ("cycleway:right", "cycleway:left"))
+    if traffic is False:            # traffic against the way: its side is the way's other one
+        near, far = far, near
+    found: list[str] = []
+
+    def add(value, serves: bool | None) -> None:        # serves: way direction, against, both
+        if (isinstance(value, str) and value not in _CYCLEWAY_NONE
+                and (serves is None or serves == forward)):
+            found.append(value)
+
+    for key in ("cycleway", "cycleway:both"):
+        value = tags.get(key)
+        if isinstance(value, str) and value.startswith("opposite"):
+            add(value, False if traffic is None else not traffic)
+        elif traffic is None:
+            add(value, None)
+        else:
+            add(value, traffic)
+            if key == "cycleway:both" and contraflow_ok:
+                add(value, not traffic)
+    if traffic is None:
+        add(tags.get(near), True)
+        add(tags.get(far), False)
+    else:
+        add(tags.get(near), traffic)
+        value = tags.get(far)
+        contraflow = isinstance(value, str) and (value.startswith("opposite") or contraflow_ok)
+        add(value, (not traffic) if contraflow else traffic)
+    for group in (_CYCLEWAY_SEPARATED, _CYCLEWAY_PAINTED):
+        for value in found:
+            if value in group:
+                return value
+    return found[0] if found else "no"
+
+
+# Rows of levels when separated / with a painted lane or shared bus lane / in mixed traffic,
+# from least to most stress. Untagged speed: 50 km/h on main roads, quiet (≤ 30) on local
+# streets; untagged lanes: 1 per direction.
+_STRESS_ROWS: tuple[tuple[int, int, int], ...] = (
+    (0, 1, 1),    # ≤ 20 km/h (living street, meeting zone), cycle street
+    (0, 1, 2),    # local street ≤ 30 km/h or untagged
+    (1, 2, 3),    # main road ≤ 30 km/h; local street > 30 km/h (tagged; rural: little traffic)
+    (2, 3, 4),    # main road 50 km/h (or untagged), 1 lane per direction
+    (3, 4, 5),    # main road 50 km/h with 2+ lanes per direction, or > 50 km/h
+)
+# Slope (rise / run, in the edge's direction) from which a climb moves a row. The run is at
+# least `STRESS_SLOPE_MIN_LENGTH_M`: shorter edges are below what a 30 m DEM resolves (their
+# slopes are mostly noise), and a short ramp hardly slows a cyclist.
+STRESS_SLOPE = 0.05
+STRESS_SLOPE_MIN_LENGTH_M = 100.0
+
+
+def lanes_in_direction(tags: dict, forward: bool) -> float | None:
+    """Motor-traffic lanes for travel along the OSM way (`forward`) or against it, without
+    bus lanes: `lanes:forward|backward` where tagged, else half of `lanes` on two-way roads
+    and all of them in a one-way road's direction (0 against it). None if `lanes` is not
+    tagged."""
+    traffic = _motor_traffic_direction(tags)
+    total = _parse_lanes(tags.get("lanes"))
+    if traffic is not None:
+        if forward != traffic:
+            return 0.0
+        lanes = total
+        side = "forward" if traffic else "backward"
+        bus = next((n for n in (_parse_lanes(tags.get(k)) for k in (
+            "lanes:bus", "lanes:psv", f"lanes:bus:{side}", f"lanes:psv:{side}")) if n), 0.0)
+    else:
+        side = "forward" if forward else "backward"
+        lanes = _parse_lanes(tags.get(f"lanes:{side}"))
+        if lanes is None and total is not None:
+            lanes = total / 2
+        bus = next((n for n in (_parse_lanes(tags.get(f"lanes:{k}:{side}"))
+                                for k in ("bus", "psv")) if n), None)
+        if bus is None:
+            both = next((n for n in (_parse_lanes(tags.get(f"lanes:{k}"))
+                                     for k in ("bus", "psv")) if n), 0.0)
+            bus = both / 2
+    return None if lanes is None else max(lanes - bus, 0.0)
+
+
+def _road_row(data: dict) -> int:
+    """Index into `_STRESS_ROWS` for riding on this road, before modifiers."""
+    highways = [h for h in _tag_values(data, "highway") if h]
+    speeds = [s for s in (parse_maxspeed_kmh(v) for v in _tag_values(data, "maxspeed"))
+              if s is not None]
+    speed = max(speeds) if speeds else None
+    if ("living_street" in highways or (speed is not None and speed <= 20)
+            or any(c in ("yes", True, "true", "1", 1) for c in _tag_values(data, "cyclestreet"))):
+        return 0
+    main = any(h in STRESS_MAIN_ROADS for h in highways)
+    lanes = max([n for n in (_parse_lanes(v) for v in _tag_values(data, "lanes_dir"))
+                 if n is not None] or [1.0])
+    if speed is None:
+        speed = 50.0 if main else 30.0
+    if not main:
+        return 1 if speed <= 30 else 2
+    if speed <= 30:
+        return 2
+    return 4 if speed > 50 or lanes >= 2 else 3
+
+
+def bike_stress_beside(data: dict) -> int:
+    """The level a way separated from motor traffic gets beside this road: the table's
+    `separated` column (0 beside a quiet street … 3 beside a fast or multi-lane main road)."""
+    return _STRESS_ROWS[_road_row(data)][0]
+
+
+def bike_stress(data: dict, beside: int | None = None, slope: float | None = None) -> float:
+    """Traffic stress of riding this bike-network edge, 0 (none) to 5 (very high); NaN where
+    the bike has to be pushed (`bike_push`).
+
+      - ways without motor traffic (cycleways, paths, tracks, footways with bike access, roads
+        closed to cars): `beside`, the `bike_stress_beside` level of the road running alongside,
+        or 0 if none does;
+      - roads: the row by speed limit, road class and lanes in the edge's direction
+        (`lanes_dir`; `_STRESS_ROWS`), the column by the bike infrastructure in the edge's
+        direction (`cycleway_dir`): a cycle track as separated, a lane or shared bus lane as
+        painted; shared markings and contraflow without a lane as mixed traffic. Painted and
+        mixed: one row less if motor traffic is one-way (`oneway_motor`), one row more if the
+        edge climbs by `STRESS_SLOPE` or more (`slope`: rise in the edge's direction over
+        its length, at least `STRESS_SLOPE_MIN_LENGTH_M`); both cancel out. `cycleway_dir`,
+        `lanes_dir` and `oneway_motor` are set by `networks_from_pbf`.
+    """
+    if bike_push(data):
+        return float("nan")
+    highways = [h for h in _tag_values(data, "highway") if h]
+    car_tags = [v for k in ("motor_vehicle", "motorcar") for v in _tag_values(data, k)]
+    closed_to_cars = "no" in car_tags or (
+        any(a in ("no", "private") for a in _tag_values(data, "access"))
+        and not any(v in _DRIVE_ACCESS_ALLOWED for v in car_tags))
+    if all(h in _CAR_FREE_HIGHWAYS for h in highways) or closed_to_cars:
+        return float(beside if beside is not None else 0)
+    cycleways = {c for c in _tag_values(data, "cycleway_dir") if isinstance(c, str)}
+    row = _road_row(data)
+    if cycleways & _CYCLEWAY_SEPARATED:
+        return float(_STRESS_ROWS[row][0])
+    oneway = [n for n in (_parse_lanes(v) for v in _tag_values(data, "oneway_motor"))
+              if n is not None]
+    shift = int(bool(oneway) and min(oneway) >= 0.5)
+    if slope is not None and slope >= STRESS_SLOPE:          # NaN compares False
+        shift -= 1
+    row = min(max(row - shift, 0), len(_STRESS_ROWS) - 1)
+    return float(_STRESS_ROWS[row][1 if cycleways & _CYCLEWAY_PAINTED else 2])
+
+
 # =====================================================================
 # OSM highway-rank machinery + per-node OSM classification.
-# Moved from `aperta.network_processing` 2026-06-07 as part of the
-# sweep that pushed all OSM-aware code to aperta-atlas; aperta is now
-# OSM-agnostic and consumes whatever attributes the caller provides.
 # =====================================================================
 
 
@@ -632,27 +1100,17 @@ def flag_node_osm_classification(graph) -> None:
     `autostrasse` / `main_street` tiers), write a project-specific
     classifier that follows the same per-node-attribute pattern.
     """
-    is_multi = graph.is_multigraph()
-
-    # Per-node max / min highway rank from incident edges.
+    # Per-node max / min highway rank from incident edges (one item per parallel edge
+    # on multigraphs too).
     node_max = {n: float("-inf") for n in graph.nodes}
     node_min = {n: float("inf") for n in graph.nodes}
-    if is_multi:
-        for u, v, _, d in graph.edges(keys=True, data=True):
-            rank = _osm_highway_rank(d.get("highway"))
-            for endpoint in (u, v):
-                if rank > node_max[endpoint]:
-                    node_max[endpoint] = rank
-                if rank < node_min[endpoint]:
-                    node_min[endpoint] = rank
-    else:
-        for u, v, d in graph.edges(data=True):
-            rank = _osm_highway_rank(d.get("highway"))
-            for endpoint in (u, v):
-                if rank > node_max[endpoint]:
-                    node_max[endpoint] = rank
-                if rank < node_min[endpoint]:
-                    node_min[endpoint] = rank
+    for u, v, d in graph.edges(data=True):
+        rank = _osm_highway_rank(d.get("highway"))
+        for endpoint in (u, v):
+            if rank > node_max[endpoint]:
+                node_max[endpoint] = rank
+            if rank < node_min[endpoint]:
+                node_min[endpoint] = rank
 
     for nid in graph.nodes():
         is_t = bool(graph.nodes[nid].get("is_t_junction", 0))
@@ -670,415 +1128,3 @@ def flag_node_osm_classification(graph) -> None:
         graph.nodes[nid]["is_4way_major"] = int(is_4 and is_major)
         graph.nodes[nid]["is_t_junction_anchor"] = int(is_t and is_anchor)
         graph.nodes[nid]["is_4way_anchor"] = int(is_4 and is_anchor)
-
-
-# =====================================================================
-# Legacy OSM-specific wrappers (transitional — retire with the extended
-# notebook). Moved here 2026-06-07. These all assume OSMnx-shaped graphs
-# and read OSM tag conventions; the boundary rule "aperta is OSM-agnostic"
-# now puts them in aperta-atlas even though they're transitional. When
-# `aperta-atlas/atlas/` replaces `aperta/examples/extended/`,
-# this whole section can be deleted alongside the notebook.
-# =====================================================================
-
-
-def _int_via_float(value) -> int:
-    """`int(float(v))` — tolerates both `'0'`/`'1'` and `'0.0'`/`'1.0'` strings.
-
-    Plain `int()` raises on float-formatted strings (`int('0.0')` → ValueError).
-    Used as the cast for graphml-loaded `is_*` flags so older saves (where
-    these were written as floats) and newer saves (ints) both round-trip
-    cleanly.
-    """
-    return int(float(value))
-
-
-def _int_via_bool_or_float(value) -> int:
-    """Tolerant graphml-cast for attrs that may have been written as Python
-    `bool` (round-trips as `'True'` / `'False'` strings) or as `int`."""
-    if isinstance(value, (bool, int)):
-        return int(value)
-    if value in ("True", "true"):
-        return 1
-    if value in ("False", "false"):
-        return 0
-    return int(float(value))
-
-
-# Per-node attribute dtypes that `consolidate_intersections` writes as
-# ints. OSMnx's own `default_node_dtypes` only knows about its built-in
-# attrs (elevation, x, y, osmid, street_count, lat, lon), so without
-# this constant our custom `is_*` and `*_highway_rank` flags round-trip
-# as strings — and `int('0.0')` would raise downstream.
-_CONSOLIDATED_NODE_DTYPES: dict = {
-    "n_streets": _int_via_float,
-    "is_t_junction": _int_via_float,
-    "is_4way": _int_via_float,
-    "is_t_junction_major": _int_via_float,
-    "is_4way_major": _int_via_float,
-    "is_t_junction_anchor": _int_via_float,
-    "is_4way_anchor": _int_via_float,
-    "max_highway_rank": _int_via_float,
-    "min_highway_rank": _int_via_float,
-    "is_traffic_signal": _int_via_float,
-    "is_stop": _int_via_float,
-    "is_yield": _int_via_float,
-    "is_roundabout": _int_via_float,
-}
-
-_CONSOLIDATED_EDGE_DTYPES: dict = {
-    "lanes_per_direction": float,
-    "density_norm": float,
-    "is_t_junction": float,
-    "is_4way": float,
-    "is_traffic_signal": float,
-}
-
-
-# Prefix-scan attribute prefixes for dynamic per-mode bool flags
-# written by `prepare_network` / `compute_snap_eligibility` /
-# `insert_projected_nodes`. See `load_consolidated_graphml` below.
-_PREFIX_SCAN_NODE = ("is_snap_eligible_", "is_virtual")
-_PREFIX_SCAN_EDGE = ("cost_excluded_",)
-
-
-def _scan_graphml_keys(filepath, prefixes, scope):
-    """Return the names of `<key for=scope>` graphml attributes that
-    start with any of `prefixes` (or equal one — handles the no-suffix
-    `is_virtual` case via the prefix-match condition).
-    """
-    import xml.etree.ElementTree as ET
-
-    ns = "{http://graphml.graphdrawing.org/xmlns}"
-    out: list[str] = []
-    for _event, elem in ET.iterparse(filepath, events=("end",)):
-        if elem.tag == f"{ns}key" and elem.get("for") == scope:
-            name = elem.get("attr.name", "")
-            if any(name.startswith(p) or name == p for p in prefixes):
-                out.append(name)
-        elif elem.tag == f"{ns}graph":
-            break
-        elem.clear()
-    return out
-
-
-def load_consolidated_graphml(
-    filepath, *, node_dtypes: dict | None = None,
-    edge_dtypes: dict | None = None, **kwargs,
-):
-    """Load a graphml saved by `consolidate_intersections`, casting
-    aperta-atlas's custom `is_*` / `*_highway_rank` / `is_snap_eligible_<mode>`
-    / `cost_excluded_<mode>` / `is_virtual` attrs back to their proper
-    types.
-
-    Thin wrapper around `osmnx.load_graphml` that merges:
-      1. `_CONSOLIDATED_NODE_DTYPES` / `_CONSOLIDATED_EDGE_DTYPES`
-         (fixed casts for the attrs `consolidate_intersections` writes).
-      2. Prefix-scan of the graphml `<key>` schema for the dynamic
-         per-mode flags written by `prepare_network` etc.
-      3. Caller overrides via `node_dtypes` / `edge_dtypes` (win).
-    """
-    import osmnx as ox
-
-    auto_node = {
-        name: _int_via_bool_or_float
-        for name in _scan_graphml_keys(filepath, _PREFIX_SCAN_NODE, "node")
-    }
-    auto_edge = {
-        name: _int_via_bool_or_float
-        for name in _scan_graphml_keys(filepath, _PREFIX_SCAN_EDGE, "edge")
-    }
-    merged_node = {**_CONSOLIDATED_NODE_DTYPES, **auto_node, **(node_dtypes or {})}
-    merged_edge = {**_CONSOLIDATED_EDGE_DTYPES, **auto_edge, **(edge_dtypes or {})}
-    return ox.load_graphml(filepath, node_dtypes=merged_node, edge_dtypes=merged_edge, **kwargs)
-
-
-def extract_obstacle_locations(
-    graph,
-    *,
-    obstacle_node_tags: dict[str, tuple[str, str]] | None = None,
-    detect_roundabouts: bool = True,
-) -> tuple[dict[str, list[tuple[float, float]]], list[tuple[float, float]]]:
-    """Pull obstacle + roundabout `(x, y)` locations from a raw OSMnx graph.
-
-    Companion to `consolidate_intersections`. Returns the two structures
-    the consolidator needs (`obstacle_xy`, `roundabout_xy`) so callers
-    can extract obstacles *once* from a canonical source (typically the
-    raw car graph — the most signal-complete) and reuse for every
-    network type's consolidation. This matters because OSMnx's per-
-    network-type filters drop ways that signals sit on (e.g. trunk roads
-    excluded from walk graphs), losing those signal nodes entirely from
-    the walk graph's node set; passing the union of locations via
-    `obstacle_locations=` / `roundabout_locations=` to
-    `consolidate_intersections` reattaches them to whichever consolidated
-    node is nearest in each network.
-    """
-    if obstacle_node_tags is None:
-        obstacle_node_tags = {
-            "traffic_signal": ("highway", "traffic_signals"),
-            "stop": ("highway", "stop"),
-            "yield": ("highway", "give_way"),
-        }
-    obstacle_xy: dict[str, list[tuple[float, float]]] = {
-        name: [] for name in obstacle_node_tags}
-    for _, ndata in graph.nodes(data=True):
-        for obstacle_name, (key, value) in obstacle_node_tags.items():
-            tag_value = ndata.get(key)
-            if (tag_value == value
-                    or (isinstance(tag_value, list) and value in tag_value)):
-                obstacle_xy[obstacle_name].append((ndata["x"], ndata["y"]))
-    roundabout_xy: list[tuple[float, float]] = []
-    if detect_roundabouts:
-        for u, v, _, edata in graph.edges(keys=True, data=True):
-            j = edata.get("junction")
-            if j == "roundabout" or (isinstance(j, list) and "roundabout" in j):
-                u_attr, v_attr = graph.nodes[u], graph.nodes[v]
-                roundabout_xy.append(
-                    ((u_attr["x"] + v_attr["x"]) / 2,
-                     (u_attr["y"] + v_attr["y"]) / 2))
-    return obstacle_xy, roundabout_xy
-
-
-def consolidate_intersections(
-    graph,
-    tolerance: float,
-    *,
-    obstacle_buffer: float = 30.0,
-    obstacle_node_tags: dict[str, tuple[str, str]] | None = None,
-    obstacle_locations: dict[str, list[tuple[float, float]]] | None = None,
-    detect_roundabouts: bool = True,
-    roundabout_locations: list[tuple[float, float]] | None = None,
-    node_attr_aggs: dict | None = None,
-    edge_attr_aggs: dict | None = None,
-    drop_edge_attrs: list[str] | None = None,
-):
-    """OSMnx intersection consolidation + obstacle-aware re-flagging.
-
-    Wraps `osmnx.consolidate_intersections(rebuild_graph=True)` with the
-    post-processing OSMnx alone misses: traffic-signal / stop / give-way
-    nodes typically sit a few metres off the geometric intersection
-    centre, so OSMnx's `tolerance`-based merge can throw those nodes away
-    rather than carrying the `highway=traffic_signals` tag onto the
-    surviving consolidated node.
-
-    This wrapper captures obstacle locations from the *original* graph
-    before consolidation, then spatially re-attaches them to the nearest
-    surviving consolidated node within `obstacle_buffer` metres. Same
-    trick for roundabouts (whose `junction=roundabout` tag lives on
-    edges in OSM and is otherwise lost when the roundabout collapses).
-
-    Post-consolidation cleanup delegates to `clean_consolidated_edges`
-    (drop noise attrs, collapse list-valued `lanes`/`maxspeed`/`highway`,
-    recompute `length`); per-edge `lanes_per_direction` is written via
-    the canonical `lanes_per_direction` helper.
-
-    The returned graph has per-node attributes set by
-    `flag_node_intersection_topology` (`n_streets`, `is_t_junction`,
-    `is_4way`) plus one `is_<name>` per requested obstacle type plus
-    `is_roundabout` if `detect_roundabouts=True`. As of 2026-06-07 we
-    no longer also call `flag_node_osm_classification` here (its output
-    — `max_highway_rank`, `_major`, `_anchor` — was unused by the
-    extended notebook); callers that need those flags should invoke
-    `flag_node_osm_classification` separately on the result.
-
-    Args:
-        graph: an OSMnx MultiDiGraph (projected; `tolerance` in metres).
-        tolerance: nodes within this distance are merged. 5-15 m urban;
-            ~25 m sparse.
-        obstacle_buffer: max distance (m) for the obstacle re-attach.
-            Should be >= `tolerance`; default 30 m.
-        obstacle_node_tags: `{flag_name -> (osm_key, osm_value)}` —
-            obstacle node tags to extract. Default:
-            `{'traffic_signal': ('highway', 'traffic_signals'),
-              'stop': ('highway', 'stop'),
-              'yield': ('highway', 'give_way')}`.
-        obstacle_locations: pre-supplied `{flag_name -> [(x, y), ...]}`.
-        detect_roundabouts: extract `junction=roundabout` midpoints.
-        roundabout_locations: pre-supplied roundabout midpoints.
-        node_attr_aggs / edge_attr_aggs / drop_edge_attrs: passed
-            through to `ox.consolidate_intersections` /
-            `clean_consolidated_edges`.
-
-    Returns:
-        Consolidated `nx.MultiDiGraph` with new integer node IDs.
-    """
-    from typing import cast
-    import networkx as nx
-    import osmnx as ox
-
-    # Local import to avoid a circular dep with the aperta library at
-    # module load time (aperta-atlas imports from aperta; aperta does not
-    # import from aperta-atlas, but the function lookup happens at call
-    # time anyway).
-    from aperta.network_processing import flag_node_intersection_topology
-
-    # 1. Obstacle + roundabout locations (auto-extract if not supplied).
-    if (obstacle_locations is None
-            or (detect_roundabouts and roundabout_locations is None)):
-        auto_obstacle_xy, auto_roundabout_xy = extract_obstacle_locations(
-            graph,
-            obstacle_node_tags=obstacle_node_tags,
-            detect_roundabouts=detect_roundabouts,
-        )
-        if obstacle_locations is None:
-            obstacle_locations = auto_obstacle_xy
-        if detect_roundabouts and roundabout_locations is None:
-            roundabout_locations = auto_roundabout_xy
-
-    # 2. Consolidate.
-    consolidated = cast(
-        nx.MultiDiGraph,
-        ox.consolidate_intersections(
-            graph,
-            tolerance=tolerance,
-            rebuild_graph=True,
-            reconnect_edges=True,
-            node_attr_aggs=node_attr_aggs,
-        ),
-    )
-
-    # 3. Cleanup (canonical helper — drops noise, collapses list-valued
-    #    lanes/maxspeed/highway via `_DEFAULT_EDGE_ATTR_AGGS`, recomputes
-    #    length from geometry).
-    clean_consolidated_edges(
-        consolidated,
-        drop_edge_attrs=drop_edge_attrs,
-        edge_attr_aggs=edge_attr_aggs,
-    )
-
-    # 4. Per-edge `lanes_per_direction` (canonical helper). Reads the
-    #    already-collapsed `lanes` + `oneway`.
-    for _, _, _, d in consolidated.edges(keys=True, data=True):
-        d["lanes_per_direction"] = lanes_per_direction(d)
-
-    # 5. Topology flags (network-agnostic, in aperta).
-    flag_node_intersection_topology(consolidated)
-
-    # 6. Spatial re-attachment: nearest consolidated node within
-    #    obstacle_buffer gets the obstacle / roundabout flag.
-    from aperta.network_processing import snap_features_to_nodes
-    for name, locs in obstacle_locations.items():
-        snap_features_to_nodes(consolidated, locs, flag_name=name, max_distance=obstacle_buffer)
-    if detect_roundabouts and roundabout_locations is not None:
-        snap_features_to_nodes(
-            consolidated, roundabout_locations,
-            flag_name="roundabout", max_distance=obstacle_buffer)
-
-    return consolidated
-
-
-# =====================================================================
-# POI category-map helpers (pure logic — no network access).
-# Moved from `aperta_atlas.osm_helpers` 2026-06-07 (file deleted).
-# Used by `aperta/examples/extended/prepare/1_download.py` (the small-
-# scale Overpass-API path) for turning a
-# `{category -> [(tag:value, weight), ...]}` map into either an OSMnx
-# tag query or per-feature category columns on a POI GeoDataFrame.
-#
-# The PBF-based `preparation/world/osm/pois_download.py` doesn't use
-# these — it streams via pyosmium with an inverted (key, value) ->
-# categories lookup table that matches the stream-processing access
-# pattern. The PBF script is the canonical production path; the API
-# path lives in the aperta extended notebook as a "simplest way to get
-# started" pedagogical example, not in aperta-atlas.
-# =====================================================================
-
-
-# A category map: `{user_category -> [(osm_tag_pair, weight), ...]}`
-# where `osm_tag_pair` is a `'key:value'` string like `'shop:supermarket'`.
-CategoryMap = dict[str, list[tuple[str, float]]]
-
-
-def osm_tag_query_for_categories(
-    category_map: CategoryMap,
-) -> dict[str, bool | str | list[str]]:
-    """Build the osmnx `tags=` argument from a category map.
-
-    Unions every `key:value` pair across all categories and groups by key.
-    The result is the minimal query that returns *every* feature any
-    category could match.
-
-    Args:
-        category_map: `{user_category -> [(tag_pair, weight), ...]}` where
-            `tag_pair` is a `'key:value'` string.
-
-    Returns:
-        `{osm_tag_key -> [values, ...]}` with values sorted (deterministic
-        for caching / hashing). Pass directly as the `tags` argument to
-        `osmnx.features_from_polygon` / `osmnx.features_from_place`.
-    """
-    out: dict[str, set[str]] = {}
-    for tags in category_map.values():
-        for tag_pair, _weight in tags:
-            if ":" not in tag_pair:
-                raise ValueError(
-                    f"Tag pair {tag_pair!r} must be 'key:value' "
-                    f"(e.g. 'shop:supermarket').")
-            key, value = tag_pair.split(":", 1)
-            out.setdefault(key, set()).add(value)
-    return {k: sorted(v) for k, v in out.items()}
-
-
-def categorize_pois(
-    pois,
-    category_map: CategoryMap,
-    *,
-    weight_suffix: str = "_weight",
-    drop_unmatched: bool = True,
-):
-    """Add per-category count + weighted-count columns to a POI GeoDataFrame.
-
-    For each `(category, [(tag:value, weight), ...])` entry, two new columns
-    are appended:
-
-    - **`{category}`** (int): number of listed `(tag:value)` pairs this row
-      matches. Usually 0 or 1; can be >= 2 if multiple of the listed pairs
-      match for one feature (a feature with both `amenity=school` and
-      `school=primary` for a `schools` category that lists both).
-    - **`{category}{weight_suffix}`** (float): sum of weights across all
-      matching pairs. Equal to the count if every weight is 1.
-
-    Features matching no category at all are dropped if
-    `drop_unmatched=True` (the typical case — saves carrying around OSM
-    features that aren't of interest).
-
-    Args:
-        pois: GeoDataFrame containing the OSM tag columns referenced by
-            `category_map` (e.g. `amenity`, `shop`, `leisure`). Tags missing
-            from the DataFrame are silently treated as never-matching, so
-            partial input works.
-        category_map: `{category -> [(tag:value, weight), ...]}`.
-        weight_suffix: suffix for the per-category weight column. Default
-            `'_weight'`. Set to e.g. `'_w'` for shorter columns.
-        drop_unmatched: drop rows matching no listed `(tag:value)` pair.
-            Default `True`.
-
-    Returns:
-        A copy of `pois` with two new columns per category. Original
-        columns + index preserved.
-    """
-    pois = pois.copy()
-    count_cols: list[str] = []
-    for category, tags in category_map.items():
-        weight_col = f"{category}{weight_suffix}"
-        if category in pois.columns or weight_col in pois.columns:
-            raise ValueError(
-                f"Category {category!r} would overwrite an existing column "
-                f"(have {category!r} / {weight_col!r}). Rename the category "
-                f"or use a different `weight_suffix`.")
-        pois[category] = 0
-        pois[weight_col] = 0.0
-        for tag_pair, weight in tags:
-            key, value = tag_pair.split(":", 1)
-            if key not in pois.columns:
-                continue
-            match = pois[key] == value
-            pois.loc[match, category] += 1
-            pois.loc[match, weight_col] += float(weight)
-        count_cols.append(category)
-    if drop_unmatched and count_cols:
-        any_match = pois[count_cols].sum(axis=1) > 0
-        pois = pois[any_match]
-    return pois
-
-

@@ -3,14 +3,17 @@ Validate atlas's per-edge AADT flow estimates (from 03b_traffic_flows.py)
 against Swiss traffic counters (NPVM zaehldaten).
 
 Loads the saved `edges_car_flows.csv` + the car graph from atlas,
-re-tags each edge with a tier bucket (`highway` / `main` / `local`)
-derived from `OSM_HIGHWAY_RANKS`, snaps each counter to the right
-edge using `calibration.snap_counters_to_edges` (with per-counter
-search radius + bearing tolerance + tier-matched eligibility), then
-runs `calibration.evaluate_against_counters` to pair each matched
-counter with its edge's modeled AADT. Agreement stats (`technical_validation.common.
-agreement_stats`, same columns as `times_vs_survey*.py`) are reported for
-all counters and per tier.
+tags each edge with a road class (`highway` = motorway / trunk, `main` =
+primary–tertiary, `local`) from `OSM_HIGHWAY_RANKS`, snaps each counter to
+an edge with `calibration.snap_counters_to_edges` (motorway stations to a
+motorway / trunk edge within 50 m, all other stations to any non-motorway
+edge within 10 m, both within the bearing tolerance), then runs
+`calibration.evaluate_against_counters` to pair each matched counter with
+its edge's modeled AADT. Agreement stats (`technical_validation.common.
+agreement_stats`) are reported for
+all counters and per road class of the matched edge. Neither the matching
+nor the classes depend on the observed counts, so no group is selected on
+the value it is compared with.
 
 Out-of-sample: 03a / 03b never see the counters (flow coefficients come
 from the survey; absolute volumes from the per-person trip rate).
@@ -24,10 +27,10 @@ Inputs:
         properties/edges_car_flows.csv      # from 03b_traffic_flows.py
     PRIVATE/preparation/switzerland/traffic_counters/traffic_counters.gpkg
         # directional point counters with `traffic_cars`, `bearing_deg`,
-        # `is_highway` / `is_main` / `is_local` flags.
+        # `is_highway` flag (Federal Roads Office stations, two or more lanes).
 
 Outputs (RESULTS, under <scenario>/):
-    technical_validation/flows_vs_counters.csv   # per-tier stats
+    technical_validation/flows_vs_counters.csv   # stats, all + per road class
     technical_validation/flows_vs_counters.png   # modeled vs observed AADT scatter
 
 Run:
@@ -52,16 +55,16 @@ from scenarios import get_scenario
 from technical_validation.common import agreement_stats
 
 
-# Counter-to-edge snap. Highway counters get a wider radius (sparser
-# layout, lower risk of catching a parallel local road); non-highway
-# counters get a tight radius. Bearing tolerance prevents
+# Counter-to-edge snap. Motorway stations (`is_highway`) get a wider radius
+# (sparser layout, lower risk of catching a parallel local road) and only
+# motorway / trunk edges; all other stations a tight radius and any edge but a
+# motorway (so stations on trunk roads match too). Bearing tolerance prevents
 # opposite-direction counters from cross-snapping on two-way roads.
 _HIGHWAY_RADIUS_M = 50.0
 _NON_HIGHWAY_RADIUS_M = 10.0
 _BEARING_TOL_DEG = 10.0
 
-# Tier-classification cutoffs over `OSM_HIGHWAY_RANKS`. Matches the
-# extended notebook's bucketing exactly.
+# Tier-classification cutoffs over `OSM_HIGHWAY_RANKS`.
 _TIER_HIGHWAY_MIN_RANK = 6   # motorway / trunk
 _TIER_MAIN_MIN_RANK = 3      # primary / secondary / tertiary
 # Anything below tertiary → 'local' (residential / service / unknown).
@@ -85,9 +88,8 @@ def _edge_tier(d: dict) -> str:
     return 'local'
 
 
-_TIERS: list[tuple[str, str | None]] = [
-    ('ALL', None), ('highway', 'is_highway'), ('main', 'is_main'), ('local', 'is_local'),
-]
+_ROAD_CLASSES = ('highway', 'main', 'local')
+_MOTORWAYS = frozenset({'motorway', 'motorway_link'})
 
 # Scatter: road class → (legend label, colour). Fixed order, first three slots of a
 # colour-blind-checked categorical palette (valid for all pairs of three series).
@@ -101,15 +103,13 @@ _SCATTER_STYLE: dict[str, tuple[str, str]] = {
 def _plot_scatter(context, merged: pd.DataFrame, counters: pd.DataFrame,
                   rows: list[dict]) -> None:
     """Log-log scatter of modeled vs observed AADT per matched counter, one colour
-    per road class, with a 1:1 line and the overall R²_fit as title. Zero values cannot be drawn on log axes and are
-    left out (logged)."""
+    per road class of the matched edge, with a 1:1 line and the overall R²_fit as
+    title. Zero values cannot be drawn on log axes and are left out (logged)."""
     drawable = (merged['observed'] > 0) & (merged['modeled'] > 0)
     if not drawable.all():
         logging.info(f"  → {int((~drawable).sum()):,} counters with zero AADT not drawn")
     pts = merged[drawable]
-    tier_of = pd.Series('local', index=pts.index)
-    tier_of[counters.loc[pts.index, 'is_main'] == 1] = 'main'
-    tier_of[counters.loc[pts.index, 'is_highway'] == 1] = 'highway'
+    tier_of = counters.loc[pts.index, 'road_class']
 
     fig, ax = plt.subplots(figsize=(3.6, 3.6), layout='constrained')
     handles = {}
@@ -126,7 +126,7 @@ def _plot_scatter(context, merged: pd.DataFrame, counters: pd.DataFrame,
     (one_to_one,) = ax.plot([lo, hi], [lo, hi], color='0.45', lw=0.8, ls='--', zorder=1,
                             label='1:1')
     ax.set(xscale='log', yscale='log', xlim=(lo, hi), ylim=(lo, hi), aspect='equal')
-    ax.set_xlabel('Observed AADT (vehicles/day)', fontsize=8)
+    ax.set_xlabel('Observed weekday traffic (vehicles/day)', fontsize=8)
     ax.set_ylabel('Modeled AADT (vehicles/day)', fontsize=8)
     ax.tick_params(labelsize=7)
     ax.grid(True, which='major', color='0.9', lw=0.5)
@@ -159,9 +159,6 @@ def _log_and_save(context, rows: list[dict]) -> None:
 
 def main():
     context = init_context()
-    assert context.scenario is not None, \
-        ('atlas requires a scenario (set --scenario or '
-         "DEFAULT_SCENARIO in src/scenarios.py)")
     scenario = get_scenario(context.scenario)
     crs_main = scenario.crs_main
 
@@ -176,10 +173,12 @@ def main():
             f"  → {graph.number_of_nodes():,} nodes, "
             f"{graph.number_of_edges():,} edges")
 
-    with step('tag every edge with tier (highway / main / local)'):
+    with step('tag every edge with road class (highway / main / local)'):
         n_per_tier = {'highway': 0, 'main': 0, 'local': 0}
         for _, _, _, d in graph.edges(keys=True, data=True):
             d['_tier'] = _edge_tier(d)
+            hwy = d.get('highway')
+            d['_is_motorway'] = (hwy[0] if isinstance(hwy, list) and hwy else hwy) in _MOTORWAYS
             n_per_tier[d['_tier']] += 1
         logging.info(f"  → tier distribution: {n_per_tier}")
 
@@ -207,20 +206,15 @@ def main():
         counters = gpd.read_file(counters_path).to_crs(crs_main)
         logging.info(
             f"  → {len(counters):,} counters loaded "
-            f"(highway: {int(counters['is_highway'].sum()):,}, "
-            f"main: {int(counters['is_main'].sum()):,}, "
-            f"local: {int(counters['is_local'].sum()):,})")
+            f"({int(counters['is_highway'].sum()):,} motorway stations)")
 
-    with step('filter counters → area polygon (inner core, no buffer)'):
-        # The area polygon (e.g. Canton of Bern boundary) — counters
-        # outside it see traffic going to/from places the simulation
-        # can't model (because they're outside the cell+zone layer),
-        # which inflates observed AADT relative to modeled. Filter to
-        # in-area-polygon counters for a fair comparison.
+    with step(f'filter counters → area polygon shrunk by {-_AOI_BUFFER / 1000:g} km'):
+        # The area polygon shrunk by `-_AOI_BUFFER` (10 km inside the Swiss
+        # border): counters near or beyond it see traffic going to/from places
+        # the simulation can't model (outside the cell+zone layer, which ends
+        # with the car network's buffer), which inflates observed AADT relative
+        # to modeled. Keep only counters inside the shrunk polygon.
         area = AREAS[scenario.area_name]
-        # `union_all()` on a 1-row GeoSeries returns that single geometry;
-        # cleaner type-wise than `.geometry.iloc[0]` (whose pandas-side
-        # return type isn't narrowed to BaseGeometry by geopandas stubs).
         core_polygon = (
             buffered_place_polygon(area.place, _AOI_BUFFER)
             .to_crs(crs_main).geometry.union_all())
@@ -229,30 +223,25 @@ def main():
         counters = counters[in_core].copy()
         logging.info(
             f"  → kept {len(counters):,} of {n_before:,} counters "
-            f"({100 * len(counters) / n_before:.1f} %) inside the "
-            f"{area.place!r} polygon")
+            f"({100 * len(counters) / n_before:.1f} %) at least "
+            f"{-_AOI_BUFFER / 1000:g} km inside the {area.place!r} polygon")
 
     with step(
         f'snap counters → edges (bearing_tol={_BEARING_TOL_DEG}°, '
         f'radius {_HIGHWAY_RADIUS_M:.0f}/{_NON_HIGHWAY_RADIUS_M:.0f} m for '
-        f'highway/other)'
+        f'motorway stations/other)'
     ):
-        # Per-counter radius: wider for highway counters.
+        # Per-counter radius: wider for motorway stations.
         max_distance = counters['is_highway'].map(
             {1: _HIGHWAY_RADIUS_M, 0: _NON_HIGHWAY_RADIUS_M})
 
-        # Per-counter eligibility: highway counters only snap to highway
-        # edges, main to main, local to local. Prevents catching the wrong
-        # road class on parallel infrastructure (e.g. a highway counter
-        # snapping to a frontage road).
+        # Per-counter eligibility: motorway stations only snap to motorway /
+        # trunk edges (not to a frontage road within 50 m), all other stations
+        # to any edge but a motorway (not to a motorway passing within 10 m).
         def _eligible_for_counter(counter_row, candidate_edges):
             if counter_row['is_highway']:
-                wanted = 'highway'
-            elif counter_row['is_main']:
-                wanted = 'main'
-            else:
-                wanted = 'local'
-            return candidate_edges[candidate_edges['_tier'] == wanted]
+                return candidate_edges[candidate_edges['_tier'] == 'highway']
+            return candidate_edges[~candidate_edges['_is_motorway'].astype(bool)]
 
         snapped = calibration.snap_counters_to_edges(
             counters, graph,
@@ -265,26 +254,33 @@ def main():
         logging.info(
             f"  → snapped {n_matched:,} of {len(counters):,} counters "
             f"({100 * n_matched / len(counters):.1f} %)")
-        for label, col in [('highway', 'is_highway'), ('main', 'is_main'),
-                           ('local', 'is_local')]:
-            mask = counters[col] == 1
+        for label, mask in (('motorway stations', counters['is_highway'] == 1),
+                            ('other stations', counters['is_highway'] == 0)):
             n_tot = int(mask.sum())
             n_ma = int((mask & counters['u'].notna()).sum())
             if n_tot:
                 logging.info(
-                    f"     {label:7s}: {n_ma:,} of {n_tot:,} matched "
+                    f"     {label}: {n_ma:,} of {n_tot:,} matched "
                     f"({100 * n_ma / n_tot:.1f} %)")
+        counters['road_class'] = [
+            graph.edges[u, v, k]['_tier'] if pd.notna(u) else None
+            for u, v, k in zip(counters['u'], counters['v'], counters['k'])]
+        logging.info(f"  → matched by road class of the edge: "
+                     f"{counters['road_class'].value_counts().to_dict()}")
 
-    # ---------- Evaluate: overall + per-tier ------------------------------
-    with step('evaluate modeled vs observed AADT (overall + per-tier)'):
+    # ---------- Evaluate: overall + per road class -------------------------
+    with step('evaluate modeled vs observed AADT (overall + per road class)'):
         # `merged` pairs every matched counter (index preserved) with its
-        # edge's modeled AADT; tier filtering happens on that frame.
+        # edge's modeled AADT; class filtering happens on that frame. A class
+        # is known only for matched counters, so `n_in_area` is for ALL only.
         merged = calibration.evaluate_against_counters(flows, counters)['merged']
         rows: list[dict] = []
-        for tier, col in _TIERS:
-            in_tier = (counters[col] == 1) if col else pd.Series(True, index=counters.index)
-            sub = merged[merged.index.isin(counters.index[in_tier])]
-            rows.append({'tier': tier, 'n_in_area': int(in_tier.sum()),
+        for tier in ('ALL', *_ROAD_CLASSES):
+            in_tier = (counters['road_class'] == tier) if tier != 'ALL' else None
+            sub = merged if in_tier is None else merged[
+                merged.index.isin(counters.index[in_tier])]
+            rows.append({'tier': tier,
+                         'n_in_area': len(counters) if in_tier is None else pd.NA,
                          **agreement_stats(sub['observed'].to_numpy(dtype=float),
                                            sub['modeled'].to_numpy(dtype=float))})
 

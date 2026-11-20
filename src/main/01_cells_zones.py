@@ -26,16 +26,27 @@ Build the cells + zones layers for one atlas scenario.
 6. Drop zones with no cells.
 7. Save cells.gpkg + cells_centroids.gpkg + zones.gpkg + per-property CSVs.
 
-Outputs (per `Storage`, under <scenario>/):
+Inputs (PUBLIC / PRIVATE, preparation namespaces):
+    preparation/world/osm: shapes/buildings_<area>.gpkg, pois_<area>.gpkg
+    preparation/world/land_use, preparation/switzerland/land_use: per-building
+        population / employment (h3, buildings), hectare artifacts (hectares)
+    preparation/switzerland/general: traffic_zones_without_lakes.gpkg, countries.gpkg
+
+Outputs (scenario storage, under <scenario>/):
     shapes/cells.gpkg                  # polygon OR point per cell_source
     shapes/cells_centroids.gpkg        # point-representation companion
+    shapes/cells_aoi.gpkg              # AOI subset (GIS / visualisation)
     shapes/zones.gpkg                  # NPVM zones OR H3 hex polygons
-    properties/cells_population.csv    # per-cell population_total
-    properties/cells_employment.csv    # per-cell employment_total
+    properties/cells_zone_ids.csv      # zone_id, is_aoi
+    properties/cells_population.csv    # population columns + combined_total
+    properties/cells_employment.csv    # employment columns
     properties/cells_pois.csv          # per-cell n_pois + per-category counts
     properties/zones_population.csv    # per-zone aggregates
     properties/zones_employment.csv
     properties/zones_pois.csv
+
+Run:
+    python -m main.01_cells_zones --scenario <name>
 """
 
 import logging
@@ -126,8 +137,7 @@ def _build_cells_hectares(context, scenario, area_buffered, crs_main):
     return cells
 
 
-def _build_cells_buildings(context, scenario, area_buffered, crs_main,
-                            country, ids_in_ch):
+def _build_cells_buildings(context, scenario, crs_main, ids_in_ch):
     """OSM building centroids as POINT cells; per-building pop/emp
     attached from `_load_per_building_values`. Building index becomes
     the cell_id — stable across OSM refreshes for the same building
@@ -220,16 +230,8 @@ def _load_per_building_values(
     return pop_df, emp_df
 
 
-# =====================================================================
-# Small helpers to keep main() readable across the polygon/point cell
-# distinction.
-# =====================================================================
-
 def _cell_points(cells: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Return a GeoDataFrame of cell points (centroid for polygon cells;
-    the point itself for point cells). Geopandas `.centroid` returns the
-    input for Point geometries, so this is uniform across cell sources —
-    the helper just exists to make intent explicit at call sites."""
+    """Cell centroids (point cells: the points themselves)."""
     return gpd.GeoDataFrame(
         geometry=cells.geometry.centroid, index=cells.index, crs=cells.crs,
     )
@@ -280,15 +282,10 @@ def main():
     with step(f"build cells (source={scenario.cell_source!r})"):
         if scenario.cell_source == 'h3':
             cells = _build_cells_h3(scenario, area_buffered, crs_main)
-            values_attached_at_build_time = False
         elif scenario.cell_source == 'hectares':
             cells = _build_cells_hectares(context, scenario, area_buffered, crs_main)
-            values_attached_at_build_time = True
         elif scenario.cell_source == 'buildings':
-            cells = _build_cells_buildings(
-                context, scenario, area_buffered, crs_main,
-                country=country, ids_in_ch=ids_in_ch)
-            values_attached_at_build_time = True
+            cells = _build_cells_buildings(context, scenario, crs_main, ids_in_ch)
         else:
             raise ValueError(
                 f"Unknown scenario.cell_source={scenario.cell_source!r}")
@@ -330,9 +327,9 @@ def main():
         logging.info(f"  → {int(zones['is_in_ch'].sum()):,} of {len(zones):,} zones in CH")
 
     # --- Attach per-cell pop/emp for the h3 path ----------------------
-    if not values_attached_at_build_time:
-        # h3 only: use loaded buildings + per-building values, aggregate
-        # into cells via containment.
+    # (hectare and building cells get their values when built)
+    if scenario.cell_source == 'h3':
+        # Per-building values, aggregated into cells via containment.
         with step('attach per-building population + employment'):
             assert buildings is not None
             pop, emp = _load_per_building_values(
@@ -371,17 +368,14 @@ def main():
     # --- Allocate POIs → cells ----------------------------------------
     # Branch on cell geometry type: containment for polygon cells,
     # nearest-cell-centroid for point cells (buildings).
+    _p_centroids = gpd.GeoDataFrame(geometry=pois.geometry, crs=pois.crs)
     if scenario.cell_source in ('h3', 'hectares'):
         with step('allocate POIs → cells (point-in-polygon)'):
-            _p_centroids = gpd.GeoDataFrame(
-                geometry=pois.geometry, crs=pois.crs)
             _ids, _ = geo_mapping.map_points_to_polygons(
                 _p_centroids, cells, allow_nearest=False)
             pois['cell_id'] = _ids
     else:  # buildings — cells are points
         with step('allocate POIs → cells (nearest-cell-centroid)'):
-            _p_centroids = gpd.GeoDataFrame(
-                geometry=pois.geometry, crs=pois.crs)
             _ids, _ = geo_mapping.map_points_to_points(
                 _p_centroids, _cell_points(cells))
             pois['cell_id'] = _ids
@@ -400,11 +394,10 @@ def main():
 
     # --- Aggregate per-cell POI counts --------------------------------
     with step('per-cell POI counts + per-category counts'):
-        cells_n_pois = (
+        cells['n_pois'] = (
             pois.dropna(subset=['cell_id'])
             .groupby('cell_id').size().rename('n_pois')
             .reindex(cells.index, fill_value=0).astype(int))
-        cells['n_pois'] = cells_n_pois
         cells_poi_per_cat = (
             pois.dropna(subset=['cell_id'])
             .groupby(['cell_id', 'category']).size()

@@ -7,7 +7,7 @@ Why osmium-tool rather than Python: osmium streams the input PBF and
 clips with bounded RAM (hundreds of MB regardless of input size).
 Equivalent Python clipping would not work on Europe-scale PBFs.
 
-Cases are defined in `preparation/world/areas.py`; this script registers
+Areas are defined in `preparation/world/areas.py`; this script registers
 one `<area_name>_buffered` variant per area. The buffer is the widest
 per-mode buffer of the area so every downstream per-mode variant fits
 inside the clipped PBF.
@@ -27,7 +27,7 @@ Run all variants sequentially (default):
     python -m preparation.world.osm.clip_pbf
 Single variant:
     python -m preparation.world.osm.clip_pbf --variant switzerland_buffered
-    python -m preparation.world.osm.clip_pbf --variant bern_buffered
+    python -m preparation.world.osm.clip_pbf --variant bern-metro_buffered
 """
 
 import os

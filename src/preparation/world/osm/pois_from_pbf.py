@@ -3,10 +3,7 @@ Stream OSM POI features from a locally clipped PBF — destinations
 (shops, schools, leisure, gastronomy, …), mobility infrastructure
 (car/bike parking, car-sharing), and public-transit stops.
 
-Independent of the network preparation chain; only depends on
-`clip_pbf.py`'s output. Mirrors `obstacles_from_pbf.py` in structure
-(pyosmium streaming handler, per-area variants, GeoDataFrame output).
-The categorisation here is broader: each POI category bundles a set of
+Each POI category bundles a set of
 OSM `key:value` tags with per-tag weights that downstream accessibility
 code can sum / aggregate.
 
@@ -15,8 +12,8 @@ POI categories cover three families:
   - `poi_*` — destination types for accessibility (errands, education,
     leisure). Most are nodes (shops, kindergartens); some are commonly
     tagged on ways (parks, schools as building polygons).
-  - `mobility_*` — car parking, bicycle parking, car-sharing stations.
-    Often tagged on ways (parking lots as polygons).
+  - `mobility_*` — car parking, bicycle parking, car-sharing stations,
+    park-and-ride. Often tagged on ways (parking lots as polygons).
   - `mobility_transit*` — bus stops, train / tram stations, rail halts.
     Almost exclusively nodes.
 
@@ -24,17 +21,19 @@ For each matching OSM feature the handler emits ONE row per matching
 category. A `shop:supermarket` that belongs to BOTH
 `poi_errands_supermarkets` AND `poi_errands_groceries` produces two
 rows (with category-specific weights), so downstream `groupby('category')`
-gives a per-category POI set without further filtering. A feature with
-multiple matching tags (rare — e.g. an `amenity:restaurant` also tagged
-`amenity:cafe`) similarly emits one row per matching tag.
+gives a per-category POI set without further filtering. A feature that
+matches several tags of the same category (common for stops tagged both
+`highway=bus_stop` and `public_transport=platform`) is kept once per
+category, with its highest-weight tag (`features_to_gdf`).
 
 Way features become point features: the polygon centroid for closed
 rings (school buildings, parks), the length-weighted LineString
-centroid for open ways (hiking trails). Relations (multipolygon
-campuses, complex park boundaries) are not handled — nodes and ways
-only.
+centroid for open ways (e.g. platforms, running tracks). Multipolygon relations
+(campuses, complex park boundaries) become the centroid of their
+assembled polygon (`area` callback, osm_type 'r'); other relations
+(e.g. hiking routes) are not read.
 
-Cases are defined in `preparation/world/areas.py`; this script registers
+Areas are defined in `preparation/world/areas.py`; this script registers
 one `<area_name>_pois` variant per area.
 
 Inputs (PUBLIC, under raw/global/osm/):
@@ -43,15 +42,11 @@ Inputs (PUBLIC, under raw/global/osm/):
 Outputs (PUBLIC, under preparation/world/osm/):
     pois_<area_name>.gpkg           # point features, WGS84
 
-Requires `osmium-tool` (CLI) AND `pyosmium` (Python).
-
-Run after `clip_pbf.py`.
-
 Run all variants sequentially (default):
     python -m preparation.world.osm.pois_from_pbf
 Single variant:
     python -m preparation.world.osm.pois_from_pbf --variant switzerland_pois
-    python -m preparation.world.osm.pois_from_pbf --variant bern_pois
+    python -m preparation.world.osm.pois_from_pbf --variant bern-metro_pois
 """
 
 import logging
@@ -67,7 +62,7 @@ from aperta_atlas.utils import step
 from aperta_atlas.variant import Variants
 
 from preparation.world.areas import AREAS, widest_buffer
-from preparation.world.osm.common import clipped_pbf
+from preparation.world.osm.common import area_multipolygon, clipped_pbf
 
 
 # Buffer = widest per-mode for the area; POI set spans the widest
@@ -245,6 +240,17 @@ POI_CATEGORIES: dict[str, list[tuple[str, float]]] = {
         ('amenity:car_sharing',     1.0),
         ('amenity:bicycle_rental',  1.0),
     ],
+    # Park-and-ride car parks (`park_ride=*`, mostly on `amenity=parking`): car access to
+    # public transport (main/06), not a destination. Left out: `no`, and `hov` (car-pool
+    # meeting points).
+    'mobility_park_ride': [
+        ('park_ride:yes',         1.0),
+        ('park_ride:train',       1.0),
+        ('park_ride:bus',         1.0),
+        ('park_ride:tram',        1.0),
+        ('park_ride:metro',       1.0),
+        ('park_ride:designated',  1.0),
+    ],
     # ---- Public transit -------------------------------------------
     # `mobility_transit` is the union of bus + rail + tram (anything a
     # commuter steps onto). `mobility_transit_rail` excludes buses;
@@ -305,7 +311,7 @@ def _way_centroid(coords: list[tuple[float, float]]):
 class POIHandler(osmium.SimpleHandler):
     """Streaming pyosmium handler that collects OSM POI features.
 
-    For each node or way, iterates its tags and consults `_TAG_INDEX`
+    For each node, way or multipolygon relation, iterates its tags and consults `_TAG_INDEX`
     to find matching POI categories. Emits ONE row per (feature,
     category) match — a feature in multiple categories yields multiple
     rows, which simplifies downstream `groupby('category')`.
@@ -317,7 +323,7 @@ class POIHandler(osmium.SimpleHandler):
     def __init__(self) -> None:
         super().__init__()
         # (category, osm_key, osm_value, weight, osm_type, osm_id, lon, lat).
-        # `osm_type` is 'n' or 'w' — OSM ids are unique only within a type.
+        # `osm_type` is 'n', 'w' or 'r' — OSM ids are unique only within a type.
         self.features: list[
             tuple[str, str, str, float, str, int, float, float]
         ] = []
@@ -335,22 +341,35 @@ class POIHandler(osmium.SimpleHandler):
     def way(self, w) -> None:
         # Tag check first — most ways have no POI tag and can skip the
         # expensive coordinate build entirely.
-        tag_matches: list[tuple[str, str, list[tuple[str, float]]]] = []
-        for tag in w.tags:
-            matches = _TAG_INDEX.get((tag.k, tag.v))
-            if matches is not None:
-                tag_matches.append((tag.k, tag.v, matches))
+        tag_matches = [(t.k, t.v, _TAG_INDEX[(t.k, t.v)])
+                       for t in w.tags if (t.k, t.v) in _TAG_INDEX]
         if not tag_matches:
             return
         coords = [(n.location.lon, n.location.lat)
                   for n in w.nodes if n.location.valid()]
         if len(coords) < 2:
             return
-        centroid = _way_centroid(coords)
+        self._emit(tag_matches, 'w', w.id, _way_centroid(coords))
+
+    def area(self, a) -> None:
+        # Multipolygon relations only: closed ways also arrive here, but `way` has
+        # them already.
+        if a.from_way():
+            return
+        tag_matches = [(t.k, t.v, _TAG_INDEX[(t.k, t.v)])
+                       for t in a.tags if (t.k, t.v) in _TAG_INDEX]
+        if not tag_matches:
+            return
+        geometry = area_multipolygon(a)
+        if geometry is not None:
+            self._emit(tag_matches, 'r', a.orig_id(), geometry.centroid)
+
+    def _emit(self, tag_matches, osm_type: str, osm_id: int, point) -> None:
+        """One row per (matching tag, category) of a way or relation, at `point`."""
         for k, v, cats_weights in tag_matches:
             for cat, weight in cats_weights:
                 self.features.append(
-                    (cat, k, v, weight, 'w', w.id, centroid.x, centroid.y))
+                    (cat, k, v, weight, osm_type, osm_id, point.x, point.y))
 
 
 def features_to_gdf(
@@ -360,35 +379,35 @@ def features_to_gdf(
     default integer index named `poi_id`.
 
     Columns: `category`, `osm_key`, `osm_value`, `weight`, `osm_type`,
-    `osm_id`, `geometry`. Multiple rows for the same OSM feature are
-    allowed (one per matching category); `(osm_type, osm_id)` alone is
-    NOT unique. The fresh integer index gives `Context.create_generic`'s
-    uniqueness check something it accepts.
+    `osm_id`, `geometry`; one row per (OSM feature, matching category).
     """
     df = pd.DataFrame(features, columns=[
         'category', 'osm_key', 'osm_value', 'weight',
         'osm_type', 'osm_id', 'lon', 'lat',
     ])
+    # One row per (category, OSM feature): a feature matching several tags of the same
+    # category (e.g. a stop tagged both `highway=bus_stop` and
+    # `public_transport=platform`) is one destination; keep its highest-weight tag.
+    df = (df.sort_values('weight', ascending=False, kind='stable')
+            .drop_duplicates(['category', 'osm_type', 'osm_id'])
+            .sort_index().reset_index(drop=True))
     df.index.name = 'poi_id'
-    gdf = gpd.GeoDataFrame(
+    return gpd.GeoDataFrame(
         df[['category', 'osm_key', 'osm_value', 'weight',
             'osm_type', 'osm_id']],
         geometry=gpd.points_from_xy(df['lon'], df['lat']),
         crs='EPSG:4326',
     )
-    return gdf
 
 
 def main(variant) -> None:
     context = init_context(variant)
     out_name = f'pois_{variant.area_name}'
 
-    with clipped_pbf(context, variant, out_name) as pbf_path:
+    with clipped_pbf(context, variant, out_name) as (pbf_path, _):
         with step('stream parse (pyosmium handler)'):
             handler = POIHandler()
             handler.apply_file(pbf_path, locations=True)
-        # By-category summary so the downstream step has a baseline to
-        # compare against after snap-to-network-node.
         cat_counts = Counter(f[0] for f in handler.features)
         n_features = len(handler.features)
         logging.info(

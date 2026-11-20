@@ -44,8 +44,12 @@ stages:
 
   # ---- Survey prep: legs (needs graphs from 02a + cells/zones from 01) --
   # Calibrate-only: self-skips when the scenario declares no Calibrate() coef.
+  # Two sets: the legs (`mtmc`; read by 03a) and the door-to-door trips
+  # (`mtmc_trips`; 07a/b, 09a, survey/08b), which alone are routed (05) and given
+  # overheads (08a). Route the legs by hand (--variant mtmc) if needed.
   - name: prepare_survey_legs
     module: survey.02d_prepare_survey_legs
+    variants: [mtmc, mtmc_trips]
 
   # ---- Flow calibration (needs survey_legs) + traffic-flow bake --------
   - name: flow_coefs
@@ -70,8 +74,10 @@ stages:
   # ---- Survey routing (needs 04's edge weights + 05_transit's NPVM z2z)-
   - name: survey_leg_times
     module: survey.05_leg_times
+    variants: [mtmc_trips]
 
-  # ---- Public-transit per-cell access (05's walk + bike skims, stop POIs)
+  # ---- Public-transit per-cell access (05's walk, bike, car skims; stop and
+  #      park-and-ride POIs)
   - name: public_transit_access
     module: main.06_public_transit_access
 
@@ -83,16 +89,14 @@ stages:
   - name: transit_overhead_coefs
     module: main.07b_transit_overhead_coefs
 
-  # ---- Survey overheads (needs 07a + 07b), trip-level transit times
-  #      (needs 07b), summary (needs 08a; read by 09a) --------------------
+  # ---- Survey overheads (needs 07a + 07b), trip-level transit times of
+  #      07b's trips for the validation (needs 07b) -------------------------
   - name: survey_leg_overheads
     module: survey.08a_add_leg_overheads
+    variants: [mtmc_trips]
 
   - name: survey_trip_transit
     module: survey.08b_trip_transit_times
-
-  - name: survey_stats
-    module: survey.08c_survey_stats
 
   # ---- Gross-time ODM bake + straight-line distance ODM ----------------
   - name: gross_od_times
@@ -101,10 +105,10 @@ stages:
   - name: dist_line_od
     module: main.08b_dist_line_od
 
-  # ---- Utility model (needs survey/{02d,05,08a,08c} on Calibrate) ------
+  # ---- Utility model (needs survey/{02d,05,08a} on Calibrate) ----------
   # The pipeline fits / transfers only `default` (`utility_default`). The
-  # spec-comparison variants `default_single` / `default_route` (declared in
-  # switzerland-h10 only) are run by hand with --variant.
+  # spec-comparison variant `default_route` (declared in switzerland-h10
+  # only) is run by hand with --variant.
   - name: utility_estimation
     module: main.09a_utility_estimation
     variants: [default]

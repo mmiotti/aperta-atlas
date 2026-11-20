@@ -5,6 +5,7 @@ Per-cell access metrics (routed travel time, seconds):
   - `t_walk_to_transit_nearest`  walk to nearest 1 transit stop
   - `t_walk_to_transit_mean3`    mean walk to nearest 3 transit stops
   - `t_bike_to_train_nearest`    bike to nearest 1 heavy-rail stop
+  - `t_car_to_park_ride_nearest` drive (base hours) to nearest 1 park-and-ride car park
 
 Each metric also gets a `<metric>_zone_dev` deviation column (negative =
 better than zone mean). These per-cell deviations are then applied, with
@@ -19,13 +20,21 @@ to cell-keyed → `lookup_dest_column_geo` on the POI count column
 (clipped at 1 per cell to avoid multi-direction bus-stop double-count)
 → `accessibility.nearest_k` → weighted zone-mean deviation.
 
+The stops are destination columns of the scenario (`transit_stops_cols`, from
+`cells_pois`). The park-and-ride car parks are not a destination: they are read
+from the POI file (`mobility_park_ride`) and placed at the nearest cell centroid.
+
 Inputs (scenario storage, under <scenario>/):
     properties/cells_pois.csv                              # `mobility_transit`, `mobility_transit_train`
     properties/cells_population.csv + cells_snap.csv + shapes/cells.gpkg
     properties/zones_population.csv + zones_snap.csv + shapes/zones.gpkg
     odm/walk_node_pairs.npz + odm/walk_time_net_rwalk.npz  # from 05
     odm/bike_node_pairs.npz + odm/bike_time_net_rbike.npz  # from 05 (rbike profile)
+    odm/car_node_pairs.npz + odm/car_time_net_base.npz     # from 05 (base profile)
     properties/nodes_walk_extended.csv                     # from 02b (density)
+
+Inputs (PUBLIC, under preparation/world/osm/):
+    pois_<area_name>.gpkg                                  # `mobility_park_ride` (pois_from_pbf)
 
 Output (scenario storage, under <scenario>/):
     properties/cells_transit_access.csv
@@ -38,15 +47,16 @@ import logging
 from collections.abc import Sequence
 from typing import cast
 
+import geopandas as gpd
 import pandas as pd
 
-from aperta import accessibility, od_pairs
+from aperta import accessibility, geo_mapping, od_pairs
 from aperta.od_pairs import TieredODNodePairs
 from aperta_atlas.context import init_context
 from aperta_atlas.utils import step
 
 from aperta.data_processing import weighted_group_mean
-from main.common import ROAD_OVERHEAD_DENSITY_COL
+from main.common import ROAD_OVERHEAD_DENSITY_COL, zone_weights
 from scenarios import get_scenario
 
 
@@ -58,6 +68,29 @@ _TRANSIT_ANALYSES: tuple[tuple[str, str | None, str, str, tuple[int, ...]], ...]
     ('walk', 'rwalk', 'mobility_transit',       'transit', (1, 3)),
     ('bike', 'rbike', 'mobility_transit_train', 'train',   (1,)),
 )
+# Car access to park-and-ride, same tuple layout; always run (the scenario check requires car
+# with transit), its column built from the POI file (`_park_ride_per_cell`).
+_PARK_RIDE_ANALYSIS: tuple[str, str | None, str, str, tuple[int, ...]] = (
+    'car', 'base', 'mobility_park_ride', 'park_ride', (1,))
+
+
+def _park_ride_per_cell(context, scenario, cells: gpd.GeoDataFrame) -> pd.Series:
+    """Park-and-ride car parks per cell (`mobility_park_ride` POIs of the scenario's area, each
+    at the nearest cell centroid)."""
+    col = _PARK_RIDE_ANALYSIS[2]
+    file_name = f'pois_{scenario.area_name}.gpkg'
+    pois = context.source('preparation/world/osm').get_generic(file_name)
+    park_ride = pois.loc[pois['category'] == col]
+    if park_ride.empty:
+        raise ValueError(f"No {col!r} POIs in {file_name}; re-run "
+                         f"preparation.world.osm.pois_from_pbf.")
+    points = gpd.GeoDataFrame(geometry=park_ride.geometry.to_crs(cells.crs))
+    centroids = gpd.GeoDataFrame(geometry=cells.geometry.centroid, crs=cells.crs)
+    cell_ids, dist = geo_mapping.map_points_to_points(points, centroids)
+    logging.info(f"  → {len(points):,} park-and-ride POIs → {cell_ids.nunique():,} cells; "
+                 f"distance to the cell centroid: median {dist.median():.0f} m, "
+                 f"max {dist.max():,.0f} m")
+    return cell_ids.value_counts().reindex(cells.index, fill_value=0)
 
 
 def _compute_nearest(
@@ -156,6 +189,7 @@ def main():
             f"No transit analyses can run — none of _TRANSIT_ANALYSES's cols "
             f"({[c for _, _, c, *_ in _TRANSIT_ANALYSES]}) are in "
             f"scenario.transit_stops_cols ({tuple(scenario.transit_stops_cols)}).")
+    analyses.append(_PARK_RIDE_ANALYSIS)
     active_cols = sorted({col for _, _, col, *_ in analyses})
 
     with step('load cells + zones + POIs (clip per-cell stop counts at 1)'):
@@ -163,6 +197,7 @@ def main():
             'cells', ['population', 'snap', 'pois'], add_shapes=True)
         zones = context.get_properties(
             'zones', ['population', 'snap'], add_shapes=True)
+        cells[_PARK_RIDE_ANALYSIS[2]] = _park_ride_per_cell(context, scenario, cells)
         # Clip per-cell counts at 1: N bus stops in one cell are usually
         # the same physical location (one per direction); treating each
         # as a separate opportunity inflates the k-near means. Then
@@ -200,7 +235,7 @@ def main():
         out = pd.DataFrame(out_data, index=cells.index)
 
         zone_id = cells['zone_id']
-        weights = cells['combined_total']
+        weights = zone_weights(cells)
         base_cols = list(out.columns)
         for col in base_cols:
             zone_mean = zone_id.map(

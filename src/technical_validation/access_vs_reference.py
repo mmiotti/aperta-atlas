@@ -34,8 +34,9 @@ between-column spread and hides which settings fail. Each column also gets
 its parameter (`param`, e.g. `k10`) and reach (`REACH`: local / medium /
 broad); summaries are medians over destinations per parameter (`by_param`).
 
-Reported per column:
-  - `n_units`     — matched-index size (before finite filter)
+Reported per column (statistics: `technical_validation.common.agreement_stats`,
+reference = measured, target = predicted), with `n_units`, the matched-index size
+of the file (before the finite filter):
   - `n_finite`    — units finite in both
   - `R²_1to1`     — R² relative to the 1:1 line (`1 − SS_res / SS_tot`,
                     SS_tot from the reference): do the values agree?
@@ -47,6 +48,7 @@ Reported per column:
   - `offset`      — mean difference target − reference (level shift)
   - `slope`       — OLS slope tgt~ref (≈ 1 when values agree in scale)
   - `MAE` / `RMSE` — target − reference in the metric's native units
+  - `MAE%`        — MAE relative to the mean absolute reference value
 
 Inputs (via context):
     <target>/    PUBLIC / properties/cells_access_*.csv
@@ -61,7 +63,7 @@ The comparison itself is `compare_scenarios(...)`, also used by
 (resolution / radii / cv / data) in one go.
 
 Run:
-    python -m technical_validation.access_vs_reference --scenario <target> \
+    python -m technical_validation.access_vs_reference --scenario <target> \\
         [--reference <name>] [--reference-mode {auto,cells,buildings}]
 """
 
@@ -71,7 +73,6 @@ import logging
 import re
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from aperta import NOTE as _NOTE_LEVEL
@@ -79,8 +80,11 @@ from aperta import NOTE as _NOTE_LEVEL
 from aperta_atlas.context import init_context
 from aperta_atlas.utils import step
 
-from main.common import _CAR_HOUR_MODIFIER, UTILITY_T_REF_MIN, profile_to_util_mode
+from main.common import (
+    _CAR_HOUR_MODIFIER, UTILITY_T_REF_MIN, profile_to_util_mode, time_utility,
+)
 from scenarios import get_scenario
+from technical_validation.common import agreement_stats
 
 
 @contextlib.contextmanager
@@ -97,9 +101,7 @@ def _quiet_logs():
 
 _DEFAULT_REFERENCE = 'switzerland-h10'
 
-# Longest-first so `access_util_nearest_k_rbike` peels the metric before
-# splitting the profile. `counts` matched last since it can appear as a
-# substring (currently doesn't, but future-proofing).
+# Longest first; `_parse_access_basename` splits on the last `_<metric>`.
 _METRICS: tuple[str, ...] = ('nearest_k', 'gravity', 'counts')
 
 # Column names are `<destination>_<bin | k | decay>` (e.g. `population_total_0_5min`,
@@ -168,13 +170,13 @@ def column_stats(tgt: pd.DataFrame, ref: pd.DataFrame, idx, cols: list[str]) -> 
                     for df in (tgt, ref))
     rows = []
     for c in list(cols) + list(sums):
-        s = _stats_from_arrays(tgt.loc[idx, c].to_numpy(dtype=float),
-                               ref.loc[idx, c].to_numpy(dtype=float))
+        s = agreement_stats(ref.loc[idx, c].to_numpy(dtype=float),
+                            tgt.loc[idx, c].to_numpy(dtype=float))
         param = param_of(c)
         rows.append({'column': c, 'dest': dest_of(c), 'param': param,
                      'reach': REACH.get(param, '—'), 'summed': c in sums,
-                     'n_finite': s['n_finite'],
-                     'R²_1to1': s['r2'], 'R²_fit': s['r2_fit'], 'offset': s['offset'],
+                     'n_finite': s['n'],
+                     'R²_1to1': s['r2'], 'R²_fit': s['r2_fit'], 'offset': s['bias'],
                      'slope': s['slope'], 'MAE': s['mae'], 'RMSE': s['rmse'],
                      'MAE%': s['mae_pct']})
     return pd.DataFrame(rows)
@@ -206,9 +208,9 @@ def _list_access_files(context) -> list[str]:
 def _auto_reference_mode(target_scenario, reference_scenario) -> str:
     """Pick `cells` when both scenarios share the same cell layer keys,
     else `buildings`. Keys: `(cell_source, cell_h3_resolution)`."""
-    def layer_key(s):
-        return (s.cell_source, s.cell_h3_resolution)
-    return 'cells' if layer_key(target_scenario) == layer_key(reference_scenario) else 'buildings'
+    same = ((target_scenario.cell_source, target_scenario.cell_h3_resolution)
+            == (reference_scenario.cell_source, reference_scenario.cell_h3_resolution))
+    return 'cells' if same else 'buildings'
 
 
 def _bldg_to_cell(scenario_ctx, scenario) -> pd.Series:
@@ -216,15 +218,7 @@ def _bldg_to_cell(scenario_ctx, scenario) -> pd.Series:
     identity (cells ARE buildings). Otherwise spatial join buildings'
     centroids into cells (H3 or hectare polygons); buildings outside all
     cells (typically at the buffer boundary) get NaN and drop out at the
-    finite-mask step downstream.
-
-    `allow_cache=False` on `get_shapes('cells')` is load-bearing: the
-    context cache is keyed only by `(relative_path, storage)`, NOT by
-    `(project, scenario)`, so back-to-back reads from two scenarios of
-    the same file (`shapes/cells.gpkg`) would silently return the
-    first scenario's cells for the second — making both bldg→cell
-    mappings identical.
-    """
+    finite-mask step downstream."""
     osm_ctx = scenario_ctx.source('preparation/world/osm')
     buildings = osm_ctx.get_shapes('buildings', data_name=scenario.area_name)
     if scenario.cell_source == 'buildings':
@@ -245,14 +239,7 @@ def _load_access_on_units(
 ) -> pd.DataFrame:
     """Load a `cells_access_<basename>.csv` and return it keyed by the
     active reference-unit id: cell id (mode='cells') or building id
-    (mode='buildings', via `bldg_to_cell`).
-
-    `allow_cache=False` is load-bearing when target and reference share
-    storage AND grid-name (e.g. res-h9 vs res-h10,
-    both use grid `grid_time` → same relative path). The context cache
-    is keyed only by `(relative_path, storage)`; without this flag, the
-    second scenario's read silently returns the first's data.
-    """
+    (mode='buildings', via `bldg_to_cell`)."""
     access = scenario_ctx.get_properties('cells', basename, allow_cache=False)
     if mode == 'cells':
         return access
@@ -274,10 +261,8 @@ def _parse_access_basename(basename: str) -> tuple[str, str, str] | None:
     if not basename.startswith('access_'):
         return None
     rest = basename[len('access_'):]
-    # `_metric` token — grid keys and profile names can contain
-    # underscores, so use `_<metric>` as the split anchor. Use the
-    # LAST occurrence so a `_gravity_` inside a grid key doesn't
-    # confuse the split.
+    # Grid keys and profiles can contain underscores: split on the last
+    # `_<metric>`.
     for metric in _METRICS:
         needle = f'_{metric}'
         i = rest.rfind(needle)
@@ -313,51 +298,6 @@ def _match_grids(target_scenario, reference_scenario) -> dict[str, str]:
     return matches
 
 
-def _stats_from_arrays(tgt: np.ndarray, ref: np.ndarray) -> dict:
-    """Descriptive stats for a matched (target, reference) pair after
-    finite-in-both masking. Slope is OLS through the joint mean;
-    `r2` is relative to the 1:1 line (`1 − SS_res / SS_tot`, as in
-    `times_vs_survey`); `r2_fit` relative to the best-fit line (squared
-    Pearson). `mae_pct`
-    is a WMAPE-style relative error — `MAE / mean(|ref|)` — dimensionless
-    and robust to per-cell zeros
-    (undefined only when the reference is uniformly zero). Returns
-    `n_finite=0` when insufficient data."""
-    mask = np.isfinite(tgt) & np.isfinite(ref)
-    n = int(mask.sum())
-    if n < 2:
-        return {'n_finite': n, 'r2': float('nan'), 'r2_fit': float('nan'),
-                'offset': float('nan'), 'slope': float('nan'),
-                'mae': float('nan'), 'rmse': float('nan'),
-                'mae_pct': float('nan')}
-    tgt_f, ref_f = tgt[mask], ref[mask]
-    ref_c = ref_f - ref_f.mean()
-    tgt_c = tgt_f - tgt_f.mean()
-    ss_ref = float((ref_c ** 2).sum())
-    slope = float((ref_c * tgt_c).sum() / ss_ref) if ss_ref > 0 else float('nan')
-    resid = tgt_f - ref_f
-    r2 = 1.0 - float((resid ** 2).sum()) / ss_ref if ss_ref > 0 else float('nan')
-    # Pattern agreement (ignores level and scale) + the level shift itself.
-    ss_tgt = float((tgt_c ** 2).sum())
-    r2_fit = (float((ref_c * tgt_c).sum()) ** 2 / (ss_ref * ss_tgt)
-                  if ss_ref > 0 and ss_tgt > 0 else float('nan'))
-    offset = float(resid.mean())
-    mae = float(np.abs(resid).mean())
-    rmse = float(np.sqrt((resid ** 2).mean()))
-    ref_abs_mean = float(np.abs(ref_f).mean())
-    mae_pct = 100.0 * mae / ref_abs_mean if ref_abs_mean > 0 else float('nan')
-    return {
-        'n_finite': n,
-        'r2': r2,
-        'r2_fit': r2_fit,
-        'offset': offset,
-        'slope': slope,
-        'mae': mae,
-        'rmse': rmse,
-        'mae_pct': mae_pct,
-    }
-
-
 def _common(target_df: pd.DataFrame, reference_df: pd.DataFrame) -> tuple[list[str], pd.Index]:
     """Numeric columns and units both frames share. `get_properties` copies
     the H3 index into a `cell_id` column; the numeric filter drops it."""
@@ -367,17 +307,22 @@ def _common(target_df: pd.DataFrame, reference_df: pd.DataFrame) -> tuple[list[s
             target_df.index.intersection(reference_df.index))
 
 
+_SLOPE_HALF_WIDTH_MIN = 5.0
+
+
 def _minutes_per_utility(ctx, variant: str, profile: str) -> float | None:
     """Minutes of door-to-door time worth one utility unit for `profile` under the
-    scenario's utility coefficients (`utility_<variant>`): 1 / |∂v/∂t| at the
-    reference time of 20 min (the derivative does not depend on whether the time
-    terms were centered). `None` if the profile has no utility model."""
+    scenario's utility coefficients (`utility_<variant>`): 1 / |mean ∂v/∂t| over
+    the reference time ± `_SLOPE_HALF_WIDTH_MIN` (the reference time of 20 min is
+    a knot of most modes' piecewise-linear time term, so its own slope is not
+    defined). `None` if the profile has no utility model."""
     util_mode = profile_to_util_mode(profile)
-    u = ctx.get_coefs(f'utility_{variant}')['value']
-    if util_mode is None or f'b_time_{util_mode}' not in u.index:
+    if util_mode is None:
         return None
-    slope = (float(u[f'b_time_{util_mode}'])
-             + float(u[f'b_time_log_{util_mode}']) / UTILITY_T_REF_MIN)
+    u = ctx.get_coefs(f'utility_{variant}')['value']
+    lo, hi = (UTILITY_T_REF_MIN - _SLOPE_HALF_WIDTH_MIN,
+              UTILITY_T_REF_MIN + _SLOPE_HALF_WIDTH_MIN)
+    slope = float(time_utility(u, util_mode, hi) - time_utility(u, util_mode, lo)) / (hi - lo)
     b_time_modifier = _CAR_HOUR_MODIFIER.get(profile, (None, None))[1]
     if b_time_modifier in u.index:
         slope += float(u[b_time_modifier])
@@ -501,30 +446,25 @@ def main():
             context, target, args.reference, mode=args.reference_mode)
 
     with step('summary'):
-        _log_summary_table(target, args.reference, rows,
-                           info['n_no_pair'], info['n_too_few'],
-                           n_total=info['n_total'],
-                           context=context, mode=info['mode'])
+        _log_summary_table(context, target, args.reference, rows, info)
     context.close()
 
 
-def _log_summary_table(target: str, reference: str, rows: list[dict],
-                       n_skipped_no_pair: int, n_skipped_too_few: int,
-                       n_total: int, context=None, mode: str = 'cells') -> None:
-    """Log the median statistics per (grid, metric, profile) × parameter and,
-    with `context`, save the per-column rows as a CSV under RESULTS."""
+def _log_summary_table(context, target: str, reference: str, rows: list[dict],
+                       info: dict) -> None:
+    """Save the per-column rows as a CSV under RESULTS and log the median
+    statistics per (grid, metric, profile) × parameter."""
     n_files = len({(r['grid'], r['metric'], r['profile']) for r in rows})
     logging.info(f"Comparison: {target!r} vs {reference!r}  "
-                 f"({n_files}/{n_total} file(s) matched; "
-                 f"{n_skipped_no_pair} no counterpart, "
-                 f"{n_skipped_too_few} too few finite)")
+                 f"({n_files}/{info['n_total']} file(s) matched; "
+                 f"{info['n_no_pair']} no counterpart, "
+                 f"{info['n_too_few']} too few finite)")
     if not rows:
         return
     df = pd.DataFrame(rows)
-    if context is not None:
-        # Filename encodes reference + mode so invocations don't overwrite each other.
-        context.create_results(df, f'access_vs_{reference}_{mode}.csv',
-                               kws={'index': False, 'float_format': '%.4f'})
+    # Filename encodes reference + mode so invocations don't overwrite each other.
+    context.create_results(df, f"access_vs_{reference}_{info['mode']}.csv",
+                           kws={'index': False, 'float_format': '%.4f'})
     summary = by_param(df, ['grid_pair', 'metric', 'profile'])
     logging.info('Median over destinations, per parameter:\n'
                  + summary.to_string(index=False, float_format='{:.3f}'.format))

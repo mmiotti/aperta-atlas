@@ -130,11 +130,7 @@ def _fill_transit_z2z_from_npvm(
                 f"({pct:.1f}%) missing from NPVM — stored as NaN. "
                 f"If pct is near 100%, check the zone-id key format: "
                 f"NPVM uses 'ZD…'/'ZF…' strings.")
-        costs = TieredODGeoPairs(
-            cells_to_cells=None,
-            cells_to_zones=None,
-            zones_to_zones=z2z_out,
-        )
+        costs = TieredODGeoPairs(zones_to_zones=z2z_out)
         context.create_tiered_odm(
             costs, network_name='transit', data_name='time_net_npvm')
         finite = np.concatenate([

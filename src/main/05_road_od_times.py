@@ -29,7 +29,7 @@ Tier classification (from `aperta.od_pairs.get_pairs`):
 
 Cells are filtered to those with mode-specific snap + `zone_id` in the
 prepared zones layer. Origins are further restricted to `is_active == 1`
-(cells that snapped to ALL network types); destinations include the
+(AOI cells that snapped to ALL network types); destinations include the
 buffer-only cells that only snap to some networks.
 
 Inputs (scenario storage, under <scenario>/):
@@ -169,17 +169,6 @@ def _build_road_pairs(
 # ---------------------------------------------------------------------------
 
 
-def _load_lean_graph(
-    context, mode_config: ModeConfig, src: CalibratedSource,
-):
-    """Load `<mode>.graphml` + attach one profile's calibrated-duration
-    edge column. Returns `(graph, weight_col)`."""
-    graph = context.get_nw(data_name=mode_config.mode, allow_cache=False)
-    calibrated = context.get_properties('edges', src.edges_data_name)
-    attach_edge_properties(graph, calibrated[[src.edge_column]])
-    return graph, src.edge_column
-
-
 def _route_road_profile(
     context, mode_config: ModeConfig, src: CalibratedSource,
     pairs: TieredODNodePairs,
@@ -188,10 +177,13 @@ def _route_road_profile(
     net-time cost ODM. Uses the per-mode Dijkstra cutoff to bound the
     per-origin frontier without changing in-bound results."""
     with step(f'profile={src.name}: load lean graph + route + save'):
-        graph, weight_col = _load_lean_graph(context, mode_config, src)
+        # The graph with one profile's calibrated-duration edge column.
+        graph = context.get_nw(data_name=mode_config.mode, allow_cache=False)
+        calibrated = context.get_properties('edges', src.edges_data_name)
+        attach_edge_properties(graph, calibrated[[src.edge_column]])
         # `cast`: `tiered_path_costs` returns the subclass matching `pairs`.
         costs = cast(TieredODNodePairs, routing.tiered_path_costs(graph, pairs,
-            weight=weight_col,
+            weight=src.edge_column,
             cutoff=mode_config.time_cutoff_s,
         ))
         context.create_tiered_odm(

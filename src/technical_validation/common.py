@@ -2,10 +2,41 @@
 
 - `agreement_stats`: the bias / MAE / RMSE / slope / R² / MAE% set
   reported by every ground-truth comparison (`times_vs_survey*.py`,
-  `flows_vs_counters.py`).
+  `flows_vs_counters.py`) and by the accessibility comparisons
+  (`access_vs_reference.column_stats`).
+- `DIST_BANDS`, `STATS_RENAME`, `STATS_FORMATTERS`: distance bands and the
+  table columns of `times_vs_survey*.py`.
 """
 
 import numpy as np
+
+# Straight-line distance bands (metres). Coarse on purpose: MTMC self-report is
+# 5-min-rounded, so finer bands mostly add rounding noise; shared across leg sets so
+# MTMC and MOBIS rows compare. <2 km and 2-5 km split the short legs, where per-trip
+# overheads weigh most.
+DIST_BANDS: list[tuple[str, float, float]] = [
+    ('   <2km',       0.0,    2_000.0),
+    ('   2-5km',  2_000.0,    5_000.0),
+    ('  5-25km',  5_000.0,   25_000.0),
+    ('   >25km', 25_000.0,  np.inf),
+]
+
+# `agreement_stats` keys → table headers (plus the script's own name for `n`).
+STATS_RENAME: dict[str, str] = {
+    'bias_pct': 'bias%', 'med_resid_pct': 'med_resid%',
+    'r2': 'R²_1to1', 'r2_fit': 'R²_fit', 'mae_pct': 'MAE%',
+}
+
+# Console formatters for the table headers (plus the script's own for `n`).
+STATS_FORMATTERS = {
+    'bias':       '{:+8.1f}'.format,
+    'bias%':      '{:+.1f}%'.format,
+    'med_resid':  '{:+8.1f}'.format,
+    'med_resid%': '{:+.1f}%'.format,
+    'R²_1to1':    '{:.4f}'.format,
+    'R²_fit':     '{:.4f}'.format,
+    'MAE%':       '{:.1f}%'.format,
+}
 
 
 def agreement_stats(measured: np.ndarray, predicted: np.ndarray) -> dict:

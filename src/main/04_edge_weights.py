@@ -1,6 +1,6 @@
 """
 Calibrate per-profile per-edge weights (durations) against per-mode
-ground-truth trip times for the Swiss Urban Mobility Atlas.
+ground-truth trip times for the Aperta Accessibility Atlas.
 
 Ground truth per mode is set by `scenario.edge_weights_sources[mode]`:
   'mtmc'            MZMV 2015 + 2021 legs (self-reported durations).
@@ -22,12 +22,7 @@ For bike, only the regular bike (rbike) is fit. Ebike profiles
      of `min(target_speed_kph, OSM_speed_kph)` — e.g. 22 km/h (ebike25)
      or 40 km/h (ebike45), each capped by the OSM-derived speed limit.
   2. Scaling rbike's fitted feature coefficients by per-feature
-     multipliers (see `_EBIKE_DERIVATIONS`). Examples:
-       elevation_gain × 0.33  (motor assist eases climbs)
-       elevation_loss × 0.50 (ebike25) / 0 (ebike45) (downhill help shrinks)
-       is_4way / is_traffic_signal × 1.30 (ebike25) / 1.80 (ebike45)
-                                          (faster baseline → bigger relative
-                                           cost of stop/start at intersections)
+     multipliers (see `_EBIKE_DERIVATIONS`).
   3. Capping each edge's duration at the slower bicycle profiles'
      (`not_slower_than`): ebike25 ≤ rbike, ebike45 ≤ ebike25 and rbike.
 All three bike columns are written to a single `edges_bike_calibrated.csv`
@@ -50,20 +45,13 @@ Inputs (scenario storage, under <scenario>/):
 
 Outputs (scenario storage, under <scenario>/):
     properties/edges_<mode>_calibrated.csv
-        # duration_calibrated_<profile> + effective_speed_kph_<profile>
-        # + duration_baseline_<profile> for every profile under <mode>.
-        # Bike's file has 3 profile columns each (rbike, ebike25, ebike45);
-        # walk's 2 (rwalk, walk_prm).
-        # `duration_baseline_*` is the per-edge naive baseline duration
-        # (length / baseline_speed): OSM `speed_kph` for car; uniform
-        # `cfg.baseline_speed_kph` for walk / bike. Consumed by
-        # survey/05 for the naive-routing comparison in validation.
+        # duration_calibrated_, effective_speed_kph_ and duration_baseline_<profile> per
+        # profile (bike: rbike, ebike25, ebike45; walk: rwalk, walk_prm). The baseline is
+        # length / baseline speed (car: OSM `speed_kph`; walk / bike: uniform), for
+        # survey/05's uncalibrated comparison.
     coefs/<kind>/edge_weights_<mode>.csv
-        # <kind> ∈ {calibrated, transferred, manual} per the scenario's
-        # `coefs={'edge_weights_<mode>': ...}` declaration (see
-        # README "Coefficients" + aperta_atlas.coefs).
-        # One column per profile; bike's / walk's file shows the fitted
-        # parent's coefs alongside the rule-derived ones.
+        # one column per profile (derived profiles next to their fitted parent); <kind>
+        # per the scenario's coef declaration (aperta_atlas.coefs)
 
 Run all variants (walk / bike / car) sequentially (default):
     python -m main.04_edge_weights --scenario <name>
@@ -155,12 +143,9 @@ class ProfileCalibration:
 
 # Predicates for walk_prm edge exclusions.
 def _is_steps(edges: pd.DataFrame) -> pd.Series:
-    """OSM `highway=steps` edges."""
-    def _first_if_list(v):
-        if isinstance(v, list):
-            return v[0] if v else None
-        return v
-    return edges['highway'].map(_first_if_list) == 'steps'
+    """Edges with any stairs: OSM `highway=steps` length share (`steps`, kept through the
+    chain collapse in preparation/world/osm/networks_from_pbf.py) above 0."""
+    return pd.to_numeric(edges['steps'], errors='coerce').fillna(0.0) > 0
 
 
 def _too_steep(edges: pd.DataFrame) -> pd.Series:
@@ -195,7 +180,13 @@ _EBIKE_DERIVATIONS: list[DerivedFromCalibrated] = [
             'elevation_gain':    0.33,  # motor assist eases climbs
             'elevation_loss':    0.50,  # downhill saves less time (still pedalling)
             'is_4way':           1.30,  # faster baseline → bigger relative stop cost
+            'is_t_junction':     1.30,
             'is_traffic_signal': 1.30,
+            # Pushed edges at rbike's speed: set to overshoot, and `not_slower_than` caps them
+            # at rbike's duration. 2026-11-13 fit (α 0.96, bike_push 1.17): rbike pushes at
+            # 8.5 km/h; uncapped, ebike25 would at 7.8 and ebike45 at 7.3. Stays an overshoot
+            # while bike_push ≥ 0.57 (ebike25) / 0.70 (ebike45).
+            'bike_push':         1.6,
         },
         not_slower_than=('rbike',),
     ),
@@ -208,7 +199,9 @@ _EBIKE_DERIVATIONS: list[DerivedFromCalibrated] = [
             'elevation_gain':    0.33,
             'elevation_loss':    0.00,  # at 40 km/h, downhill barely helps
             'is_4way':           1.80,
+            'is_t_junction':     1.80,
             'is_traffic_signal': 1.80,
+            'bike_push':         3.9,   # as for ebike25
         },
         not_slower_than=('rbike', 'ebike25'),
     ),
@@ -223,45 +216,52 @@ _PROFILE_CONFIG: list[ProfileCalibration] = [
         constant=None,
         baseline_speed_kph=5.0,             # flat-ground pedestrian average
         multiplier_features={
-            # 'is_traffic_signal': 0.0,     # Near-zero coefficient
             'density_r500_norm': -0.1,
         },
         additive_route_features={
             'elevation_gain':    2.5,
             'elevation_loss':    1.0,
-            'is_4way':           15.0,
-            # 'is_traffic_signal': 0.0,
+            'is_t_junction':     1.0,
+            'is_4way':           3.0,
+            # Slightly negative coefficient, oscillates. Very few features per route (<1). Change
+            # to "signaled crossing" in the future.
+            # 'is_traffic_signal': 1.0,
         },
         additive_endpoint_features={
             'snap_dist':          0.0,
         },
         min_trip_distance=250.0,            
-        max_trip_distance=2_500.0,       
+        max_trip_distance=2_000.0,       
         derived_profiles=_WALK_DERIVATIONS,  # walk_prm from rwalk fit
     ),
     ProfileCalibration(
         profile='rbike',
         mode='bike',
         constant=None,
-        baseline_speed_kph=17.5,
+        baseline_speed_kph=18.0,
         multiplier_features={
-            # 'slope_uphill':         0.0,
+            # 'slope_uphill':         0.0, # Alternative to gain/loss below; unused
             # 'slope_downhill':       0.0,
-            # 'bike_infra_score_avg_r250': 0.0, # Has effect, but can be confounded by other things (road type). Coefficient quite large, probably non-linear. Need to re-think bike infrastructure quantification.
-            # 'speed_limit_avg_r250': 0.0, # Some interesting interaction with gain/loss, runs away with it (no convergence).
-            'density_r500_norm': -0.1,
+            # 'is_stress_01':                0.0, # Coefficient oscillates; no significant impact
+            # 'is_stress_45':               -0.1, # Coefficient oscillates; no significant impact
+            'is_unpaved':                  0.3,
+            'bike_push':                   0.7,
+            'density_r500_norm':           0.0,
         },
         additive_route_features={
-            # 'is_traffic_signal': 3.0, # Coefficient negative, but also few features per route; hard to fit
-            'is_4way':           5.0,
+            # Coefficient fluctuates with iterations (unstable). Few features per route; improve
+            # in future version (ideally with dual graph).
+            # 'is_traffic_signal': 3.0,
+            'is_t_junction':     1.0,
+            'is_4way':           3.0,
             'elevation_gain':    2.8,
-            'elevation_loss':    0.0,
+            'elevation_loss':    -0.5,
         },
         additive_endpoint_features={
             'snap_dist':          0.0,
         },
         min_trip_distance=500.0,
-        max_trip_distance=20_000.0,
+        max_trip_distance=10_000.0,
         derived_profiles=_EBIKE_DERIVATIONS,  # ebike25 / ebike45 from rbike fit
     ),
     ProfileCalibration(
@@ -274,6 +274,7 @@ _PROFILE_CONFIG: list[ProfileCalibration] = [
             'vc_beta_2.0':        0.2,
         },
         additive_route_features={
+            'is_t_junction':       3.0,
             'is_4way':            10.0,
             'is_traffic_signal':  10.0,
         },
@@ -327,52 +328,24 @@ for _cfg in _PROFILE_CONFIG:
     variants.add(name=_cfg.mode, mode=_cfg.mode)
 
 
-_VALID_TRIP_COL = 'is_valid_domestic_trip'
-_SPEED_ENVELOPE_COL = 'is_within_speed_envelope'
-_DETOUR_ENVELOPE_COL = 'is_within_detour_envelope'
-_LAND_BASED_COL = 'is_land_based'
-_ELEVATION_BAND_COL = 'is_within_elevation_band'
 # Survey `mode_simplified` labels fitted per graph mode (bike: regular bicycles only).
 _SURVEY_MODES: dict[str, set[str]] = {'walk': {'walk'}, 'bike': {'rbike'}, 'car': {'car'}}
 
 
 def _apply_survey_gates(legs: pd.DataFrame) -> pd.DataFrame:
-    """Trip-level quality gates common to MTMC + MOBIS calibration
-    training. Applied at load time because 04 reads both sources
-    straight from the preparation surveys directory (not through
-    `survey/02d_prepare_survey_legs.py`'s pre-filter), so every flag is
-    enforced here, symmetrically. Gates:
-
-      - is_valid_domestic_trip == 1 (dist/time OK, in Switzerland,
-        MOBIS `implausible` False)
-      - is_within_speed_envelope == 1 (per-mode speed envelope)
-      - is_within_detour_envelope == 1 (dist_measured/dist_line ratio
-        within per-mode cap — catches errand-stop legs)
-      - is_land_based == 1 (drops plane / boat / aerialway)
-      - is_within_elevation_band == 1 (DEM-valid endpoints + not
-        alpine; composite gate from `standardize.attach_within_
-        elevation_band_flag` — thresholds live there as single
-        source of truth, shared with 07a + 02d)
-
-    Mode filtering is applied by each caller (they know which mode
-    set they're training on). Person-level diary integrity is NOT
-    enforced here — it's a person-stats concern, not a training
-    concern (see `standardize.person_has_any_bad_trip` for the
-    downstream helper).
-
-    Flags checked defensively — a missing column is treated as
-    all-pass so this survives future schema changes.
+    """Leg quality gates of the edge-weight fit, applied here because 04 reads the MTMC and
+    MOBIS legs straight from the preparation surveys (not via survey/02d): valid domestic
+    trip, within the mode's speed and detour envelopes, endpoints within the elevation band
+    (`standardize.attach_within_elevation_band_flag`), and land-based (NaN passes). A
+    missing flag column passes all legs. Mode filtering is up to the caller; person-level
+    diary integrity is not a training concern (see `standardize.person_has_any_bad_trip`).
     """
-    if _VALID_TRIP_COL in legs.columns:
-        legs = legs[legs[_VALID_TRIP_COL] == 1]
-    if _SPEED_ENVELOPE_COL in legs.columns:
-        legs = legs[legs[_SPEED_ENVELOPE_COL] == 1]
-    if _DETOUR_ENVELOPE_COL in legs.columns:
-        legs = legs[legs[_DETOUR_ENVELOPE_COL] == 1]
-    if _LAND_BASED_COL in legs.columns:
-        legs = legs[legs[_LAND_BASED_COL].fillna(1) == 1]
-    if _ELEVATION_BAND_COL in legs.columns:
-        legs = legs[legs[_ELEVATION_BAND_COL] == 1]
+    for col in ('is_valid_domestic_trip', 'is_within_speed_envelope',
+                'is_within_detour_envelope', 'is_within_elevation_band'):
+        if col in legs.columns:
+            legs = legs[legs[col] == 1]
+    if 'is_land_based' in legs.columns:
+        legs = legs[legs['is_land_based'].fillna(1) == 1]
     return legs
 
 
@@ -465,11 +438,21 @@ def _load_survey_legs(
 
 
 def _prepare_edge_features(graph, baseline_speed_kph: float | None) -> None:
-    """Write a uniform `speed_kph` onto every edge of `graph`, in place.
-    No-op when `baseline_speed_kph` is None (car keeps the OSM speeds).
+    """Write a uniform `speed_kph` onto every edge of `graph`, in place
+    (skipped when `baseline_speed_kph` is None: car keeps the OSM speeds).
+
+    Also adds 0/1 indicators from 02b's per-edge labels: `is_stress_01` / `is_stress_45`
+    from `bike_stress` (bike graph; 0 on pushed edges, where it is NaN) and `is_unpaved`
+    from `surface_type` (`unpaved_smooth` or `unpaved_rough`; 0 where untagged).
     """
     if baseline_speed_kph is not None:
         nx.set_edge_attributes(graph, baseline_speed_kph, 'speed_kph')
+    for *_, d in graph.edges(data=True):
+        if 'bike_stress' in d:
+            stress = d['bike_stress']
+            d['is_stress_01'] = float(pd.notna(stress) and stress <= 1)
+            d['is_stress_45'] = float(pd.notna(stress) and stress >= 4)
+        d['is_unpaved'] = float(d.get('surface_type') in ('unpaved_smooth', 'unpaved_rough'))
 
 
 _KMH_TO_MS = 1.0 / 3.6
@@ -492,11 +475,11 @@ def _set_per_edge_derived_baseline(
     (eff_speed / 3.6)`. Writes `__derived_effective_speed_kph` and
     `__derived_baseline_duration` per edge. Edges with missing /
     non-positive `osm_speed_kph` fall back to `target_speed_kph`."""
-    for u, v, k, data in graph.edges(keys=True, data=True):
+    for *_, data in graph.edges(data=True):
         length = float(data['length'])
         osm = data.get('osm_speed_kph')
         target = derivation.target_speed_kph
-        if osm is None or not pd.notna(osm) or float(osm) <= 0:
+        if pd.isna(osm) or float(osm) <= 0:
             eff = target
         else:
             eff = min(target, float(osm))
@@ -757,10 +740,6 @@ def _apply_coefs_and_save(
             out_edge_dfs.append(pd.DataFrame.from_dict({
                 edge_duration_attr: durations,
                 f'effective_speed_kph_{profile}': eff_speed,
-                # Per-edge naive baseline duration (length / baseline_speed).
-                # For car: baseline = OSM speed_kph. For walk/bike: uniform
-                # `cfg.baseline_speed_kph`. Used by 05 for the naive-routing
-                # comparison in technical_validation/times_vs_* scripts.
                 f'duration_baseline_{profile}': baseline_durations,
             }))
 

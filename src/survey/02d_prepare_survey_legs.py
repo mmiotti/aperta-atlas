@@ -1,11 +1,17 @@
 """
-Prepare survey trip legs for the Swiss Urban Mobility Atlas — takes a
+Prepare survey trip legs for the Aperta Accessibility Atlas — takes a
 standardized survey source and produces a scenario-scoped legs table for
 the downstream survey scripts (05, 08a–c) and the calibration stages.
 
 One variant per leg set (`main.common.SURVEY_LEG_SETS`):
-  - `mtmc` (default): MZMV 2015 + 2021 → `survey_legs.csv`, the canonical
-    set read by 03a, 07a/b, 09a, survey/05–08c and the validation scripts.
+  - `mtmc` (default): MZMV 2015 + 2021 → `survey_legs.csv`, the legs read by 03a.
+  - `mtmc_trips`: the same legs as door-to-door trips (`main.common.
+    survey_trips`: main mode plus walking, or transit plus feeder legs) →
+    `survey_trips.csv`, read (with its survey/05 and 08a outputs) by 07a/b,
+    09a and the validation of the times. Each trip is snapped and
+    located at its ends, like a leg. Its legs are filtered by scope only (in
+    Switzerland, a modeled mode); plausibility is checked on the whole trip
+    (`main.common.TRIP_QUALITY_FLAGS`), not on each leg as for the legs.
   - `mobis_precovid` / `mobis_covid`: validation-only MOBIS GPS legs → a
     fixed-seed random sample of 100k legs in `survey_legs_<leg_set>.csv`.
     Keep the cohorts apart: precovid is normal traffic (and car's training
@@ -38,11 +44,13 @@ Inputs (scenario storage, under `<scenario>/`):
 
 Output (PRIVATE, under `<scenario>/`):
     generic/survey_legs.csv                  # mtmc
+    generic/survey_trips.csv                 # mtmc_trips
     generic/survey_legs_<leg_set>.csv        # MOBIS leg sets
 
 Run (default variant `mtmc`):
     python -m survey.02d_prepare_survey_legs --scenario <name>
-MOBIS validation leg set:
+Trip set, or a MOBIS validation leg set:
+    python -m survey.02d_prepare_survey_legs --scenario <name> --variant mtmc_trips
     python -m survey.02d_prepare_survey_legs --scenario <name> --variant mobis_precovid
 """
 
@@ -56,7 +64,7 @@ from aperta_atlas.context import Storage, init_context
 from aperta_atlas.utils import step
 from aperta_atlas.variant import Variants
 
-from main.common import SURVEY_LEG_SETS, survey_file
+from main.common import MOBIS_LEG_SETS, SURVEY_LEG_SETS, TRIP_SET, survey_file, survey_trips
 from preparation.switzerland.private.surveys.common import MODES_MODE_CHOICE_MODEL
 from scenarios import get_scenario, scenario_needs_survey_prep
 
@@ -73,8 +81,7 @@ _MOBIS_SAMPLE_SEED = 0
 # cell snap radius where that is larger (sparse networks).
 _MAX_SNAP_RADIUS = 500.0
 
-# Snap-eligibility setup — must match 02a so survey snaps land on the
-# same SCC subset cells were snapped to.
+# Snap-eligibility setup, as in 02a.
 _DIRECTEDNESS = 'directed_scc'
 
 # Columns kept from each year's legs.csv. `sd_*` numeric columns are
@@ -94,12 +101,16 @@ _KEEP_COLS = [
     'is_within_speed_envelope',
     'is_within_detour_envelope',
     'is_within_gap_envelope',
+    'is_valid_dist_time',          # main-mode legs of the trip set (main.common.survey_trips)
+    # Local clock times: trip-level door-to-door time incl. waiting between legs
+    # (main.common.survey_trips) and timetable-based transit routing (survey/08d).
+    'datetime_departure', 'datetime_arrival',
+    # Conditions at departure (standardize.attach_daylight_and_season); not used by the
+    # models yet.
+    'is_daylight', 'is_late_night', 'season',
 ]
-# Kept when present (MZMV only; MOBIS legs carry `started_at` instead):
-# departure / arrival times — trip-level door-to-door time incl. waiting
-# between legs (main.common.aggregate_transit_trips) and timetable-based
-# transit routing (survey/08d).
-_KEEP_COLS_OPTIONAL = ['datetime_departure', 'datetime_arrival']
+# Kept for the trip set only (MTMC legs; `survey_trips` takes them from the main leg).
+_TRIP_KEEP_COLS = ['mode_is_passenger']
 
 
 def _load_legs(surveys_ctx, survey_name: str) -> pd.DataFrame:
@@ -107,9 +118,6 @@ def _load_legs(surveys_ctx, survey_name: str) -> pd.DataFrame:
     with an int `year`."""
     legs = surveys_ctx.get_generic(
         f'{survey_name}/legs.csv', storage=Storage.PRIVATE)
-    if legs.index.name != 'leg_id':
-        # MOBIS files lead with an `id_column`, so `get_generic`'s first-column index isn't leg_id.
-        legs = legs.set_index('leg_id', verify_integrity=True)
     if survey_name.startswith('mzmv_'):
         legs['year'] = int(survey_name.split('_')[-1])
     return legs
@@ -154,17 +162,21 @@ def main(variant):
         # `is_land_based` is defense-in-depth: the mode filter already
         # excludes plane / boat / aerialway, but taxonomy changes can't
         # sneak non-land modes through. `is_within_elevation_band` gates
-        # on DEM validity + alpine exclusion (standardize.py), as in 04
-        # and 07a. Envelope flags are kept, not filtered on (see `_KEEP_COLS`).
-        legs = legs.loc[
-            (legs['is_valid_domestic_trip'] == 1)
-            & (legs['is_land_based'] == 1)
-            & (legs['is_within_elevation_band'] == 1)
-            & legs['mode_simplified'].isin(MODES_MODE_CHOICE_MODEL)
-        ].copy()
+        # on DEM validity + alpine exclusion (standardize.py), as in 04.
+        # Envelope flags are kept, not filtered on (see `_KEEP_COLS`). The trip
+        # set filters its legs by scope only: a leg's distance, time or
+        # elevation does not invalidate the trip (`main.common.survey_trips`).
+        keep = ((legs['is_land_based'] == 1)
+                & legs['mode_simplified'].isin(MODES_MODE_CHOICE_MODEL))
+        if leg_set == TRIP_SET:
+            keep &= legs['is_in_switzerland'] == 1
+        else:
+            keep &= ((legs['is_valid_domestic_trip'] == 1)
+                     & (legs['is_within_elevation_band'] == 1))
+        legs = legs.loc[keep].copy()
         logging.info(f"  → {len(legs):,} / {before:,} legs kept")
 
-    if leg_set != 'mtmc' and len(legs) > _MOBIS_SAMPLE_N:
+    if leg_set in MOBIS_LEG_SETS and len(legs) > _MOBIS_SAMPLE_N:
         with step(f'random sample of {_MOBIS_SAMPLE_N:,} legs (validation-only leg set)'):
             legs = legs.sample(n=_MOBIS_SAMPLE_N, random_state=_MOBIS_SAMPLE_SEED)
             logging.info(f"  → modes: {legs['mode_simplified'].value_counts().to_dict()}")
@@ -174,9 +186,9 @@ def main(variant):
             c for c in legs.columns
             if c.startswith('sd_') and pd.api.types.is_numeric_dtype(legs[c])
         ]
-        optional = [c for c in _KEEP_COLS_OPTIONAL if c in legs.columns]
-        cols = (_KEEP_COLS + optional + sd_cols
-                + (['year'] if 'year' in legs.columns else []))
+        cols = _KEEP_COLS + sd_cols + (['year'] if 'year' in legs.columns else [])
+        if leg_set == TRIP_SET:
+            cols += _TRIP_KEEP_COLS
         missing = [c for c in cols if c not in legs.columns]
         if missing:
             raise KeyError(f"Expected columns missing from legs: {missing}")
@@ -184,16 +196,20 @@ def main(variant):
         logging.info(f"  → {len(legs.columns)} columns "
                      f"({len(sd_cols)} sd_* numeric)")
 
-    orig_pts = _points_from_xy(legs, 'orig_x', 'orig_y', crs_main)
-    dest_pts = _points_from_xy(legs, 'dest_x', 'dest_y', crs_main)
+    if leg_set == TRIP_SET:
+        # From here on, each row is a trip: snapped and located at its ends.
+        with step('aggregate legs → door-to-door trips (main.common.survey_trips)'):
+            legs = survey_trips(legs)
+
+    endpoints = {e: _points_from_xy(legs, f'{e}_x', f'{e}_y', crs_main)
+                 for e in ('orig', 'dest')}
 
     # -------- Per-mode snap (orig + dest) ---------------------------------
     max_snap_radius = max(_MAX_SNAP_RADIUS, scenario.snap.max_cell_radius_m)
     modes = [m for m in _MODES if m in scenario.mode_configs]
     for mode in modes:
         with step(f'mode={mode}: load graph + compute snap-eligible nodes'):
-            # `add_edge_properties='core'` re-attaches the `cost_excluded_<mode>`
-            # flag 02a wrote, so we derive the same SCC subset cells used.
+            # `core` edge properties carry 02a's `cost_excluded_<mode>` flags.
             graph = context.get_nw(
                 data_name=mode,
                 add_node_properties='core',
@@ -208,7 +224,7 @@ def main(variant):
                 f"snap-eligible {len(snap_eligible):,} "
                 f"({100*len(snap_eligible)/graph.number_of_nodes():.1f} %)")
 
-        for endpoint, pts in [('orig', orig_pts), ('dest', dest_pts)]:
+        for endpoint, pts in endpoints.items():
             with step(f'mode={mode}: snap {endpoint}'):
                 ids, dists = network_snap.snap_to_network_nodes(
                     pts, graph,
@@ -225,7 +241,7 @@ def main(variant):
         zones = context.get_shapes('zones').to_crs(crs_main)
         logging.info(f"  → {len(cells):,} cells, {len(zones):,} zones")
 
-    for endpoint, pts in [('orig', orig_pts), ('dest', dest_pts)]:
+    for endpoint, pts in endpoints.items():
         with step(f'{endpoint}: assign cell + zone (within only; foreign → NaN)'):
             cell_ids, _ = geo_mapping.map_points_to_polygons(pts, cells, allow_nearest=True,
                                                              max_distance=500)

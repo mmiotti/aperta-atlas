@@ -40,16 +40,17 @@ The framework half (use any subset; nothing requires all of them):
 The OSM-aware / domain-helper half (used by the preparation scripts in
 this repo; not strictly part of the framework):
 
-- `aperta_atlas.osm`               — OSM tag conventions, highway-rank
-                                     dict, consolidation cleanup,
-                                     graphml dtype handling.
+- `aperta_atlas.osm`               — OSM tag conventions (way usability,
+                                     sidepaths, surface, maxspeed, bike
+                                     stress), highway ranks, consolidation
+                                     cleanup.
 - `aperta_atlas.graph_simplification` — PBF-pipeline graph cleanup
                                      (collapse degree-2 chains, prune
                                      short dead ends).
 - `aperta_atlas.dasymetric`        — Building-level allocation of
                                      spatial-unit data (e.g. STATPOP).
-- `aperta_atlas.stats_helpers`     — Bin-edge helpers for the
-                                     traffic-flow calibration.
+- `aperta_atlas.stats_helpers`     — Collinearity warning for the
+                                     dasymetric NNLS fits.
 - `aperta_atlas.routing_mp`        — Multi-process Dijkstra wrapper
                                      using fork-based COW graph sharing.
 

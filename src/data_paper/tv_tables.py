@@ -16,8 +16,8 @@ Technical Validation tables in the data descriptor (`papers/atlas-pipeline`):
                  for walking and cycling, then each `network` scenario (car; left
                  out until its comparison has run)
     cv           R²_1:1 and R²_fit per test region, by cost × metric; utility also in
-                 time-equivalent units (each side divided by its marginal utility of
-                 time at the reference time)
+                 time-equivalent units (each side divided by its mean marginal
+                 utility of time between 15 and 25 min)
     cv_coefs     selected coefficients (`_CV_COEFS`) per mode, fitted on all of
                  Switzerland (headline scenario) and on each cv training region
     utility      the headline scenario's mode-choice coefficients with
@@ -29,8 +29,7 @@ profile; its own count bins, not summed) instead, as its grid has no reach
 categories. Counts are compared cumulatively from 0 (`access_vs_reference.
 column_stats`); columns outside the reach categories (e.g. single bins beyond the
 first) are dropped, and so are transit counts up to 10 min, which are almost
-empty (door-to-door transit times include access and waiting). The fast e-bike
-is left out of the cv table (see the paper).
+empty (door-to-door transit times include access and waiting).
 
 Inputs (RESULTS, under the headline scenario):
     technical_validation/access_exact_<n>_columns.csv
@@ -58,6 +57,7 @@ import os
 import pandas as pd
 
 from aperta_atlas.context import Storage, init_context
+from main.common import piecewise_time_coefs, time_utility
 
 import scenarios  # noqa: F401 — load first: it imports scenarios_technical_validation
 from scenarios import get_scenario
@@ -67,7 +67,6 @@ _REACHES = ('local', 'medium', 'broad')
 _METRICS = {'counts': 'Counts', 'gravity': 'Gravity', 'nearest_k': 'Nearest-$k$'}
 _COSTS = {'time': 'Time', 'util': 'Utility', 'util_min': 'Utility, in minutes'}
 _EMPTY_BINS = {'transit': ('0_10min',)}
-_CV_EXCLUDED_PROFILES = ('ebike45',)
 _DATA_DESTS = {'population': 'population_total', 'employment': 'employment_total'}
 _NETWORK_FREE_PROFILES = ('rwalk', 'rbike')
 
@@ -76,18 +75,17 @@ _P = {'walk': 'walk', 'bike': 'rbike', 'transit': 'transit', 'car': 'car'}
 
 
 def _time_utility(t_min: float):
-    """Time part of the utility at `t_min`: constant + β_t·(t − T) +
-    β_ln·log(t / T), with the reference time T stored by 09a (walk: reference
-    mode, no constant), on the zero point of the released utilities (a 1-min
-    walk; see `main.common.build_disutility_spec`). Shows level and steepness
-    in one number per time."""
+    """Time part of the utility at `t_min`: constant + f(t) − f(T), with `f` the
+    piecewise-linear time term and the reference time T stored by 09a (walk:
+    reference mode, no constant), on the zero point of the released utilities (a
+    zero-length walk; see `main.common.build_disutility_spec`). Shows level and
+    steepness in one number per time."""
     def value(coefs: dict[str, pd.DataFrame], mode: str) -> float:
         u, m = coefs['utility_default']['value'], _P[mode]
         asc = u[f'asc_{m}'] if f'asc_{m}' in u.index else 0.0
         t_ref = u['t_ref_min']
-        walk_offset = u['b_time_walk'] * t_ref + u['b_time_log_walk'] * math.log(t_ref)
-        return (asc + u[f'b_time_{m}'] * (t_min - t_ref)
-                + u[f'b_time_log_{m}'] * math.log(t_min / t_ref) + walk_offset)
+        return float(asc + time_utility(u, m, t_min) - time_utility(u, m, t_ref)
+                     + time_utility(u, 'walk', t_ref))
     return value
 
 
@@ -121,19 +119,20 @@ _REGION_LABELS = {'cv-de-train': 'German-speaking', 'cv-fr-train': 'French-speak
 _UTILITY_ROWS: list[list[tuple[str, dict[str, str], int]]] = [
     [('Alternative-specific constant',
       {m: f'asc_{_P[m]}' for m in ('bike', 'transit', 'car')}, 3),
-     ('\\quad shift, peak hours', {'car': 'asc_car_peak'}, 3),
-     ('\\quad shift, night hours', {'car': 'asc_car_night'}, 3),
-     ('Time (min)', {m: f'b_time_{_P[m]}' for m in _CV_MODES}, 4),
-     ('Log(time)', {m: f'b_time_log_{_P[m]}' for m in _CV_MODES}, 3)],
+     # + one row per time band (`_time_rows`, from the coefficient names)
+     ],
     [('Density (normalized)',
       {m: f'b_density_r500_norm_od_{_P[m]}' for m in ('bike', 'transit', 'car')}, 3),
-     ('Mean absolute slope (m/m)',
+     ('Mean absolute slope (\\%)',
       {m: f'b_mean_abs_slope_r250_od_{_P[m]}' for m in ('walk', 'bike', 'transit')}, 3),
-     ('Speed limit (km/h)', {'bike': 'b_speed_limit_avg_r250_od_rbike'}, 3),
+     ('Speed limit (10 km/h)',
+      {m: f'b_speed_limit_avg_r250_od_{_P[m]}' for m in ('bike', 'transit', 'car')}, 3),
      ('Traffic volume (10,000 veh/day)',
       {m: f'b_traffic_flow_avg_r250_od_{_P[m]}' for m in ('bike', 'transit', 'car')}, 3),
-     ('Bicycle-infrastructure score',
-      {m: f'b_bike_infra_score_avg_r250_od_{_P[m]}' for m in ('walk', 'bike', 'transit')}, 3)],
+     ('Cycling stress 0--1 (share)',
+      {m: f'b_bike_stress_share_01_r250_od_{_P[m]}' for m in ('bike', 'transit', 'car')}, 3),
+     ('Cycling stress 4--5 (share)',
+      {m: f'b_bike_stress_share_45_r250_od_{_P[m]}' for m in ('bike', 'transit', 'car')}, 3)],
     [(label, {m: f'b_sd_{key}_{_P[m]}' for m in ('bike', 'transit', 'car')}, 3)
      for label, key in (('Male', 'cat_sex_m'), ('Age 7--13', 'cat_age_7to13'),
                         ('Age 14--18', 'cat_age_14to18'), ('Age 19--25', 'cat_age_19to25'),
@@ -247,10 +246,10 @@ def _data(context, plan) -> list[str]:
             logging.info('data: no network comparison yet (technical_validation.access_tv_groups '
                          '--variant network); its columns are left out')
     stats = {}
+    nf = _load(context, 'access_network_free')
     for value in ('R²_1to1', 'slope'):
         s = {col: _by_mode(c[(c['target'] == col[0]) & (c['dest'] == col[1])], [], value)
              for col in columns}
-        nf = _load(context, 'access_network_free')
         s.update({('no network', p): _by_mode(nf[nf['profile'] == p], [], value)
                   for p in _NETWORK_FREE_PROFILES})
         if network is not None:
@@ -274,9 +273,7 @@ def _cv(context, plan) -> list[str]:
     # `<grid>_min`: utility-based columns in time-equivalent units (access_tv_groups).
     c['cost'] = c['grid'].map(
         lambda g: 'util_min' if g.endswith('_min') else 'util' if 'util' in g else 'time')
-    if 'summed' in c.columns:   # the cv table pools the grid's own bins
-        c = c[~c['summed'].astype(bool)]
-    c = c[~c['profile'].isin(_CV_EXCLUDED_PROFILES)]
+    c = c[~c['summed'].astype(bool)]   # the cv table pools the grid's own bins
     targets = [t for t, _ in plan.groups['cv']]
     logging.info(f'cv columns: {targets} × (R²_1:1, R²_fit)')
     med = c.groupby(['cost', 'metric', 'target'])[['R²_1to1', 'R²_fit']].median()
@@ -321,15 +318,29 @@ def _cv_coefs(context, regions: dict[str, str]) -> list[str]:
     return lines
 
 
+def _time_rows(coefs: pd.DataFrame) -> list[tuple[str, dict[str, str], int]]:
+    """One row per time band of the piecewise-linear time term (slopes per minute; bands
+    read from the coefficient names), ordered by the band's end, then its start."""
+    bands: dict[tuple[float, float], dict[str, str]] = {}
+    for mode in _CV_MODES:
+        knots, _, names = piecewise_time_coefs(coefs['value'], _P[mode])
+        for lo, hi, name in zip(knots, [*knots[1:], math.inf], names):
+            bands.setdefault((lo, hi), {})[mode] = name
+    return [(f'Time, $>$ {lo:g}~min' if math.isinf(hi) else f'Time, {lo:g}--{hi:g}~min',
+             names, 4)
+            for (lo, hi), names in sorted(bands.items(), key=lambda b: (b[0][1], b[0][0]))]
+
+
 def _utility(context) -> list[str]:
     """Coefficients with stars (*** p < 0.001, ** p < 0.01, * p < 0.05, robust)."""
     coefs = context.get_coefs('utility_default')
-    shown = {name for group in _UTILITY_ROWS for _, names, _ in group for name in names.values()}
+    groups = [_UTILITY_ROWS[0] + _time_rows(coefs), *_UTILITY_ROWS[1:]]
+    shown = {name for group in groups for _, names, _ in group for name in names.values()}
     missing = sorted(set(coefs.index) - shown - {'t_ref_min'})
     if missing:
         logging.warning(f'utility parameters not in the table: {missing}')
     lines = []
-    for i, group in enumerate(_UTILITY_ROWS):
+    for i, group in enumerate(groups):
         if i:
             lines.append('\\midrule')
         for label, names, digits in group:

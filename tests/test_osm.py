@@ -1,12 +1,7 @@
-"""Tests for `aperta_atlas.osm` — OSM-specific post-consolidation helpers.
+"""Tests for `aperta_atlas.osm` — OSM tag rules and post-consolidation helpers.
 
 Run with (from the aperta-atlas repo root):
     python -m unittest discover -s tests -t .
-
-`clean_consolidated_edges` + `lanes_per_direction` were moved here from
-`aperta.network_processing` on 2026-06-05: the `lanes` / `oneway`
-semantics they rely on are OSM conventions, so the public helpers belong
-in aperta-atlas's OSM-aware layer rather than in the algorithm library.
 """
 
 import unittest
@@ -165,25 +160,11 @@ class CleanConsolidatedEdgesTestCase(unittest.TestCase):
 
 
 # =====================================================================
-# Tests moved from aperta/tests/test_network_processing.py 2026-06-07
-# as part of the sweeping cleanup that pushed all OSM-aware code to
-# aperta-atlas. These exercise `flag_node_osm_classification`,
-# `consolidate_intersections`, and `load_consolidated_graphml` —
-# all now in `aperta_atlas.osm`.
+# `flag_node_osm_classification`
 # =====================================================================
 
-import warnings
-import geopandas as gpd
-import numpy as np
-import pandas as pd
-from shapely.geometry import LineString as _LineString, Point, box  # noqa: F401
-
 from aperta.network_processing import flag_node_intersection_topology
-from aperta_atlas.osm import (
-    consolidate_intersections,
-    flag_node_osm_classification,
-    load_consolidated_graphml,
-)
+from aperta_atlas.osm import flag_node_osm_classification
 
 
 def _flag_all(g):
@@ -196,8 +177,7 @@ class FlagNodeIntersectionsTestCase(unittest.TestCase):
     """`flag_node_intersection_topology` + `flag_node_osm_classification`
     write per-node attributes describing intersection type (`n_streets`,
     `is_t_junction`, `is_4way`), their rank-conditional variants (`_major`,
-    `_anchor`), and per-node max / min OSM highway-rank. Obstacle flags
-    (traffic signals etc.) live in `consolidate_intersections`, not here.
+    `_anchor`), and per-node max / min OSM highway-rank.
     """
 
     def _graph(self) -> nx.MultiDiGraph:
@@ -367,329 +347,288 @@ class FlagNodeIntersectionsTestCase(unittest.TestCase):
             self.assertEqual(g.nodes["B"][flag], 0.0, f"{flag} should be 0 for passthrough")
 
 
-class ConsolidateIntersectionsTestCase(unittest.TestCase):
-    """`consolidate_intersections` wraps `osmnx.consolidate_intersections`,
-    plus reattaches obstacle flags (traffic signals, stops, roundabouts)
-    that OSMnx alone would drop when their host nodes are merged away.
-    """
-
-    def _graph_with_signal_and_roundabout(self) -> nx.MultiDiGraph:
-        """4-arm intersection at (1000, 1000) with a traffic_signal node 5 m
-        offset (typical OSM pattern — signals tagged on the approach, not
-        the centre). Separately, a small roundabout (two nodes 11 m apart,
-        connected by a `junction=roundabout` edge) at (2000, 2000).
-        """
-        g = nx.MultiDiGraph(crs="EPSG:2056")
-        g.add_node(1, x=1000.0, y=1000.0)
-        for n, (x, y) in zip([2, 3, 4, 5], [(1100, 1000), (900, 1000), (1000, 1100), (1000, 900)]):
-            g.add_node(n, x=float(x), y=float(y))
-        # Signal sits 5√2 ≈ 7 m east-northeast of the intersection centre.
-        g.add_node(6, x=1005.0, y=1005.0, highway="traffic_signals")
-        for u, v in [(1, 2), (1, 3), (1, 4), (1, 5)]:
-            g.add_edge(u, v)
-            g.add_edge(v, u)
-        # East arm goes through the signal node.
-        g.add_edge(2, 6)
-        g.add_edge(6, 1)
-        g.add_edge(1, 6)
-        g.add_edge(6, 2)
-        # Roundabout: two nodes ~11 m apart with junction=roundabout edges.
-        g.add_node(10, x=2000.0, y=2000.0)
-        g.add_node(11, x=2010.0, y=2005.0)
-        g.add_edge(10, 11, junction="roundabout")
-        g.add_edge(11, 10, junction="roundabout")
-        return g
-
-    def test_signal_reallocated_to_consolidated_node(self):
-        """The off-centre traffic_signal node is dropped during consolidation
-        but its flag re-attaches to the consolidated 4-way intersection."""
-        g = self._graph_with_signal_and_roundabout()
-        consolidated = consolidate_intersections(g, tolerance=20.0, obstacle_buffer=30.0)
-        # Find the consolidated central intersection (degree ≥ 4 near 1000,1000).
-        central = None
-        for nid, d in consolidated.nodes(data=True):
-            if abs(d["x"] - 1000) < 30 and abs(d["y"] - 1000) < 30 and d.get("is_4way") == 1.0:
-                central = nid
-                break
-        self.assertIsNotNone(central, "no consolidated 4-way intersection found")
-        self.assertEqual(consolidated.nodes[central]["is_traffic_signal"], 1.0)
-
-    def test_roundabout_detected_from_edge_tag(self):
-        """A node consolidated from a `junction=roundabout` edge is flagged."""
-        g = self._graph_with_signal_and_roundabout()
-        consolidated = consolidate_intersections(g, tolerance=20.0, obstacle_buffer=30.0)
-        rb_nodes = [
-            nid for nid, d in consolidated.nodes(data=True) if d.get("is_roundabout") == 1.0
-        ]
-        self.assertEqual(len(rb_nodes), 1)
-        self.assertAlmostEqual(consolidated.nodes[rb_nodes[0]]["x"], 2005, delta=10)
-        self.assertAlmostEqual(consolidated.nodes[rb_nodes[0]]["y"], 2002.5, delta=10)
-
-    def test_non_intersection_nodes_have_zero_flags(self):
-        """Arm-tip nodes (degree 1 in the original) carry no obstacle flags."""
-        g = self._graph_with_signal_and_roundabout()
-        consolidated = consolidate_intersections(g, tolerance=20.0, obstacle_buffer=30.0)
-        # Whichever nodes ended up near the arm tips (not within tolerance of
-        # the centre) should have all flags 0.
-        for nid, d in consolidated.nodes(data=True):
-            if abs(d["x"] - 1000) > 50 and abs(d["x"] - 2005) > 30:
-                self.assertEqual(d.get("is_traffic_signal", 0.0), 0.0)
-                self.assertEqual(d.get("is_roundabout", 0.0), 0.0)
-
-    def test_obstacle_buffer_excludes_far_signals(self):
-        """A signal further than `obstacle_buffer` is NOT attached."""
-        g = self._graph_with_signal_and_roundabout()
-        # With buffer=2 m the signal at (1005,1005) is too far from the
-        # consolidated central node at ~(1001,1001).
-        consolidated = consolidate_intersections(g, tolerance=20.0, obstacle_buffer=2.0)
-        any_signal = any(
-            d.get("is_traffic_signal") == 1.0 for _, d in consolidated.nodes(data=True)
-        )
-        self.assertFalse(any_signal)
+from aperta_atlas.osm import is_usable  # noqa: E402
 
 
-class GraphmlBoolRoundtripTestCase(unittest.TestCase):
-    """Bool-typed per-mode flags (`is_snap_eligible_<mode>`,
-    `cost_excluded_<mode>`, `is_virtual`) round-trip through .graphml as
-    integers (0 / 1), not the literal strings 'True' / 'False' — thanks to
-    the prefix-scan dtype helper in `load_consolidated_graphml`."""
+class AccessOverrideTestCase(unittest.TestCase):
+    """A mode-specific tag overrides `access=no|private` (OSM access hierarchy)."""
 
-    def _g(self) -> nx.MultiDiGraph:
+    def test_closed_to_cars_open_to_bikes_and_walkers(self):
+        tags = {"highway": "residential", "access": "no", "bicycle": "yes", "foot": "yes"}
+        self.assertTrue(is_usable(tags, "bike"))
+        self.assertTrue(is_usable(tags, "walk"))
+        self.assertFalse(is_usable(tags, "drive"))
+
+    def test_plain_access_no_still_excludes(self):
+        tags = {"highway": "service", "access": "private"}
+        for mode in ("walk", "bike", "drive"):
+            self.assertFalse(is_usable(tags, mode))
+
+    def test_explicit_no_wins(self):
+        self.assertFalse(is_usable({"highway": "track", "access": "no", "bicycle": "no"}, "bike"))
+
+    def test_drive_needs_general_traffic(self):
+        self.assertTrue(is_usable(
+            {"highway": "residential", "access": "no", "motor_vehicle": "destination"}, "drive"))
+        self.assertFalse(is_usable(
+            {"highway": "unclassified", "access": "no", "motor_vehicle": "forestry"}, "drive"))
+
+
+class MountainTrailsTestCase(unittest.TestCase):
+    """Mountain-hiking trails are not in the bike network unless in a mountain-bike route."""
+
+    def test_sac_scale(self):
+        trail = {"highway": "path", "sac_scale": "mountain_hiking", "bicycle": "yes"}
+        self.assertFalse(is_usable(trail, "bike"))
+        self.assertTrue(is_usable(trail, "walk"))
+        self.assertTrue(is_usable({**trail, "mtb_route": "yes"}, "bike"))
+        self.assertTrue(is_usable({"highway": "path", "sac_scale": "hiking"}, "bike"))
+
+    def test_via_ferrata(self):
+        for mode in ("walk", "bike"):
+            self.assertFalse(is_usable({"highway": "via_ferrata"}, mode))
+
+
+from aperta_atlas.osm import (  # noqa: E402
+    bike_push, bike_stress, bike_stress_beside, cycleway_in_direction, lanes_in_direction,
+    parse_maxspeed_kmh, surface_type,
+)
+
+
+class SurfaceTypeTestCase(unittest.TestCase):
+
+    def test_values(self):
+        cases = [({"surface": "asphalt"}, "paved"), ({"surface": "sett"}, "cobble"),
+                 ({"surface": "gravel"}, "unpaved_smooth"),
+                 ({"surface": "dirt"}, "unpaved_rough"),
+                 ({"tracktype": "grade1"}, "paved"), ({"tracktype": "grade2"}, "unpaved_smooth"),
+                 ({"tracktype": "grade4"}, "unpaved_rough"),
+                 ({"surface": "asphalt", "tracktype": "grade4"}, "paved"),    # surface first
+                 ({"surface": "asphalt;gravel", "tracktype": "grade3"}, "unpaved_rough"),
+                 # smoothness decides for unpaved ways only
+                 ({"surface": "gravel", "smoothness": "bad"}, "unpaved_rough"),
+                 ({"surface": "ground", "smoothness": "intermediate"}, "unpaved_smooth"),
+                 ({"surface": "asphalt", "smoothness": "bad"}, "paved"),
+                 # merged edges: the first value with a type
+                 ({"surface": [float("nan"), "gravel"], "smoothness": ["bad"]}, "unpaved_rough"),
+                 ({"surface": "asphalt;gravel"}, None), ({"surface": float("nan")}, None),
+                 ({"highway": "track"}, None)]
+        for tags, expected in cases:
+            self.assertEqual(surface_type(tags), expected, msg=tags)
+
+
+class CyclewayInDirectionTestCase(unittest.TestCase):
+    """Which direction a side-specific bike lane serves."""
+
+    def both(self, tags, **kw):
+        return (cycleway_in_direction(tags, True, **kw), cycleway_in_direction(tags, False, **kw))
+
+    def test_two_way(self):
+        self.assertEqual(self.both({"cycleway:right": "lane"}), ("lane", "no"))
+        self.assertEqual(self.both({"cycleway:right": "lane"}, left_hand_traffic=True),
+                         ("no", "lane"))
+        self.assertEqual(self.both({"cycleway:left": "track", "cycleway:right": "lane"}),
+                         ("lane", "track"))
+        self.assertEqual(self.both({"cycleway": "lane"}), ("lane", "lane"))
+        self.assertEqual(self.both({"cycleway:both": "separate"}), ("no", "no"))
+
+    def test_one_way(self):
+        one_way = {"oneway": "yes", "oneway:bicycle": "no"}
+        self.assertEqual(self.both({**one_way, "cycleway:right": "lane",
+                                    "cycleway:left": "opposite_lane"}), ("lane", "opposite_lane"))
+        self.assertEqual(self.both({**one_way, "cycleway:left": "lane"}), ("no", "lane"))
+        self.assertEqual(self.both({"oneway": "yes", "cycleway:left": "lane"}), ("lane", "no"))
+        self.assertEqual(self.both({**one_way, "cycleway": "opposite"}), ("no", "opposite"))
+        self.assertEqual(self.both({"oneway": "-1", "cycleway:right": "lane"}), ("no", "lane"))
+        # oneway=-1: traffic runs against the way, so its traffic side is the way's left
+        self.assertEqual(self.both({"oneway": "-1", "cycleway:left": "lane"}), ("no", "lane"))
+        self.assertEqual(self.both({"oneway": "-1", "oneway:bicycle": "no",
+                                    "cycleway:right": "lane"}), ("lane", "no"))
+
+
+
+class MaxspeedTestCase(unittest.TestCase):
+
+    def test_values(self):
+        cases = {"50": 50, "30 mph": 30 * 1.609344, "CH:urban": 50, "CH:rural": 80,
+                 "DE:rural": 100, "CH:zone30": 30, "GB:nsl_single": 60 * 1.609344,
+                 "50;80": 80, "80": 80}
+        for raw, kmh in cases.items():
+            self.assertAlmostEqual(parse_maxspeed_kmh(raw), kmh, places=3, msg=raw)
+        for raw in (None, float("nan"), "", "signals", "0", 0.0, "0 mph"):
+            self.assertIsNone(parse_maxspeed_kmh(raw))
+
+
+class BikeStressTestCase(unittest.TestCase):
+    """Bike traffic stress, 0 (none) to 5 (very high)."""
+
+    def test_mixed_traffic(self):
+        self.assertEqual(bike_stress({"highway": "residential"}), 2)          # untagged: quiet
+        self.assertEqual(bike_stress({"highway": "residential", "maxspeed": "50"}), 3)
+        self.assertEqual(bike_stress({"highway": "tertiary", "maxspeed": "30"}), 3)
+        self.assertEqual(bike_stress({"highway": "secondary"}), 4)           # untagged main: 50
+        self.assertEqual(bike_stress({"highway": "secondary", "lanes_dir": 2.0}), 5)
+        self.assertEqual(bike_stress({"highway": "primary", "maxspeed": "80"}), 5)
+        self.assertEqual(bike_stress({"highway": "unclassified", "maxspeed": "80"}), 3)
+        self.assertEqual(bike_stress({"highway": "residential", "lanes_dir": 2.0}), 2)
+        self.assertEqual(bike_stress({"highway": "living_street"}), 1)
+        self.assertEqual(bike_stress({"highway": "residential", "cyclestreet": "yes"}), 1)
+
+    def test_painted_lane(self):
+        self.assertEqual(bike_stress({"highway": "secondary", "cycleway_dir": "lane"}), 3)
+        self.assertEqual(bike_stress({"highway": "secondary", "cycleway_dir": "share_busway"}), 3)
+        self.assertEqual(bike_stress({"highway": "secondary", "cycleway_dir": "no"}), 4)
+        self.assertEqual(bike_stress({"highway": "residential", "cycleway_dir": "lane"}), 1)
+        self.assertEqual(bike_stress(
+            {"highway": "tertiary", "maxspeed": "30", "cycleway_dir": "lane"}), 2)
+        self.assertEqual(bike_stress(
+            {"highway": "primary", "maxspeed": "CH:rural", "cycleway_dir": "lane"}), 4)
+        self.assertEqual(bike_stress(                       # sharrows are mixed traffic
+            {"highway": "secondary", "cycleway_dir": "shared_lane"}), 4)
+
+    def test_separated_by_road_beside(self):
+        self.assertEqual(bike_stress({"highway": "cycleway"}), 0)
+        self.assertEqual(bike_stress({"highway": "cycleway"}, beside=3), 3)
+        self.assertEqual(bike_stress({"highway": "secondary", "cycleway_dir": "track"}), 2)
+        self.assertEqual(bike_stress_beside({"highway": "residential"}), 0)
+        self.assertEqual(bike_stress_beside({"highway": "primary"}), 2)
+        self.assertEqual(bike_stress_beside({"highway": "primary", "maxspeed": "80"}), 3)
+
+    def test_one_way_and_climb_move_one_row(self):
+        street = {"highway": "residential"}                          # row (0, 1, 2)
+        self.assertEqual(bike_stress({**street, "oneway_motor": 1.0}), 1)
+        self.assertEqual(bike_stress(street, slope=0.06), 3)
+        self.assertEqual(bike_stress(street, slope=0.04), 2)         # below the threshold
+        self.assertEqual(bike_stress(street, slope=-0.08), 2)        # descents are neutral
+        main = {"highway": "secondary", "cycleway_dir": "lane"}      # row (2, 3, 4)
+        self.assertEqual(bike_stress({**main, "oneway_motor": 1.0}), 2)
+        self.assertEqual(bike_stress(main, slope=0.06), 4)
+        self.assertEqual(bike_stress({**main, "oneway_motor": 1.0}, slope=0.06), 3)   # cancel
+        self.assertEqual(bike_stress({"highway": "primary", "maxspeed": "80"}, slope=0.06), 5)
+        self.assertEqual(bike_stress({"highway": "living_street", "oneway_motor": 1.0}), 1)
+
+    def test_separated_gets_no_modifiers(self):
+        track = {"highway": "secondary", "cycleway_dir": "track", "oneway_motor": 1.0}
+        self.assertEqual(bike_stress(track, slope=-0.05), 2)
+        self.assertEqual(bike_stress({"highway": "cycleway"}, beside=2, slope=0.08), 2)
+
+    def test_lanes_in_direction(self):
+        self.assertEqual(lanes_in_direction({"lanes": "4"}, True), 2)
+        self.assertEqual(lanes_in_direction(
+            {"lanes": "5", "lanes:forward": "3", "lanes:backward": "2"}, True), 3)
+        self.assertEqual(lanes_in_direction(                 # minus the bus lane
+            {"lanes": "4", "lanes:bus:forward": "1"}, True), 1)
+        self.assertEqual(lanes_in_direction({"lanes": "2", "oneway": "yes"}, True), 2)
+        self.assertEqual(lanes_in_direction({"lanes": "2", "oneway": "yes"}, False), 0)
+        self.assertIsNone(lanes_in_direction({}, True))
+
+    def test_car_free_road_and_push(self):
+        self.assertEqual(bike_stress(
+            {"highway": "residential", "access": "no", "bicycle": "yes"}), 0)
+        self.assertTrue(bike_push({"highway": "footway"}))
+        self.assertFalse(bike_push({"highway": "footway", "bicycle": "yes"}))
+        self.assertTrue(bike_push({"highway": "residential", "bicycle": "dismount"}))
+        self.assertFalse(bike_push({"highway": ["footway", "residential"]}))
+        self.assertFalse(bike_push({"highway": "path", "bicycle": ["dismount", "designated"]}))
+        # Hard mountain-bike trails, whatever the bike access; a float when read back from CSV.
+        self.assertTrue(bike_push({"highway": "path", "bicycle": "designated", "mtb:scale": "2+"}))
+        self.assertTrue(bike_push({"highway": "track", "mtb:scale": 3.0}))
+        self.assertFalse(bike_push({"highway": "path", "mtb:scale": "1"}))
+        self.assertFalse(bike_push({"highway": "path", "mtb:scale": ["3", "0"]}))
+        self.assertEqual(bike_stress(                       # destination traffic: not car-free
+            {"highway": "residential", "access": "no", "motor_vehicle": "destination"}), 2)
+        self.assertTrue(bike_stress({"highway": "footway"}) != bike_stress({"highway": "footway"}))
+
+
+from aperta_atlas.osm import drop_sidepath_ways  # noqa: E402
+
+
+class DropSidepathWaysTestCase(unittest.TestCase):
+    """A 150 m street in WGS84 near Bern: road A–M–B, a sidewalk SA–SB 8 m north of it,
+    linked to the road at both ends."""
+
+    LAT, DLAT = 46.95, 0.00007                     # 0.00007° latitude ≈ 8 m
+
+    def _graph(self, road_tags, sidewalk_tags, sidewalk_dlat=DLAT, extra=()):
         g = nx.MultiDiGraph(crs="EPSG:4326")
-        for n, (x, y) in {0: (0, 0), 1: (1, 0), 2: (2, 0)}.items():
-            g.add_node(n, x=float(x), y=float(y), osmid=n)
-        g.add_edge(0, 1, key=0, highway="residential", length=1.0)
-        g.add_edge(1, 2, key=0, highway="motorway", length=1.0)
+        pts = {"A": (7.4400, self.LAT), "M": (7.4410, self.LAT), "B": (7.4420, self.LAT),
+               "SA": (7.4400, self.LAT + sidewalk_dlat), "SB": (7.4420, self.LAT + sidewalk_dlat),
+               "X": (7.4410, self.LAT - 0.0005)}
+        for n, (x, y) in pts.items():
+            g.add_node(n, x=x, y=y)
+
+        def way(osmid, nodes, tags):
+            for a, b in zip(nodes, nodes[1:]):
+                for u, v in ((a, b), (b, a)):
+                    g.add_edge(u, v, osmid=osmid, geometry=LineString([pts[u], pts[v]]), **tags)
+
+        way(1, ["A", "M", "B"], road_tags)
+        way(2, ["SA", "SB"], sidewalk_tags)
+        way(3, ["SA", "A"], {"highway": "footway"})
+        way(4, ["SB", "B"], {"highway": "footway"})
+        for osmid, nodes, tags in extra:
+            way(osmid, nodes, tags)
         return g
 
-    def test_bool_flags_roundtrip_as_int(self):
-        import tempfile
+    def _ways(self, g):
+        return sorted({d["osmid"] for *_, d in g.edges(data=True)})
 
-        import osmnx as ox
+    def test_bike_drops_sidewalk_beside_road(self):
+        g = self._graph({"highway": "residential"}, {"highway": "footway", "footway": "sidewalk"})
+        stats = drop_sidepath_ways(g, "bike")
+        self.assertEqual(self._ways(g), [1, 3, 4])
+        self.assertEqual(stats["ways_dropped"], 1)
 
-        from aperta.routing_prep import prepare_network
-        from aperta_atlas.osm import load_consolidated_graphml
+    def test_bike_keeps_sidewalk_with_any_bicycle_tag(self):
+        g = self._graph({"highway": "residential"},
+                        {"highway": "footway", "footway": "sidewalk", "bicycle": "dismount"})
+        drop_sidepath_ways(g, "bike")
+        self.assertEqual(self._ways(g), [1, 2, 3, 4])
 
-        with tempfile.NamedTemporaryFile(suffix=".graphml", delete=False) as tmp:
-            tmp_path = tmp.name
+    def test_bike_keeps_sidewalk_without_road_alongside(self):
+        g = self._graph({"highway": "residential"}, {"highway": "footway", "footway": "sidewalk"},
+                        sidewalk_dlat=0.0004)          # ≈ 45 m away
+        stats = drop_sidepath_ways(g, "bike")
+        self.assertEqual(self._ways(g), [1, 2, 3, 4])
+        self.assertEqual(stats["ways_kept_no_alongside"], 1)
 
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                prepared = prepare_network(self._g(), "walk")
-            # Tag one node as virtual to exercise the is_virtual prefix.
-            prepared.graph.nodes[1]["is_virtual"] = 1
-            ox.save_graphml(prepared.graph, tmp_path)
+    def test_bike_use_sidepath_road_needs_track_alongside(self):
+        road = {"highway": "secondary", "bicycle": "use_sidepath"}
+        g = self._graph(road, {"highway": "cycleway"})
+        drop_sidepath_ways(g, "bike")
+        self.assertEqual(self._ways(g), [2, 3, 4])
+        g = self._graph(road, {"highway": "footway"})   # no bike way beside it: keep the road
+        drop_sidepath_ways(g, "bike")
+        self.assertEqual(self._ways(g), [1, 2, 3, 4])
 
-            loaded = load_consolidated_graphml(tmp_path)
-            # Per-node is_snap_eligible_walk: every node should have a real int.
-            for n in loaded.nodes:
-                val = loaded.nodes[n].get("is_snap_eligible_walk")
-                self.assertIsInstance(val, int, f"node {n} has wrong dtype")
-            # Per-edge cost_excluded_walk: every edge.
-            if loaded.is_multigraph():
-                for _u, _v, _k, d in loaded.edges(keys=True, data=True):
-                    val = d.get("cost_excluded_walk")
-                    self.assertIsInstance(val, int)
-            # is_virtual=1 round-trips as int 1 on node 1.
-            self.assertEqual(loaded.nodes[1].get("is_virtual"), 1)
-        finally:
-            import os
+    def test_bike_keeps_sidewalk_beside_one_way_road(self):
+        """Against a one-way road, pushing on the sidewalk is the only way: keep it."""
+        g = self._graph({"highway": "residential"}, {"highway": "footway", "footway": "sidewalk"})
+        g.remove_edges_from([(v, u) for u, v, d in list(g.edges(data=True)) if d["osmid"] == 1
+                             and (u, v) in (("A", "M"), ("M", "B"))])   # road one-way A→B
+        drop_sidepath_ways(g, "bike")
+        self.assertIn(2, self._ways(g))
 
-            os.unlink(tmp_path)
+    def test_walk_drops_road_with_separate_sidewalks(self):
+        g = self._graph({"highway": "residential", "sidewalk": "separate"},
+                        {"highway": "footway", "footway": "sidewalk"})
+        drop_sidepath_ways(g, "walk")
+        self.assertEqual(self._ways(g), [2, 3, 4])
 
+    def test_road_put_back_if_a_side_road_hangs_on_it(self):
+        """The side road M–X only connects to the road at M, which the sidewalk does not touch."""
+        g = self._graph({"highway": "residential", "sidewalk": "separate"},
+                        {"highway": "footway", "footway": "sidewalk"},
+                        extra=[(5, ["M", "X"], {"highway": "service"})])
+        stats = drop_sidepath_ways(g, "walk")
+        self.assertEqual(self._ways(g), [1, 2, 3, 4, 5])
+        self.assertEqual((stats["ways_dropped"], stats["ways_put_back"]), (0, 1))
 
-# =====================================================================
-# Tests moved from aperta-atlas/tests/test_osm_helpers.py 2026-06-07
-# (file deleted) as part of the final osm_helpers.py cleanup.
-# These exercise `osm_tag_query_for_categories` + `categorize_pois`,
-# both now in `aperta_atlas.osm`.
-# =====================================================================
-
-from aperta_atlas.osm import categorize_pois, osm_tag_query_for_categories
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-CATEGORY_MAP = {
-    "groceries": [
-        ("shop:supermarket", 1.0),
-        ("shop:convenience", 0.5),
-        ("shop:bakery", 0.5),
-    ],
-    "schools": [
-        ("amenity:school", 1.0),
-    ],
-    # Test multi-tag-key category and integer weight.
-    "transit_rail": [
-        ("railway:station", 3),
-        ("railway:halt", 1),
-    ],
-}
-
-
-def _toy_pois() -> gpd.GeoDataFrame:
-    """Six POIs covering: 1 supermarket, 1 convenience (also has a bus stop
-    tag), 1 bakery, 1 school, 1 railway station, 1 unrelated (fuel)."""
-    data = {
-        "amenity": ["fuel", None, None, "school", None, "restaurant"],
-        "shop": [None, "convenience", "bakery", None, None, None],
-        "railway": [None, None, None, None, "station", None],
-        "highway": [None, "bus_stop", None, None, None, None],
-    }
-    geom = [Point(i, 0) for i in range(len(data["amenity"]))]
-    return gpd.GeoDataFrame(
-        data,
-        geometry=geom,
-        index=pd.Index(["p0", "p1", "p2", "p3", "p4", "p5"], name="osm_id"),
-        crs="EPSG:4326",
-    )
-
-
-# ---------------------------------------------------------------------------
-# osm_tag_query_for_categories
-# ---------------------------------------------------------------------------
-
-
-class OsmTagQueryTestCase(unittest.TestCase):
-    def test_unions_keys_across_categories(self):
-        q = osm_tag_query_for_categories(CATEGORY_MAP)
-        self.assertSetEqual(set(q.keys()), {"shop", "amenity", "railway"})
-
-    def test_unions_values_per_key(self):
-        q = osm_tag_query_for_categories(CATEGORY_MAP)
-        self.assertSetEqual(set(q["shop"]), {"supermarket", "convenience", "bakery"})
-        self.assertSetEqual(set(q["amenity"]), {"school"})
-        self.assertSetEqual(set(q["railway"]), {"station", "halt"})
-
-    def test_values_are_sorted_for_determinism(self):
-        q = osm_tag_query_for_categories(CATEGORY_MAP)
-        for key, vals in q.items():
-            self.assertEqual(vals, sorted(vals), f"values for {key!r} not sorted")
-
-    def test_duplicate_tag_across_categories_deduped(self):
-        """Same (tag:value) reused across categories collapses to one value."""
-        cm = {
-            "a": [("shop:supermarket", 1.0)],
-            "b": [("shop:supermarket", 0.5)],  # same OSM tag, different weight
-        }
-        q = osm_tag_query_for_categories(cm)
-        self.assertEqual(q["shop"], ["supermarket"])
-
-    def test_missing_colon_raises(self):
-        with self.assertRaisesRegex(ValueError, "'key:value'"):
-            osm_tag_query_for_categories({"bad": [("no_colon_here", 1.0)]})
-
-
-# ---------------------------------------------------------------------------
-# categorize_pois
-# ---------------------------------------------------------------------------
-
-
-class CategorizePoisTestCase(unittest.TestCase):
-    def test_count_and_weight_columns_added(self):
-        out = categorize_pois(_toy_pois(), CATEGORY_MAP)
-        for cat in CATEGORY_MAP:
-            self.assertIn(cat, out.columns)
-            self.assertIn(f"{cat}_weight", out.columns)
-
-    def test_count_values(self):
-        out = categorize_pois(_toy_pois(), CATEGORY_MAP, drop_unmatched=False)
-        # p0 (fuel): no match anywhere.
-        self.assertEqual(out.loc["p0", "groceries"], 0)
-        # p1 (shop:convenience): matches groceries (1 listed pair).
-        self.assertEqual(out.loc["p1", "groceries"], 1)
-        # p2 (shop:bakery): matches groceries (1 listed pair).
-        self.assertEqual(out.loc["p2", "groceries"], 1)
-        # p3 (amenity:school): matches schools, not groceries.
-        self.assertEqual(out.loc["p3", "schools"], 1)
-        self.assertEqual(out.loc["p3", "groceries"], 0)
-        # p4 (railway:station): matches transit_rail.
-        self.assertEqual(out.loc["p4", "transit_rail"], 1)
-
-    def test_weight_values(self):
-        out = categorize_pois(_toy_pois(), CATEGORY_MAP, drop_unmatched=False)
-        # p1 (convenience): weight = 0.5.
-        self.assertEqual(out.loc["p1", "groceries_weight"], 0.5)
-        # p2 (bakery): weight = 0.5.
-        self.assertEqual(out.loc["p2", "groceries_weight"], 0.5)
-        # p4 (railway:station): weight = 3 (integer weight handled).
-        self.assertEqual(out.loc["p4", "transit_rail_weight"], 3.0)
-
-    def test_drop_unmatched(self):
-        out = categorize_pois(_toy_pois(), CATEGORY_MAP, drop_unmatched=True)
-        # p0 (fuel) and p5 (restaurant) match nothing → dropped.
-        self.assertNotIn("p0", out.index)
-        self.assertNotIn("p5", out.index)
-        # The rest stay.
-        self.assertSetEqual(set(out.index), {"p1", "p2", "p3", "p4"})
-
-    def test_drop_unmatched_false_keeps_all(self):
-        toy = _toy_pois()
-        out = categorize_pois(toy, CATEGORY_MAP, drop_unmatched=False)
-        self.assertEqual(len(out), len(toy))
-
-    def test_missing_tag_column_silently_skipped(self):
-        """If a category references a tag key the DataFrame doesn't have,
-        that pair simply doesn't match — no error."""
-        toy = _toy_pois().drop(columns=["railway"])
-        out = categorize_pois(toy, CATEGORY_MAP, drop_unmatched=False)
-        # transit_rail columns still added, but always zero.
-        self.assertEqual(out["transit_rail"].sum(), 0)
-        self.assertEqual(out["transit_rail_weight"].sum(), 0.0)
-
-    def test_multi_match_within_category(self):
-        """A row matching multiple (tag:value) pairs in one category gets
-        count > 1 and summed weight."""
-        # Make a single row that matches both shop:supermarket AND shop:bakery
-        # (unusual but possible — large food hall etc.). Since we have one
-        # `shop` column with a single value, simulate via a custom category.
-        cm = {
-            "groceries": [
-                ("shop:supermarket", 1.0),
-                ("amenity:supermarket", 0.5),  # second match condition
-            ],
-        }
-        gdf = gpd.GeoDataFrame(
-            {"shop": ["supermarket"], "amenity": ["supermarket"]},
-            geometry=[Point(0, 0)],
-            index=pd.Index(["p"], name="id"),
-            crs="EPSG:4326",
-        )
-        out = categorize_pois(gdf, cm, drop_unmatched=False)
-        self.assertEqual(out.loc["p", "groceries"], 2)
-        self.assertEqual(out.loc["p", "groceries_weight"], 1.5)
-
-    def test_custom_weight_suffix(self):
-        out = categorize_pois(_toy_pois(), CATEGORY_MAP, weight_suffix="_w", drop_unmatched=False)
-        self.assertIn("groceries_w", out.columns)
-        self.assertNotIn("groceries_weight", out.columns)
-
-    def test_column_name_collision_raises(self):
-        """If a category name already exists as a column, raise instead of
-        silently overwriting (would erase OSM tag data)."""
-        toy = _toy_pois().assign(groceries="preexisting")
-        with self.assertRaisesRegex(ValueError, "groceries"):
-            categorize_pois(toy, CATEGORY_MAP)
-
-    def test_input_not_mutated(self):
-        toy = _toy_pois()
-        cols_before = list(toy.columns)
-        _ = categorize_pois(toy, CATEGORY_MAP)
-        self.assertEqual(list(toy.columns), cols_before)
-
-    def test_empty_category_map(self):
-        """Empty category map = no new columns, no rows dropped."""
-        toy = _toy_pois()
-        out = categorize_pois(toy, {}, drop_unmatched=True)
-        self.assertEqual(len(out), len(toy))
-        for c in toy.columns:
-            self.assertIn(c, out.columns)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_car_unchanged(self):
+        g = self._graph({"highway": "residential", "sidewalk": "separate"},
+                        {"highway": "footway", "footway": "sidewalk"})
+        drop_sidepath_ways(g, "drive")
+        self.assertEqual(len(self._ways(g)), 4)
 
 
 if __name__ == "__main__":

@@ -48,25 +48,20 @@ variants = Variants([
 variants.add(
     name='switzerland_compare',
     area_name='switzerland',
-    statpop_year='2021',
-    statent_year='2020',
+    statpop_year='2025',
+    statent_year='2024',
 )
 
 
+def _public_path(context, namespace: str, rel_path: str) -> str:
+    path = context.source(namespace).path_for(Storage.PUBLIC, rel_path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    return path
+
+
 def _read_csv(context, namespace: str, rel_path: str) -> pd.DataFrame:
-    src = context.source(namespace)
-    path = src.path_for(Storage.PUBLIC, rel_path)
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    return pd.read_csv(path, index_col=0)
-
-
-def _read_gpkg(context, namespace: str, rel_path: str) -> gpd.GeoDataFrame:
-    src = context.source(namespace)
-    path = src.path_for(Storage.PUBLIC, rel_path)
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    return gpd.read_file(path)
+    return pd.read_csv(_public_path(context, namespace, rel_path), index_col=0)
 
 
 def main(variant) -> None:
@@ -77,9 +72,9 @@ def main(variant) -> None:
         # get reindexed onto this universe; missing entries → 0. This is
         # the right comparison: both methods must produce sensible
         # totals/values across the same set of buildings.
-        buildings = _read_gpkg(
+        buildings = gpd.read_file(_public_path(
             context, 'preparation/world/osm',
-            f'shapes/buildings_{variant.area_name}.gpkg')
+            f'shapes/buildings_{variant.area_name}.gpkg'))
         if 'building_id' in buildings.columns:
             buildings = buildings.set_index('building_id')
         country = load_swiss_country(context)
@@ -108,18 +103,15 @@ def main(variant) -> None:
             f'properties/buildings_employment_{variant.area_name}.csv')
 
     with step('build 8-column comparison frame (universe = all CH buildings)'):
+        def on_ch(s: pd.Series) -> pd.Series:
+            return s.reindex(ch_idx).fillna(0.0).astype(float)
+
         df = pd.DataFrame(index=ch_idx)
-        df['pop_statpop'] = (
-            statpop['population_total'].reindex(ch_idx).fillna(0.0).astype(float))
-        df['pop_ghs'] = (
-            ghs['population_total'].reindex(ch_idx).fillna(0.0).astype(float))
+        df['pop_statpop'] = on_ch(statpop['population_total'])
+        df['pop_ghs'] = on_ch(ghs['population_total'])
         for sector in ('primary', 'secondary', 'tertiary'):
-            df[f'emp_{sector}_statent'] = (
-                statent[f'employment_{sector}']
-                .reindex(ch_idx).fillna(0.0).astype(float))
-            df[f'emp_{sector}_coef'] = (
-                coef[f'employment_{sector}']
-                .reindex(ch_idx).fillna(0.0).astype(float))
+            df[f'emp_{sector}_statent'] = on_ch(statent[f'employment_{sector}'])
+            df[f'emp_{sector}_coef'] = on_ch(coef[f'employment_{sector}'])
         logging.info(f"  → {len(df):,} buildings in comparison frame")
 
     # ---- Per-column non-zero fractions + sums ----
@@ -185,7 +177,7 @@ def main(variant) -> None:
         df_with_h3['h3_r8'] = pd.Series(h3_r8, index=b_ch.index).reindex(df.index)
         df_with_h3 = df_with_h3.dropna(subset=['h3_r10', 'h3_r8'])
 
-    value_cols = [c for c in df.columns]
+    value_cols = list(df.columns)
     agg10 = df_with_h3.groupby('h3_r10')[value_cols].sum()
     agg8 = df_with_h3.groupby('h3_r8')[value_cols].sum()
 

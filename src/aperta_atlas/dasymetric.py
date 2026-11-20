@@ -55,7 +55,8 @@ from aperta_atlas.stats_helpers import warn_high_collinearity
 #
 # **`yes` trade-off (primary/secondary)**. OSM tags farms / industrial
 # buildings inconsistently — many real farms are tagged `yes` rather
-# than `farm`. Including `yes` in primary/secondary memberships:
+# than `farm`. Including `yes` in primary/secondary memberships (current
+# choice):
 #   + STATENT-direct can allocate ~all of the national target (cells
 #     with yes-tagged farms get reached).
 #   + Aggregate totals match between STATENT-direct and coef-based.
@@ -63,7 +64,7 @@ from aperta_atlas.stats_helpers import warn_high_collinearity
 #     (residential included), so coef-based spreads employment thinly
 #     across the city — poor correlation with STATENT-direct's
 #     concentrated per-cell-rescaled output.
-# Excluding `yes` (current choice):
+# Excluding `yes`:
 #   + Strong per-building signal: only tags that *typically* host
 #     primary/secondary employment carry β. Coef-based and STATENT-direct
 #     concentrate on the same buildings → higher correlation.
@@ -76,11 +77,7 @@ from aperta_atlas.stats_helpers import warn_high_collinearity
 # vs Swiss-side allocation completeness.
 
 EMPLOYMENT_TAGS_PER_SECTOR: dict[str, frozenset[str]] = {
-    # Primary sector — agriculture & forestry buildings.
-    # NOTE: without including 'yes' (generic buildings), we miss quite a lot of
-    # primary sector in the allocation. WITH including it, the coefficients
-    # will allocate a small amount of primary sector employment
-    # to each building
+    # Primary sector — agriculture & forestry buildings (`yes`: see the trade-off above).
     'primary': frozenset({
         'farm', 'farm_auxiliary', 'barn', 'stable', 'cowshed', 'sty',
         'greenhouse', 'yes',
@@ -174,7 +171,7 @@ def per_building(
     """Distribute per-cell totals (one column) across building footprints
     via overlay-based dasymetric mapping + nearest-building fallback.
 
-    See module docstring for the 4-step method. Orchestrators call this
+    Method: steps 1–6 in the code. Orchestrators call this
     once per category (sector, age band, …) with that category's
     per-tag learned intensities. Buildings outside `coeffs.keys()` are
     filtered out before any spatial work.
@@ -241,12 +238,10 @@ def per_building(
     overlays = gpd.overlay(
         b_in, c_in, how='intersection', keep_geom_type=False,
     )
+    contribs = pd.Series(0.0, index=np.arange(n_buildings))
+    in_coverage_b_idx: set[int] = set()
     if len(overlays):
         overlays['_overlap_area'] = overlays.geometry.area
-
-    contribs = pd.Series(0.0, index=np.arange(n_buildings))
-
-    if len(overlays):
         # 2. Per-overlay prediction = coef[tag] × overlap_area.
         coef_per_row = (
             overlays[building_tag_col].map(coeffs)
@@ -263,9 +258,6 @@ def per_building(
         overlays['_contrib'] = overlays['_pred'] * scale
         per_b = overlays.groupby('_b_idx')['_contrib'].sum()
         contribs = contribs.add(per_b, fill_value=0.0)
-
-    in_coverage_b_idx: set[int] = set()
-    if len(overlays):
         in_coverage_b_idx.update(int(i) for i in overlays['_b_idx'].unique())
 
     # 5. Nearest-building fallback for cells with zero overlap → assign
@@ -294,10 +286,7 @@ def per_building(
     # Out-of-coverage buildings are dropped (would distort downstream
     # calibration with value=0 + full area). Typical case: OSM buildings
     # in the buffer outside a country-scoped STATPOP/STATENT run.
-    # `dtype=bool` is load-bearing: with `n_buildings == 0` the list
-    # comprehension is empty and `np.array([])` defaults to float64,
-    # which then raises `IndexError: arrays used as indices must be of
-    # integer (or boolean) type` on line 324's fancy-indexing.
+    # `dtype=bool`: an empty list would default to float64, which can't index.
     in_coverage_mask = np.array(
         [i in in_coverage_b_idx for i in range(n_buildings)], dtype=bool)
     n_in_coverage = int(in_coverage_mask.sum())
@@ -465,7 +454,7 @@ def learn_coefficients(
             `X[c_syn, tag(B)] = B.area` is added. Matches the model
             `per_building` uses for allocation → learned β values are
             consistent with downstream use.
-      - β = per-tag intensities (FTE/m² or residents/m²), constrained
+      - β = per-tag intensities (employees/m² or residents/m²), constrained
         to ≥ 0 via `scipy.optimize.nnls`.
 
     Logs a 3-tier coverage diagnostic per target-bearing cell: fittable
@@ -566,14 +555,8 @@ def learn_coefficients(
             f"in `relevant_tags`; returning empty result.")
         return _empty_output()
 
-    # Per-tag full-area sum and observation count, across the WHOLE
-    # `buildings` input. The caller's responsibility is to pre-filter
-    # `buildings` to the calibration area (e.g. country borders); this
-    # function takes the input at face value as the calibration scope.
-    # Used as the denominator for bias rescaling (β reflects average
-    # intensity across all input buildings) and for the contribution
-    # column. Critical: this is what makes `β × area` give consistent
-    # totals when later applied to all buildings of the same area.
+    # Per-tag full-area sum and observation count over the WHOLE input (the calibration
+    # scope; see the caller contract in the docstring): denominator of the bias rescaling.
     area_sum_per_tag = b_in.groupby(building_tag_col)[area_col].sum()
     n_obs_per_tag = b_in.groupby(building_tag_col).size().rename('n_observations')
 
@@ -649,12 +632,7 @@ def learn_coefficients(
     else:
         pct_overlap = pct_fallback = pct_unreachable = pct_unreachable_target = 0.0
 
-    # ---- Build augmented (X, y) for NNLS ----
-    # Drop cells with zero row-sum (no overlap) that weren't rescued by
-    # fallback — they have nothing to fit. This includes truly unreachable
-    # cells AND zero-target cells with no relevant buildings (which contribute
-    # nothing to the loss either way).
-    # If we have fallback rows, build them now and add them.
+    # ---- Build augmented (X, y) for NNLS: add the fallback rows ----
     if fallback_extra_rows:
         # Pivot fallback rows into a (cell, tag) area frame.
         fb_df = pd.DataFrame(
@@ -726,37 +704,14 @@ def learn_coefficients(
 
     # Two-sided p-value for H0: β = 0. For NNLS-clipped β = 0 (constraint
     # binds), z = 0 → p = 1 (cannot reject null). For β >> 0 with small
-    # SE, p → 0. Where SE = 0 (e.g. degenerate column), p = NaN.
-    # Computed BEFORE the bias rescaling below — under rescaling both β
-    # and SE would scale by the same factor, so z = β/SE is invariant
-    # and the p-value is unchanged either way; computing here just makes
-    # that explicit.
+    # SE, p → 0. Where SE = 0 (e.g. degenerate column), p = NaN. Scale-invariant, so
+    # unaffected by the bias rescaling below.
     with np.errstate(invalid='ignore', divide='ignore'):
         z_stat = np.where(se > 0, beta / se, np.nan)
     p_values = 2.0 * norm.sf(np.abs(z_stat))
 
-    # Bias correction: NNLS β minimizes squared error per cell, NOT
-    # total preservation. Applied bottom-up as `β × area` to all
-    # relevant-tag buildings in the calibration area, NNLS gives a
-    # total ≠ cal_target_sum. Rescale β so the SUM across all input
-    # buildings reproduces cal_target_sum:
-    #
-    #     Σ_T (β_eff × area_sum_per_tag[T]) = cal_target_sum
-    #
-    # CRITICAL: this requires `buildings` (the input) to BE the
-    # calibration area's buildings — i.e. the caller has already
-    # filtered to inside the country/region where `cell_totals` applies.
-    # If the caller passes a wider set (e.g. CH + buffer), β gets
-    # under-scaled and applying it to CH alone under-predicts.
-    #
-    # When the published β is later applied to a different region for
-    # extrapolation, it scales proportionally with that region's
-    # relevant-tag area — which is the right behavior, since we have
-    # no per-cell anchor outside the calibration region.
-    #
-    # Per-cell rescaling in `per_building` is invariant to this scaling
-    # (only relative β within a cell matters there), so Swiss-side output
-    # is unchanged.
+    # Bias correction (see docstring): rescale β so that Σ_T (β × area_sum_per_tag[T])
+    # over all input buildings reproduces the target sum.
     predicted_in_calibration = sum(
         beta[i] * float(area_sum_per_tag.get(tag_names[i], 0.0))
         for i in range(len(tag_names)))
@@ -884,7 +839,7 @@ def per_building_from_coefficients(
             f"the calibrated set ({len(buildings):,} / {n_before:,} kept = "
             f"{len(buildings) / n_before * 100:.1f} %)")
 
-    out = buildings.copy()
+    out = buildings                     # already a filtered copy
     tags = out[building_tag_col].astype(str).values
     areas = out[area_col].astype(float).values
     for col in columns:

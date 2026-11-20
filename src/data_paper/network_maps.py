@@ -42,12 +42,13 @@ import osmnx as ox
 import pandas as pd
 from matplotlib.collections import LineCollection
 from matplotlib.colors import LogNorm, Normalize
+from shapely.geometry import box
 
 from aperta_atlas.context import Storage, init_context
 from aperta_atlas.utils import step
 from scenarios import get_scenario
 from data_paper.access_maps import (
-    _FIG_WIDTH_IN, _FONT_SIZE, _colorbar, _panel_label, _scale_bar)
+    _FIG_WIDTH_IN, _FONT_SIZE, _colorbar, _frame, _panel_label, _scale_bar)
 
 # (xmin, ymin, xmax, ymax), LV95. Speeds: the city of Bern with the motorways on its
 # northern, eastern and western edges. swissTLMRegio: Bern and its surroundings.
@@ -70,17 +71,6 @@ def _cmap(name: str = 'viridis', lo: float = 0.0, hi: float = 0.88):
     return mpl.colors.ListedColormap(mpl.colormaps[name](np.linspace(lo, hi, 256)))
 
 
-def _frame(ax, extent) -> None:
-    x0, y0, x1, y1 = extent
-    ax.set_xlim(x0, x1)
-    ax.set_ylim(y0, y1)
-    ax.set_aspect('equal')
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set(color='black', linewidth=0.6)
-
-
 def _segments(geoms: gpd.GeoSeries) -> list[np.ndarray]:
     return [np.asarray(g.coords)[:, :2] for g in geoms]
 
@@ -89,9 +79,8 @@ def _street_speeds(context, mode: str, profiles: tuple[str, ...],
                    extent) -> gpd.GeoDataFrame:
     """Streets in `extent` with the round-trip effective speed (km/h) of each profile,
     in columns named after the profiles."""
-    x0, y0, x1, y1 = extent
     edges = gpd.read_file(context.path_for(context.default_storage, f'shapes/edges_{mode}.gpkg'),
-                          bbox=(x0, y0, x1, y1)).set_index('edge_id')
+                          bbox=extent).set_index('edge_id')
     cols = [f'duration_calibrated_{p}' for p in profiles]
     cal = pd.read_csv(context.path_for(context.default_storage,
                                        f'properties/edges_{mode}_calibrated.csv'),
@@ -192,9 +181,8 @@ def _tlmregio_edges(context, area: str, extent) -> gpd.GeoDataFrame:
 
 
 def _osm_car_edges(context, extent) -> gpd.GeoDataFrame:
-    x0, y0, x1, y1 = extent
     edges = gpd.read_file(context.path_for(context.default_storage, 'shapes/edges_car.gpkg'),
-                          bbox=(x0, y0, x1, y1)).set_index('edge_id')
+                          bbox=extent).set_index('edge_id')
     core = pd.read_csv(context.path_for(context.default_storage, 'properties/edges_car_core.csv'),
                        usecols=['edge_id', 'highway'], index_col='edge_id')
     edges = edges.join(core, how='left')
@@ -218,7 +206,6 @@ def _draw_roads(ax, edges: gpd.GeoDataFrame, extent, km_label: str) -> None:
 def _clipped_km(edges: gpd.GeoDataFrame, extent) -> float:
     """Road length (km) inside `extent`, counting each road once (the two directions
     of a road share their geometry)."""
-    from shapely.geometry import box
     once = edges.drop_duplicates(subset=['geometry'])
     reverse = once.geometry.apply(lambda g: g.reverse().wkb)
     seen, keep = set(), []

@@ -3,8 +3,8 @@ Extract zone-to-zone public-transit travel times from the NPVM 2023 .mtx file.
 
 Reads ARE's NPVM (Nationales Personenverkehrsmodell) 2023 transit travel-time
 matrix — a VISUM `$O;D3` text-format file, ~2.4 GB, ~63M OD pairs over
-~7900 zones. Values are total trip time (first-mile access + in-vehicle
-+ wait + transfer + last-mile egress, in minutes).
+~7900 zones. Values are trip times without the initial wait (access + first
+boarding to last alighting, incl. transfers + egress; in minutes).
 
 Output: an aperta `TieredODGeoPairs` with the `zones_to_zones` tier
 populated. Zone IDs match the prefix scheme from `traffic_zones.py`:
@@ -16,11 +16,10 @@ prepared `traffic_zones.csv` are dropped — those are usually internal
 NPVM artefacts (centroid-of-centroid placeholders, etc.) not relevant to
 downstream accessibility work.
 
-Inputs (PUBLIC, under <DATA_DIR_PUBLIC>/raw/switzerland/npvm/2023/transit/):
+Inputs (PUBLIC, under raw/switzerland/npvm/2023/transit/):
     RITA_ACT_EGT_NPVM_2023.mtx                 # VISUM $O;D3 text matrix
-
-Inputs (same-namespace; prior stage):
-    traffic_zones.csv (from general/traffic_zones.py)    # zone_id prefix scheme
+Inputs (PUBLIC, under preparation/switzerland/general/):
+    traffic_zones.csv                          # from traffic_zones.py; zone_id prefixes
 
 Outputs (PUBLIC, under preparation/switzerland/npvm/):
     odm/npvm_2023_transit_idx.npz              # zones_to_zones: dest IDs per origin
@@ -40,10 +39,7 @@ from aperta_atlas.context import Storage, init_context
 from aperta_atlas.utils import step
 
 
-# The .mtx file is one metric per file with a fixed 8-line header. The body
-# starts at line 9; each line is `<orig_npvm_id> <dest_npvm_id> <value>`
-# (whitespace-separated). Encoding is UTF-8 with BOM. Values are in
-# MINUTES (we convert to seconds on save).
+# Fixed 8-line header (see `_parse_factor_line`), then `<orig> <dest> <value>` lines.
 _MTX_HEADER_LINES = 8
 _MTX_REL = 'switzerland/npvm/2023/transit/RITA_ACT_EGT_NPVM_2023.mtx'
 
@@ -78,9 +74,6 @@ def _count_data_rows(path: str) -> int:
     """
     import mmap
     with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ) as mm:
-        # Search for the newline immediately before the `* Netzobjektnamen`
-        # separator. Robust to `\n` and `\r\n` line endings (in either case
-        # the byte right before `* Netzobjektnamen` is `\n`).
         sep_idx = mm.find(b'\n* Netzobjektnamen')
         if sep_idx < 0:
             # Fallback: try locating `$NAMES` directly. Same logic.
@@ -89,10 +82,7 @@ def _count_data_rows(path: str) -> int:
                 raise ValueError(
                     "Neither `* Netzobjektnamen` nor `$NAMES` marker found "
                     "in .mtx file — VISUM $O format may have changed.")
-        # Count newlines in [0, sep_idx + 1) via chunked reads — bytes.count
-        # is C-fast and the chunk size bounds peak memory. The number of
-        # newlines equals the number of lines ending at or before sep_idx,
-        # which is the header + data line count combined.
+        # Header + data lines = newlines up to the separator (chunked reads bound memory).
         mm.seek(0)
         remaining = sep_idx + 1
         chunk_bytes = 64 * 1024 * 1024
@@ -183,8 +173,6 @@ def main():
             f"({100*n_sentinel/max(len(df), 1):.2f} %) as unreachable sentinels")
 
     with step('convert minutes → seconds, group into per-origin arrays'):
-        # NPVM-published transit times are minutes; aperta-wide convention
-        # for travel-time ODMs is seconds.
         df['value_s'] = (df['value'] * 60.0).astype(np.float32)
         # Canonical ordering: sort by (origin, destination) so idx and values
         # are aligned and reproducible across runs.

@@ -8,18 +8,18 @@ sign-flips at load time so downstream (10) can consume these as if
 they were time costs (nearest picks smallest, gravity uses `exp(-D)`,
 etc.).
 
-One ODM is written per (mode, profile, utility variant); the variants
-are the scenario's `utility_<variant>` coef keys (`_stats` sidecars
-excluded).
+One ODM is written per (mode, profile) for the utility variant of the
+scenario's util grids (`AccessibilityGrid.utility`, one per scenario); other
+declared `utility_<variant>` coefs (spec comparisons) get none.
 
 Formula per OD pair (gross_sec = the corresponding cell in the
-underlying gross-time ODM):
+underlying gross-time ODM, floored at the mode's `min_route_time_s` as 09a
+floors the trip times it is fitted on; D itself has no floor):
 
     D(i, j) = ASC_effective                    (built into `spec.disutility.constant`)
-            + β_time_effective · gross_sec     (build_disutility_odm)
+            + f(gross_sec)                     (piecewise linear, one slope per
+                                                time band; `spec.time_disutility`)
             + Σ_o β_o · feat_o(i) + Σ_d β_d · feat_d(j)   (aperta's add_endpoint_utility)
-            + β_time_log · log(gross_sec)      (apply_log_time_utility; linear
-                                                beyond t_cut_min)
 
 Every β above is sign-flipped from 09a's raw fit — see
 `build_disutility_spec`.
@@ -33,8 +33,7 @@ Inputs (scenario storage, under `<scenario>/`):
                                               # t_ref_min; cols: value, rob_std_err,
                                               # rob_t_test, rob_p_value)
     coefs/<kind>/utility_<variant>_stats.csv  # companion sidecar: sd_avg_<sd_col>
-                                              # + t_cut_min_<mode> rows (two-col
-                                              # `key, value`)
+                                              # rows (two-col `key, value`)
     properties/nodes_walk_extended.csv,
       nodes_bike_extended.csv,
       nodes_car_extended.csv,
@@ -53,6 +52,7 @@ import logging
 from typing import cast
 
 from aperta import NOTE as _NOTE_LEVEL
+from aperta import routing
 from aperta.od_pairs import TieredODGeoPairs
 from aperta_atlas.context import init_context
 from aperta_atlas.utils import step
@@ -62,23 +62,27 @@ from main.common import (
     build_disutility_spec,
     check_util_matches_cost_shape,
     coefs_for_unrun_profiles,
+    crossmodal_hour_shift_keys,
     extract_sd_averages_from_coefs,
-    extract_t_cut_min_from_coefs,
     join_util_node_features,
     profile_to_util_mode,
 )
+from mode_configs import TRANSIT_MODE_CONFIG
 from scenarios import get_scenario
 
 
+def _time_slopes_text(spec) -> str:
+    """Disutility per minute of each time band, for the log (`{lo}-{hi} min: slope`)."""
+    knots = [k / 60.0 for k in spec.time_knots_sec]
+    bands = [f'{lo:g}-{hi:g}' for lo, hi in zip(knots, [*knots[1:], float('inf')])]
+    return 'time slopes/min ' + ', '.join(
+        f'{b}: {s * 60.0:+.4f}' for b, s in zip(bands, spec.time_slopes))
+
+
 def _utility_variants_from_scenario(scenario) -> list[str]:
-    """Discover utility variants from the scenario's coefs dict —
-    every `utility_<name>` key is one variant name to build. Excludes
-    `utility_<name>_stats` companion sidecars (loaded separately)."""
-    return sorted(
-        k[len('utility_'):]
-        for k in scenario.coefs.keys()
-        if k.startswith('utility_') and not k.endswith('_stats')
-    )
+    """The utility variant(s) 10 reads: those of the scenario's util grids."""
+    return sorted({g.utility for g in scenario.accessibility_grids.values()
+                   if g.travel_cost == 'util'})
 
 
 def main():
@@ -87,9 +91,7 @@ def main():
 
     utility_variants = _utility_variants_from_scenario(scenario)
     if not utility_variants:
-        logging.info(
-            "no `utility_*` coefs declared in scenario.coefs (no utility grid); "
-            "skipping")
+        logging.info("no utility grid; skipping")
         context.close()
         return
     logging.info(f"utility variants to build: {utility_variants}")
@@ -114,7 +116,7 @@ def main():
         cells_m = cells.copy()
         zones_m = zones.copy()
         # Each endpoint feature comes from its source graph's node file
-        # (density from walk, bike_infra from bike, ...). A cell without
+        # (density from walk, bike stress from bike, ...). A cell without
         # that mode's snap gets NaN features → NaN utility on its pairs.
         join_util_node_features(cells_m, zones_m, context)
         cells_m['unit_id'] = cells_m.index  # `add_endpoint_utility` uses this
@@ -124,36 +126,21 @@ def main():
             f"  → {len(cells_m):,} cells ({n_active:,} active) "
             f"+ {len(zones_m):,} zones")
 
-    with step('load utility stats sidecars (SD averages + t_cut_min)'):
+    with step('load utility stats sidecars (SD averages)'):
         # `utility_<v>_stats` shares `utility_<v>`'s CoefSource (validated
         # in Scenario.__post_init__); 09a resolves both.
-        stats_by_variant = {
-            v: context.get_coefs(f'utility_{v}_stats') for v in utility_variants
-        }
         sd_averages_by_variant = {
-            v: extract_sd_averages_from_coefs(stats_by_variant[v])
-            for v in utility_variants
-        }
-        t_cut_min_by_variant = {
-            v: extract_t_cut_min_from_coefs(stats_by_variant[v]) or None
+            v: extract_sd_averages_from_coefs(context.get_coefs(f'utility_{v}_stats'))
             for v in utility_variants
         }
         v0 = utility_variants[0]
         n_sd = len(sd_averages_by_variant[v0])
-        t_cut = t_cut_min_by_variant[v0]
-        logging.info(f"  → utility_{v0}_stats: {n_sd} sd_avg row(s); "
-                     f"t_cut_min p95 (min) = "
-                     f"{ {m: round(v, 1) for m, v in (t_cut or {}).items()} }")
+        logging.info(f"  → utility_{v0}_stats: {n_sd} sd_avg row(s)")
         if n_sd == 0:
             logging.warning(
                 "  ⚠ utility stats have no sd_avg_* rows — SD correction "
                 "disabled (ASC represents reference-category person, NOT "
                 "population-average). Re-run 09a to bake sd_avg in.")
-        if t_cut is None:
-            logging.warning(
-                "  ⚠ utility stats have no t_cut_min_* rows — log-time "
-                "extrapolation falls back to pure log. Re-run 09a with "
-                "survey_summary.csv present to bake t_cut_min in.")
 
     # ---- Road modes: build disutility ODM per profile per variant ---
     for case in scenario.mode_configs.values():
@@ -174,6 +161,8 @@ def main():
             with step(f'mode={mode} profile={label}: load gross ODM + geo pairs'):
                 costs_gross = cast(TieredODGeoPairs, context.get_tiered_odm(
                     network_name=mode, data_name=gross_name))
+                costs_gross = routing.floor_intrazonal_costs(
+                    costs_gross, min_cost=case.min_route_time_s)
                 pairs_geo = cast(TieredODGeoPairs, context.get_tiered_odm(
                     network_name=mode, data_name='geo_pairs'))
 
@@ -181,7 +170,6 @@ def main():
                 spec = build_disutility_spec(
                     util_coefs_by_variant[variant], label,
                     sd_averages=sd_averages_by_variant[variant],
-                    t_cut_min_per_mode=t_cut_min_by_variant[variant],
                     consumed_out=consumed_by_variant[variant],
                 )
                 if spec is None:
@@ -207,8 +195,7 @@ def main():
                     logging.info(
                         f"  → disutility ODM saved "
                         f"({mode}_util_{src.name}_{variant}); "
-                        f"β_time_eff={spec.disutility.cost_coefficient:+.5f}, "
-                        f"β_time_log={spec.b_time_log:+.3f}, "
+                        f"{_time_slopes_text(spec)}, "
                         f"constant={spec.disutility.constant:+.3f}")
 
     # ---- Transit: same treatment as road ----------------------------
@@ -218,6 +205,8 @@ def main():
         with step('mode=transit: load gross ODM + geo pairs'):
             transit_costs = cast(TieredODGeoPairs, context.get_tiered_odm(
                 network_name='transit', data_name='time_gross_npvm'))
+            transit_costs = routing.floor_intrazonal_costs(
+                transit_costs, min_cost=TRANSIT_MODE_CONFIG.min_route_time_s)
             transit_pairs = cast(TieredODGeoPairs, context.get_tiered_odm(
                 network_name='transit', data_name='geo_pairs'))
 
@@ -225,7 +214,6 @@ def main():
             spec = build_disutility_spec(
                 util_coefs_by_variant[variant], 'transit',
                 sd_averages=sd_averages_by_variant[variant],
-                t_cut_min_per_mode=t_cut_min_by_variant[variant],
                 consumed_out=consumed_by_variant[variant],
             )
             if spec is None:
@@ -253,8 +241,7 @@ def main():
                 logging.info(
                     f"  → transit disutility ODM saved "
                     f"(transit_util_npvm_{variant}); "
-                    f"β_time_eff={spec.disutility.cost_coefficient:+.5f}, "
-                    f"β_time_log={spec.b_time_log:+.3f}, "
+                    f"{_time_slopes_text(spec)}, "
                     f"constant={spec.disutility.constant:+.3f}")
 
     # ---- Per-variant residual check: any 09a coef no spec consumed? -
@@ -270,7 +257,11 @@ def main():
             }
             residual = all_beta_keys - consumed_by_variant[variant]
             unrun = coefs_for_unrun_profiles(residual, run_profile_labels)
-            drift = sorted(residual - unrun)
+            hour_shifts = crossmodal_hour_shift_keys(residual)
+            drift = sorted(residual - unrun - hour_shifts)
+            if hour_shifts:
+                logging.info(f"  → utility_{variant}: hour shifts {sorted(hour_shifts)} "
+                             f"apply in 10's cross-modal profiles")
             if unrun:
                 logging.log(
                     _NOTE_LEVEL,

@@ -6,7 +6,7 @@
 >
 > Both links resolve to the latest version of each dataset.
 
-**aperta-atlas** is the pipeline that produces the *Urban Mobility Atlas*:
+**aperta-atlas** is the pipeline that produces the *Aperta Accessibility Atlas*:
 multi-modal accessibility metrics at high spatial resolution, built on
 the [`aperta`](https://github.com/mmiotti/aperta) accessibility-analysis
 library. `aperta` provides the algorithms (routing, OD pairs,
@@ -47,6 +47,10 @@ Declared in [`src/scenarios.py`](src/scenarios.py):
   `<DATA_DIR_PUBLIC>/atlas/switzerland-h10-public/coefs/manual/`: unpack
   `coefficients.zip` from the accessibility Zenodo record there. The
   survey stages self-skip and no private data is read.
+- **`bern-metro-car-public`** — car only, without public transport, on
+  public data for Bern-Mittelland with the published coefficients (in
+  `coefs/manual/`). Checks that the pipeline runs for a single mode and
+  profile and without a transit model.
 - **`cambridgeuk-public`** — Cambridge (UK) on public data only (OSM,
   GHS-POP), walk / bike / car, with all coefficients transferred from
   `switzerland-h10`. Shows how to run a new region without local
@@ -85,8 +89,9 @@ Tested on **Python 3.12**.
 ```bash
 conda create -n aperta python=3.12
 conda activate aperta
-conda install -c conda-forge osmium-tool pyosmium   # PBF tooling, not on PyPI
+conda install -c conda-forge osmium-tool            # osmium CLI (conda-only)
 pip install -e '.[projects]'                        # this repo + project deps (pulls aperta from PyPI)
+pip install -e '.[estimation]'                      # biogeme 3.2 for utility estimation (09a; Python 3.12)
 ```
 
 For `aperta` development, install a local clone instead
@@ -141,8 +146,8 @@ at all, by transferring everything from Switzerland — see
 | `node_trip_weights_car`, `flow_cost_bins_car` — trip generation + trip-time distribution | `main/03a` | MTMC car trips, cell population / employment |
 | `overheads_road` — door-to-door trip overheads per road profile | `main/07a` | MTMC trips |
 | `overheads_transit` — per-cell transit access overheads | `main/07b` | MTMC trips with a transit leg |
-| `utility_*` — mode-choice utility model | `main/09a` | MTMC legs + sociodemographics |
-| Population / employment intensities per OSM building tag | `preparation/switzerland/public/land_use/` | BFS STATPOP / STATENT |
+| `utility_*` — mode-choice utility model | `main/09a` | MTMC trips + sociodemographics |
+| Population / employment intensities per building type and setting (rural, suburban, urban) | `preparation/switzerland/public/land_use/` | BFS STATPOP / STATENT |
 
 Coefficients are stored per scenario under `coefs/calibrated/`,
 `coefs/transferred/` or `coefs/manual/`, so the folder records their
@@ -161,6 +166,17 @@ provenance.
 ```bash
 python -m unittest discover -s tests -t .
 ```
+
+## Citation
+
+If you use the pipeline or the data it produces, please cite the data descriptor:
+
+> Miotti, M., Elvarsson, A., Räth, Y. M., & Hellweg, S. (2026). Calibrated transport
+> networks and accessibility indicators for Switzerland. *Scientific Data* (submitted).
+
+To cite the code of a specific release, cite its Zenodo record (concept DOI
+[10.5281/zenodo.21461294](https://doi.org/10.5281/zenodo.21461294), which resolves to the
+latest release). See also [CITATION.cff](CITATION.cff).
 
 ## Acknowledgments
 

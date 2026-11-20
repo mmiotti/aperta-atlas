@@ -1,37 +1,41 @@
 """
-Distance vs. door-to-door time vs. disutility per mode on MTMC legs
-(Figure 1 of the atlas data descriptor).
+Distance vs. door-to-door time vs. disutility per mode on MTMC trips
+(`dist_time_util_mtmc.pdf`, atlas data descriptor).
 
-Every leg is evaluated for every mode, not just the chosen one, so the
+Every trip is evaluated for every mode, not just the chosen one, so the
 curves compare the three cost types on the same set of trips. Times are
 composed as in 09a (routed time + overheads − routed bias, from survey/05 +
 08a); disutilities apply `utility_default` through `build_disutility_spec`,
 the same spec 09b bakes into the released utility ODMs (SD covariates at
-population averages, car peak / night ASC, log time extrapolated beyond
-`t_cut_min`). Legs pass 09a's quality filters (AOI, endpoint elevation,
-speed + detour envelopes, straight-line distance); a mode with no route or
-a time above 09a's cap counts as unavailable for that leg.
+population averages, piecewise-linear time term). Trips are 09a's (survey/02d's trip set) and pass its quality
+filters (AOI, `CHOICE_QUALITY_FLAGS`, straight-line distance); a mode with no
+route or a time above 09a's cap counts as unavailable for that trip.
 
-Car: each leg is evaluated under all three car profiles. The narrow band
-spans the three profiles' medians; the wide band is the 12.5–87.5th
-percentile range pooled over the profiles. Other modes: median line and
-12.5–87.5th percentile band. Statistics are unweighted; bins with fewer
-than `_MIN_LEGS_PER_BIN` legs are left out. Each curve (medians and
+Car: each trip is evaluated at peak and at night hours (solid and dotted;
+base hours lie between them). The car's disutility depends on its time alone,
+not the hour (09a has no period constants), so the time–disutility panels
+pool both into one (solid) curve. Every curve: median line and 12.5–87.5th
+percentile band, transparent so that overlaps show. Statistics are unweighted; bins with fewer
+than `_MIN_LEGS_PER_BIN` trips are left out. Each curve (medians and
 percentiles, per bin) is smoothed with a Savitzky–Golay filter
 (`_SMOOTH_WINDOW` bins, quadratic): a local polynomial fit, so unlike a
 moving average it doesn't pull the curve ends towards the interior. Times
 are smoothed in log space, matching their log axis.
 
-Rows: all legs; legs in the top `_DENSE_SHARE` by endpoint density
-(`density_r500_norm`, mean of origin and destination).
+Rows: all trips; trips that start or end in a city of more than `_CITY_MIN_RESIDENTS`
+residents (the municipality itself, not its agglomeration: the NPVM zones' municipality,
+residents summed over its zones).
 
 Inputs (PRIVATE, under `<scenario>/`):
-    generic/survey_legs.csv                    # survey/02d
-    generic/survey_leg_times.csv               # survey/05
-    generic/survey_leg_overheads.csv           # survey/08a
+    generic/survey_trips.csv                   # survey/02d (--variant mtmc_trips)
+    generic/survey_trip_times.csv              # survey/05 (--variant mtmc_trips)
+    generic/survey_trip_overheads.csv          # survey/08a (--variant mtmc_trips)
 Inputs (PUBLIC, under `<scenario>/`):
     properties/nodes_{walk,bike,car}_extended.csv, nodes_car_flows_avg.csv
+    properties/zones_population.csv
     coefs/<kind>/utility_default.csv, utility_default_stats.csv   # 09a
+
+Inputs (PUBLIC, preparation): switzerland/general/traffic_zones_centroids.gpkg  # municipality
 
 Outputs (RESULTS, under `<scenario>/`):
     dist_time_util_mtmc.pdf
@@ -42,43 +46,45 @@ Run:
 
 import importlib
 import logging
-import math
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
 from matplotlib.ticker import FuncFormatter
 from scipy.signal import savgol_filter
 
 from aperta_atlas.context import init_context
 from aperta_atlas.utils import step
+from data_paper.access_maps import _FIG_WIDTH_IN
 from main.common import (
-    build_disutility_spec, extract_sd_averages_from_coefs, extract_t_cut_min_from_coefs,
+    CHOICE_QUALITY_FLAGS, build_disutility_spec, extract_sd_averages_from_coefs,
 )
 
 _u09a = importlib.import_module('main.09a_utility_estimation')
 
 _UTILITY_VARIANT = 'default'
 
-# Mode → (label, colour, routing profiles evaluated per leg).
+# Mode → (label, colour, routing profiles evaluated per trip; the first is drawn solid).
 _MODES: dict[str, tuple[str, str, tuple[str, ...]]] = {
     'walk':    ('Walking',          '#1a2540', ('rwalk',)),
     'rbike':   ('Bicycle',          '#4a7be0', ('rbike',)),
     'transit': ('Public transport', '#7fc23a', ('transit',)),
-    'car':     ('Car',              '#e02b3a', ('car_night', 'car_base', 'car_peak')),
+    'car':     ('Car',              '#e02b3a', ('car_peak', 'car_night')),
 }
+_PROFILE_LABELS = {'car_peak': 'peak hours', 'car_night': 'night'}
+_LINESTYLES = {'car_night': (0, (1, 1.2))}   # dotted; other profiles solid
+_LINEWIDTH = 1.0
+_BAND_ALPHA = 0.15
 
-_DENSE_SHARE = 0.2
+_CITY_MIN_RESIDENTS = 100_000
 # Log-spaced bins (widening towards long trips, which are rarer), so the bins at the
-# upper end still hold enough legs; uniform in log space, as the smoothing assumes.
+# upper end still hold enough trips; uniform in log space, as the smoothing assumes.
 _DIST_EDGES_KM = np.geomspace(0.1, 100.0, 21)   # up to the 100-km tier radius
 _TIME_EDGES_MIN = np.geomspace(3.0, 60.0, 17)
 _PCT_LOW, _PCT_HIGH = 12.5, 87.5
 _MIN_LEGS_PER_BIN = 100
 _SMOOTH_WINDOW, _SMOOTH_ORDER = 5, 2
-_FIG_WIDTH_IN = 6.3      # the article's text width, so fonts print at their nominal size
 _FONT_SIZE = 8
 
 _LABELS = {
@@ -90,27 +96,21 @@ _PANELS = (('d', 't'), ('d', 'u'), ('t', 'u'))
 
 
 def _load_legs(context) -> pd.DataFrame:
-    """Survey legs with per-mode gross times and endpoint features, filtered
+    """Survey trips with per-mode gross times and endpoint features, filtered
     as in 09a (without the choice-specific filters)."""
     df = _u09a._load_and_join(context)
     df = _u09a._compute_mode_times(df, 'gross', include_ebikes=False)
     df = _u09a._join_point_node_features(df, context, ('od',))
 
-    elev = context.get_properties('nodes', 'walk_extended')['elevation']
-    max_elev = _u09a._MAX_ENDPOINT_ELEVATION_M
-    keep = ((df['orig_node_id_walk'].map(elev) <= max_elev)
-            & (df['dest_node_id_walk'].map(elev) <= max_elev))
-    for flag in ('is_within_speed_envelope', 'is_within_detour_envelope'):
-        if flag in df.columns:
-            keep &= df[flag] == 1
-    keep &= df['dist_line'].between(_u09a._MIN_LEG_DIST_LINE_M, _u09a._MAX_LEG_DIST_LINE_M)
-    logging.info(f"  → {int(keep.sum()):,} / {len(df):,} legs after 09a's quality filters")
-    return df[keep.fillna(False)].copy()
+    keep = ((df['dist_line'] <= _u09a._MAX_TRIP_DIST_LINE_M)
+            & df[list(CHOICE_QUALITY_FLAGS)].eq(1).all(axis=1))
+    logging.info(f"  → {int(keep.sum()):,} / {len(df):,} trips after 09a's quality filters")
+    return df[keep].copy()
 
 
 def _car_gross_min(df: pd.DataFrame, profile: str) -> pd.Series:
-    """Car gross time for one profile, for every leg (09a picks the leg's own
-    profile via `peak_str`; here each leg gets all three)."""
+    """Car gross time for one profile, for every trip (09a picks the trip's own
+    profile via `peak_str`; here each trip gets every profile of `_MODES['car']`)."""
     bias_col = f't_routed_bias_{profile}'
     bias = df[bias_col].fillna(0.0) if bias_col in df.columns else 0.0
     total_s = (df[f't_routed_{profile}']
@@ -121,39 +121,29 @@ def _car_gross_min(df: pd.DataFrame, profile: str) -> pd.Series:
 
 
 def _disutility(df: pd.DataFrame, t_min: pd.Series, spec) -> pd.Series:
-    """Per-leg disutility; same terms as `build_disutility_odm` +
-    `apply_log_time_utility` (spec coefficients are per second)."""
+    """Per-trip disutility; same terms as `build_disutility_odm`."""
     u = spec.disutility
-    t_sec = t_min * 60.0
-    d = u.constant + u.cost_coefficient * t_sec
+    d = u.constant + pd.Series(spec.time_disutility(t_min * 60.0), index=t_min.index)
     for feat, beta in u.origin_features.items():
         d = d + beta * df[f'{feat}_orig']
     for feat, beta in u.destination_features.items():
         d = d + beta * df[f'{feat}_dest']
-    if spec.b_time_log != 0.0:
-        log_t = np.log(t_sec)
-        if spec.t_cut_min is not None:
-            t_cut = spec.t_cut_min * 60.0
-            log_t = log_t.where(t_sec <= t_cut, math.log(t_cut) + (t_sec - t_cut) / t_cut)
-        d = d + spec.b_time_log * log_t
     return d
 
 
 def _costs_per_profile(df: pd.DataFrame, context) -> dict[str, pd.DataFrame]:
-    """`{profile: DataFrame[d, t, u]}` (km, min, disutility); NaN where the
-    mode is unavailable for the leg."""
+    """`{profile: DataFrame[d, t, u]}` (km, min, disutility), without the trips
+    for which the mode is unavailable."""
     coefs = context.get_coefs(f'utility_{_UTILITY_VARIANT}')
     stats = context.get_coefs(f'utility_{_UTILITY_VARIANT}_stats')
     sd_averages = extract_sd_averages_from_coefs(stats)
-    t_cut_min = extract_t_cut_min_from_coefs(stats) or None
 
     out = {}
     for mode, (_label, _colour, profiles) in _MODES.items():
         for profile in profiles:
             t_min = _car_gross_min(df, profile) if mode == 'car' else df[f't_{mode}_min']
             t_min = t_min.where(t_min < _u09a._TIME_CAP_MIN)
-            spec = build_disutility_spec(coefs, profile, sd_averages=sd_averages,
-                                         t_cut_min_per_mode=t_cut_min)
+            spec = build_disutility_spec(coefs, profile, sd_averages=sd_averages)
             if spec is None:
                 raise ValueError(f"No utility spec for profile {profile!r}.")
             out[profile] = pd.DataFrame({
@@ -161,7 +151,7 @@ def _costs_per_profile(df: pd.DataFrame, context) -> dict[str, pd.DataFrame]:
                 't': t_min,
                 'u': _disutility(df, t_min, spec),
             }).dropna()
-            logging.info(f"  → {profile}: {len(out[profile]):,} legs; median time "
+            logging.info(f"  → {profile}: {len(out[profile]):,} trips; median time "
                          f"{out[profile]['t'].median():.1f} min, median disutility "
                          f"{out[profile]['u'].median():.2f}")
     return out
@@ -197,18 +187,17 @@ def _binned(costs: pd.DataFrame, x: str, y: str, edges: np.ndarray) -> pd.DataFr
 def _plot_panel(ax, costs: dict[str, pd.DataFrame], legs: pd.Index, x: str, y: str) -> None:
     edges = _DIST_EDGES_KM if x == 'd' else _TIME_EDGES_MIN
     centres = np.sqrt(edges[:-1] * edges[1:])   # geometric bin centres (log-spaced bins)
-    for _mode, (_label, colour, profiles) in _MODES.items():
-        per_profile = [costs[p].loc[costs[p].index.intersection(legs)] for p in profiles]
-        pooled = _binned(pd.concat(per_profile), x, y, edges)
-        ax.fill_between(centres, pooled['low'], pooled['high'],
-                        color=colour, alpha=0.15, linewidth=0)
-        if len(profiles) == 1:
-            ax.plot(centres, pooled['median'], color=colour, linewidth=1.2)
-        else:
-            medians = pd.concat([_binned(c, x, y, edges)['median'] for c in per_profile], axis=1)
-            ax.fill_between(centres, medians.min(axis=1, skipna=False),
-                            medians.max(axis=1, skipna=False),
-                            color=colour, alpha=0.7, linewidth=0)
+    for _label, colour, profiles in _MODES.values():
+        per_profile = {p: costs[p].loc[costs[p].index.intersection(legs)] for p in profiles}
+        if (x, y) == ('t', 'u'):
+            # The same disutility at every hour for a given time: one curve per mode.
+            per_profile = {profiles[0]: pd.concat(per_profile.values())}
+        for profile, c in per_profile.items():
+            stats = _binned(c, x, y, edges)
+            ax.fill_between(centres, stats['low'], stats['high'],
+                            color=colour, alpha=_BAND_ALPHA, linewidth=0)
+            ax.plot(centres, stats['median'], color=colour, linewidth=_LINEWIDTH,
+                    linestyle=_LINESTYLES.get(profile, '-'))
     plain = FuncFormatter(lambda v, _pos: f'{v:g}')
     if x == 'd':
         ax.set_xscale('log')
@@ -228,12 +217,10 @@ def _figure(costs: dict[str, pd.DataFrame], rows: dict[str, pd.Index]) -> plt.Fi
             ax = axes[i, j]
             _plot_panel(ax, costs, legs, x, y)
             ax.set_ylabel(f'{row_label}\n\n{_LABELS[y]}' if j == 0 else _LABELS[y])
-    handles = []
-    for _mode, (label, colour, profiles) in _MODES.items():
-        if len(profiles) == 1:
-            handles.append(Line2D([], [], color=colour, linewidth=1.2, label=label))
-        else:
-            handles.append(Patch(color=colour, alpha=0.7, label=f'{label} (night, base, peak)'))
+    handles = [
+        Line2D([], [], color=colour, linewidth=_LINEWIDTH, linestyle=_LINESTYLES.get(p, '-'),
+               label=f'{label}, {_PROFILE_LABELS[p]}' if p in _PROFILE_LABELS else label)
+        for label, colour, profiles in _MODES.values() for p in profiles]
     fig.legend(handles=handles, loc='outside lower center', ncol=len(handles), frameon=False)
     return fig
 
@@ -241,21 +228,27 @@ def _figure(costs: dict[str, pd.DataFrame], rows: dict[str, pd.Index]) -> plt.Fi
 def main():
     context = init_context()
 
-    with step('load survey legs + per-mode times + endpoint features'):
+    with step('load survey trips + per-mode times + endpoint features'):
         df = _load_legs(context)
 
-    with step(f'per-leg times + disutilities (utility_{_UTILITY_VARIANT})'):
+    with step(f'per-trip times + disutilities (utility_{_UTILITY_VARIANT})'):
         costs = _costs_per_profile(df, context)
 
-    with step(f'high-density subset (top {_DENSE_SHARE:.0%} by mean endpoint density)'):
-        density = (df['density_r500_norm_orig'] + df['density_r500_norm_dest']) / 2
-        threshold = density.quantile(1 - _DENSE_SHARE)
-        dense = density.index[density >= threshold]
-        logging.info(f"  → {len(dense):,} of {density.notna().sum():,} legs "
-                     f"(mean density_r500_norm ≥ {threshold:.3f})")
+    with step(f'trips to or from cities of more than {_CITY_MIN_RESIDENTS:,} residents'):
+        zones = context.source('preparation/switzerland/general').get_generic(
+            'traffic_zones_centroids.gpkg').set_index('zone_id')
+        municipality = zones.loc[zones['is_domestic'].astype(bool), 'municipality']
+        residents = context.get_properties('zones', 'population')['population_total']
+        per_municipality = residents.groupby(municipality.reindex(residents.index)).sum()
+        cities = per_municipality[per_municipality > _CITY_MIN_RESIDENTS]
+        city_zones = municipality.index[municipality.isin(cities.index)]
+        in_city = df['orig_zone_id'].isin(city_zones) | df['dest_zone_id'].isin(city_zones)
+        logging.info(f"  → {int(in_city.sum()):,} of {len(df):,} trips; cities: "
+                     + ', '.join(f'{c} ({n:,.0f})' for c, n in
+                                 cities.sort_values(ascending=False).items()))
         rows = {
             'All trips': df.index,
-            f'Highest-density {_DENSE_SHARE:.0%} of trips': dense,
+            f'Trips to or from cities\nover {_CITY_MIN_RESIDENTS:,} residents': df.index[in_city],
         }
 
     with step('plot + save'):

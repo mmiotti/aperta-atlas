@@ -14,8 +14,8 @@ Requires `POSTGRES_PASSWORD` to be set in `.env` (read into `context.env`).
 Inputs:
     (network — `motion_tag_trips` table on id-hdb-psgr-cp50.ethz.ch:5432)
 
-Outputs:
-    mobis_all/postgres_dump_<i>.gpkg    # PRIVATE — one file per 1M-row page
+Outputs (PRIVATE, under preparation/switzerland/surveys/):
+    mobis_all/postgres_dump_<i>.gpkg    # one file per 1M-row page
 
 Run:
     python -m preparation.switzerland.private.surveys.a_mobis_trajectories_fetch
@@ -30,8 +30,7 @@ import pandas as pd
 import psycopg
 import shapely
 
-from aperta_atlas.context import init_context, Context
-from aperta_atlas.context import Storage
+from aperta_atlas.context import Context, init_context
 
 from preparation.switzerland.common import CRS_LATLON
 

@@ -9,7 +9,7 @@ copy-on-write — no pickling. For best results pass a graph that's been
 through `lean_graph` first: less per-worker memory and fewer COW pages
 dirtied during routing.
 
-Single-threaded callers should use `aperta.routing.shortest_path_costs_one_to_one`
+Single-threaded callers should use `aperta.routing.shortest_path_metrics_one_to_one`
 directly. This module exists to amortize that function over many trips
 across cores on a shared graph.
 
@@ -27,11 +27,9 @@ import pandas as pd
 from aperta import routing as _routing
 
 
-# Module-level globals populated by the mp wrappers before spawning
+# Module-level globals populated by the mp wrapper before spawning
 # workers. After fork, each child sees these via memory inheritance —
-# no pickling, no per-call IPC for the graph. Costs-only wrappers use
-# _GRAPH + _WEIGHT; the metrics wrapper additionally uses
-# _EDGE_FEATURES + _LENGTH_ATTR.
+# no pickling, no per-call IPC for the graph.
 _GRAPH: nx.Graph | None = None
 _WEIGHT: str | None = None
 _EDGE_FEATURES: dict[str, str] | None = None
@@ -80,90 +78,6 @@ def lean_graph(graph: nx.Graph, weight_attrs: str | list[str]) -> nx.Graph:
     return lean
 
 
-def _route_chunk(chunk):
-    """Worker entry point. `_GRAPH` and `_WEIGHT` are inherited from the
-    parent via fork."""
-    trip_ids, origins, dests = chunk
-    return _routing.shortest_path_costs_one_to_one(
-        _GRAPH, trip_ids, origins, dests, _WEIGHT,
-    )
-
-
-def shortest_path_costs_one_to_one_mp(
-    graph: nx.Graph,
-    trip_ids,
-    origins,
-    destinations,
-    weight: str,
-    *,
-    n_workers: int | None = None,
-) -> pd.Series:
-    """Fork-multiprocessing wrapper around `routing.shortest_path_costs_one_to_one`.
-
-    Splits the trip list into `n_workers` chunks and routes each chunk in
-    a forked child process. The graph is shared via memory inheritance
-    (no per-worker pickling), so passing a `lean_graph(graph, weight)`
-    keeps per-worker memory low.
-
-    Args:
-        graph: networkx graph; edges carry `weight`. Will be set as a
-            module global before fork so workers can access it via
-            inheritance — DO NOT mutate `graph` while this function runs.
-        trip_ids, origins, destinations: same-length sequences.
-        weight: edge attribute name (single column).
-        n_workers: number of worker processes. Default = `max(1, cpu_count - 1)`,
-            which is also the ceiling — larger values are clamped down.
-            Pass `1` for a single-threaded fallback (no fork overhead).
-
-    Returns:
-        `pd.Series[float]` indexed by trip_id, named `'cost'`. Drop
-        semantics match the underlying nx variant.
-
-    Raises:
-        RuntimeError on platforms without `fork` support (Windows).
-    """
-    global _GRAPH, _WEIGHT
-    _cap = max((os.cpu_count() or 2) - 1, 1)
-    n_workers = min(n_workers or _cap, _cap)
-    if n_workers <= 1 or len(trip_ids) == 0:
-        return _routing.shortest_path_costs_one_to_one(
-            graph, trip_ids, origins, destinations, weight,
-        )
-
-    try:
-        ctx = mp.get_context('fork')
-    except ValueError as e:
-        raise RuntimeError(
-            "shortest_path_costs_one_to_one_mp requires the 'fork' start "
-            "method, which isn't available on this platform (typically Windows). "
-            "Use routing.shortest_path_costs_one_to_one single-threaded instead."
-        ) from e
-
-    trip_ids_arr = np.asarray(trip_ids)
-    origins_arr = np.asarray(origins)
-    dests_arr = np.asarray(destinations)
-    chunk_idxs = np.array_split(np.arange(len(trip_ids_arr)), n_workers)
-    chunks = [
-        (trip_ids_arr[c], origins_arr[c], dests_arr[c])
-        for c in chunk_idxs if len(c) > 0
-    ]
-
-    _GRAPH = graph
-    _WEIGHT = weight
-    try:
-        with ctx.Pool(n_workers) as pool:
-            results = pool.map(_route_chunk, chunks)
-    finally:
-        # Don't keep a multi-GB graph reference alive in this module's
-        # globals after the call returns.
-        _GRAPH = None
-        _WEIGHT = None
-
-    if not results:
-        return pd.Series(dtype=float, name='cost')
-    return pd.concat(results)
-
-
 def _metrics_chunk(chunk):
     """Worker entry for `shortest_path_metrics_one_to_one_mp`. Reads
     `_GRAPH`, `_WEIGHT`, `_LENGTH_ATTR`, `_EDGE_FEATURES` from module
@@ -190,19 +104,20 @@ def shortest_path_metrics_one_to_one_mp(
     """Fork-multiprocessing wrapper around
     `routing.shortest_path_metrics_one_to_one`.
 
-    Same chunk-and-fork scaffolding as `shortest_path_costs_one_to_one_mp`
-    but the worker calls the metrics variant, so each per-chunk result is
-    a DataFrame indexed by trip_id with columns `distance`, `cost`, and
-    one column per entry in `edge_features`. Per-chunk DataFrames are
-    concatenated on return.
-
-    Path extraction + per-edge aggregation is more expensive than a
-    cost-only Dijkstra — expect this variant to run ~1.5–2× longer than
-    the cost-only wrapper on the same trip set.
+    Splits the trip list into `n_workers` chunks and routes each chunk in
+    a forked child process. The graph is shared via memory inheritance
+    (no per-worker pickling), so passing a `lean_graph(graph, ...)` keeps
+    per-worker memory low. Per-chunk DataFrames are concatenated on return.
 
     Args:
-        graph, trip_ids, origins, destinations, weight, n_workers: see
-            `shortest_path_costs_one_to_one_mp`.
+        graph: networkx graph; edges carry `weight`. Set as a module
+            global before fork so workers can access it via inheritance —
+            DO NOT mutate `graph` while this function runs.
+        trip_ids, origins, destinations: same-length sequences.
+        weight: edge attribute name (single column).
+        n_workers: number of worker processes. Default = `max(1, cpu_count - 1)`,
+            which is also the ceiling — larger values are clamped down.
+            Pass `1` for a single-threaded fallback (no fork overhead).
         length_attr: edge attribute used as path-length (default
             `'length'`); required only if any `edge_features` value is
             `'length_weighted'`, but always summed into a `distance`

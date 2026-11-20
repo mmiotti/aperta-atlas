@@ -1,16 +1,10 @@
 """Small generic utilities for aperta-atlas pipelines.
 
-These helpers were originally defined in aperta but unused within the
-aperta core itself, so they moved here for an aperta-atlas usage audit
-(2026-05-28). Aperta's own `utils.py` was removed entirely in the same
-wave — no parallel module exists there.
-
 Grouped:
 
 - **Pipeline progress logging**: `step` context manager.
 - **Numeric / pandas helpers**: `round_to_significant_figures`,
-  `most_common`, weighted-average aggregator factories
-  (`get_weighted_agg_function`, `get_weighted_agg_function_bounded`).
+  `most_common`.
 - **Dependency-tracking NamedTuple factory**: `tracked_namedtuple` —
   produces a NamedTuple subclass that records which fields were accessed;
   used by the reproducibility scaffold (Context layer).
@@ -22,7 +16,6 @@ import math
 import time
 from typing import Any, NamedTuple
 
-import numpy as np
 import pandas as pd
 
 
@@ -106,56 +99,5 @@ def most_common(a: pd.Series) -> Any:
     Use in `groupby().agg()` patterns where you want the modal value per group.
     """
     return a.value_counts().index[0]
-
-
-def get_weighted_agg_function(
-    df: pd.DataFrame,
-    weight_name: str,
-    allow_ignore_weights: bool = False,
-    fill_value: float | None = None,
-):
-    """Get a lambda function that can be used to calculate weighted averages in Pandas groupby().agg() patterns.
-
-    If allow_ignore_weights is True, weights are set to 1 if they sum to zero otherwise.
-
-    If fill_value is given, fill_value is returned by function if weights sum to zero.
-
-    If neither fill_value is given nor allow_ignore_weights is true, an Error is raised by function
-    if weights sum to zero.
-    """
-    if fill_value is None and not allow_ignore_weights:
-
-        def wm(x):
-            return np.average(x, weights=df.loc[x.index, weight_name])
-    else:
-
-        def wm(x):
-            w = df.loc[x.index, weight_name]
-            if w.sum() == 0:
-                if allow_ignore_weights:
-                    return np.average(x)
-                else:
-                    return fill_value
-            return np.average(x, weights=w)
-
-    return wm
-
-
-def get_weighted_agg_function_bounded(
-    df: pd.DataFrame,
-    weight_name: str,
-    upper_bound: int | float,
-    lower_bound: int | float = 0,
-):
-    """Same as get_weighted_agg_function, but with bounds. Returns nan if no entries match bounds."""
-
-    def fn(x):
-        f = (x >= lower_bound) & (x < upper_bound)
-        w = df.loc[x.index, weight_name][f]
-        if f.sum() == 0 or w.sum() == 0:
-            return np.nan
-        return np.average(x[f], weights=w)
-
-    return fn
 
 
