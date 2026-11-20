@@ -1,7 +1,7 @@
 # aperta-atlas
 
 > **Published Swiss outputs** — the pipeline's key deliverables for Switzerland are available on Zenodo:
-> - **[Accessibility metrics for Switzerland](https://doi.org/10.5281/zenodo.21410511)** — per-cell multi-modal accessibility metrics (time-, utility-, and distance-based) at Uber H3 resolution 10, CC BY 4.0.
+> - **[Accessibility indicators for Switzerland](https://doi.org/10.5281/zenodo.21410511)** — per-cell multi-modal accessibility indicators (time-, utility-, and distance-based) at Uber H3 resolution 10, CC BY 4.0.
 > - **[Calibrated transport networks for Switzerland](https://doi.org/10.5281/zenodo.21410967)** — walk / bike / car networks with per-edge calibrated travel-time weights per mode profile, ODbL.
 >
 > Both links resolve to the latest version of each dataset.
